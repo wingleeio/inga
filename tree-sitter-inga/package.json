@@ -1,0 +1,14 @@
+{
+  "name": "tree-sitter-inga",
+  "version": "0.1.0",
+  "description": "Tree-sitter grammar for the Inga language",
+  "repository": "github:wingleeio/inga",
+  "license": "MIT",
+  "tree-sitter": [
+    {
+      "scope": "source.inga",
+      "file-types": ["inga"],
+      "injection-regex": "^inga$"
+    }
+  ]
+}

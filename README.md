@@ -127,6 +127,8 @@ crates/inga-rt        native runtime staticlib (allocator, strings, maps, clock)
 crates/inga-cli       the `inga` binary
 crates/inga-lsp       language server (lsp-server / lsp-types)
 editors/vscode        VS Code extension + TextMate grammar
+editors/zed           Zed extension (tree-sitter highlighting + LSP)
+tree-sitter-inga      tree-sitter grammar (used by the Zed extension)
 examples/             hello.inga, retry.inga, user_service.inga
 games/                balatro.inga — a Balatro-style deckbuilder on the Gfx module
 bench/                the same workloads in Inga, JavaScript, and Rust (see bench/README.md)

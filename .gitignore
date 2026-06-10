@@ -1,4 +1,5 @@
 /target
+/editors/zed/target
 node_modules
 *.vsix
 .DS_Store

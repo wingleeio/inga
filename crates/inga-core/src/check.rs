@@ -1188,6 +1188,10 @@ impl<'a> Checker<'a> {
                 let v = self.ctx.fresh();
                 Type::MutMap(Box::new(k), Box::new(v))
             }
+            "nowMillis" => {
+                check_arity(self, 0);
+                Type::Int
+            }
             "Some" => {
                 if !check_arity(self, 1) {
                     return Some(Type::Option(Box::new(Type::Unknown)));
@@ -1887,7 +1891,7 @@ fn last_span(block: &Block) -> Span {
     }
 }
 
-const BUILTIN_NAMES: [&str; 15] = [
+const BUILTIN_NAMES: [&str; 16] = [
     "println",
     "print",
     "show",
@@ -1903,6 +1907,7 @@ const BUILTIN_NAMES: [&str; 15] = [
     "len",
     "MutMap",
     "Some",
+    "nowMillis",
 ];
 
 /// Names the LSP offers as completions alongside user definitions.
@@ -1922,6 +1927,7 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("sleep", "sleep(duration) -> Unit"),
         ("len", "len(stringOrList) -> Int"),
         ("MutMap", "MutMap() -> MutMap<k, v>"),
+        ("nowMillis", "nowMillis() -> Int — monotonic milliseconds since program start"),
         ("Some", "Some(value) -> value?"),
         ("None", "None : a?"),
         ("Schedule.exponential", "Schedule.exponential(base) -> Schedule"),

@@ -103,8 +103,13 @@ crates/inga-cli    the `inga` binary
 crates/inga-lsp    language server (lsp-server / lsp-types)
 editors/vscode     VS Code extension + TextMate grammar
 examples/          hello.inga, retry.inga, user_service.inga
+bench/             the same workloads in Inga, JavaScript, and Rust (see bench/README.md)
 docs/SPEC.md       language design: semantics, effect rows, execution strategy
 ```
+
+Curious how the interpreter stacks up? `bench/run.sh` runs five identical
+workloads in Inga, node, and `rustc -O` — including one where Inga's typed
+errors beat JavaScript exceptions 3× ([results](bench/README.md)).
 
 ## How it runs
 

@@ -131,6 +131,8 @@ pub struct Interp<'a> {
     provided: RefCell<Vec<HashMap<String, Rc<ServiceInstance<'a>>>>>,
     /// Output sink (stdout normally; captured in tests).
     pub output: RefCell<Option<String>>,
+    /// Epoch for `nowMillis()`.
+    start: std::time::Instant,
 }
 
 pub fn run(program: &Program, entry: &str) -> Result<(), RuntimeError> {
@@ -212,6 +214,7 @@ impl<'a> Interp<'a> {
             error_fields,
             provided: RefCell::new(Vec::new()),
             output: RefCell::new(None),
+            start: std::time::Instant::now(),
         }
     }
 
@@ -750,6 +753,9 @@ impl<'a> Interp<'a> {
             },
             "MutMap" if args.is_empty() => {
                 Ok(Value::MutMap(Rc::new(RefCell::new(HashMap::new()))))
+            }
+            "nowMillis" if args.is_empty() => {
+                Ok(Value::Int(self.start.elapsed().as_millis() as i64))
             }
             "Some" if args.len() == 1 => match self.eval(args[0], scope) {
                 Ok(v) => Ok(Value::Option(Some(Rc::new(v)))),

@@ -1,0 +1,110 @@
+// Inga side of the cross-language benchmark. Same workload shapes as
+// bench.js and bench.rs — see bench/README.md for results and methodology.
+//
+// All workloads are fib-shaped tree recursion so call counts are large while
+// recursion depth stays small. Run with: inga run bench/bench.inga
+
+error Boom = { Int n }
+
+service Adder {
+    add :: (Int a, Int b) -> Int
+}
+
+service Store {
+    put :: (Int k, Int v)
+    take :: (Int k) -> Int
+}
+
+plainAdder :: Adder {
+    add :: (a, b) {
+        a + b
+    }
+}
+
+memStore :: Store {
+    m = MutMap()
+
+    put :: (k, v) {
+        m.set(k, v)
+    }
+
+    take :: (k) {
+        m.get(k) |> getOrElse(0)
+    }
+}
+
+// 1. Raw calls + integer arithmetic.
+fib :: (Int n) -> Int {
+    if n < 2 {
+        n
+    } else {
+        fib(n - 1) + fib(n - 2)
+    }
+}
+
+// 2. Same shape, but every addition goes through an injected capability.
+fibService :: (Int n) -> Int uses Adder {
+    Adder adder
+    if n < 2 {
+        n
+    } else {
+        adder.add(fibService(n - 1), fibService(n - 2))
+    }
+}
+
+// 3. One string interpolation + length per node.
+fibStrings :: (Int n) -> Int {
+    if n < 2 {
+        len("n=${n}")
+    } else {
+        fibStrings(n - 1) + fibStrings(n - 2)
+    }
+}
+
+// 4. Every leaf raises a typed error that the caller catches.
+boom :: (Int n) -> Int ! Boom {
+    fail Boom(n)
+}
+
+fibErrors :: (Int n) -> Int {
+    if n < 2 {
+        boom(n) |> catch { Boom(e) -> e.n }
+    } else {
+        fibErrors(n - 1) + fibErrors(n - 2)
+    }
+}
+
+// 5. A map write per node and a read per leaf, through a capability.
+fibStore :: (Int n) -> Int uses Store {
+    Store store
+    store.put(n, n)
+    if n < 2 {
+        store.take(n)
+    } else {
+        fibStore(n - 1) + fibStore(n - 2)
+    }
+}
+
+// The workload is a `lazy` parameter, so it evaluates inside the timed window.
+bench :: (String name, lazy Int work) {
+    t0 = nowMillis()
+    result = work
+    t1 = nowMillis()
+    println("${name} ${t1 - t0} ms (result ${result})")
+}
+
+round :: (Int i) uses Adder, Store {
+    println("--- round ${i} ---")
+    bench("fib(27)         ", fib(27))
+    bench("fib_service(24) ", fibService(24))
+    bench("strings(24)     ", fibStrings(24))
+    bench("errors(24)      ", fibErrors(24))
+    bench("store(24)       ", fibStore(24))
+}
+
+main :: () {
+    provide plainAdder, memStore {
+        round(1)
+        round(2)
+    }
+}

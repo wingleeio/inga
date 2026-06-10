@@ -422,6 +422,18 @@ main :: () {
     assert_eq!(out, "10\n");
 }
 
+#[test]
+fn now_millis_is_monotonic() {
+    let out = run(r#"
+main :: () {
+    a = nowMillis()
+    b = nowMillis()
+    println(b >= a && a >= 0)
+}
+"#);
+    assert_eq!(out, "true\n");
+}
+
 // ---- encode / decode -------------------------------------------------------------------
 
 #[test]

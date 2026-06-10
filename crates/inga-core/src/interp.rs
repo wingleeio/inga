@@ -654,6 +654,7 @@ impl<'a> Interp<'a> {
 
     /// The graphics module (interpreter side). Available when inga-core is
     /// built with the `gfx` feature (the CLI enables it; the LSP does not).
+    /// Shader handles index into MATERIALS (module scope, below).
     #[cfg(feature = "gfx")]
     fn eval_gfx_call(
         &self,
@@ -697,6 +698,10 @@ impl<'a> Interp<'a> {
                 let frame: Value<'static> = unsafe { std::mem::transmute(frame.clone()) };
                 // Debug/CI hook shared with the native runtime.
                 let shot = std::env::var("INGA_GFX_SHOT").ok();
+                let shot_frame: u32 = std::env::var("INGA_GFX_SHOT_FRAME")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(30);
                 macroquad::Window::from_config(conf, async move {
                     let mut frame_no = 0u32;
                     loop {
@@ -716,7 +721,7 @@ impl<'a> Interp<'a> {
                         }
                         frame_no += 1;
                         if let Some(path) = &shot {
-                            if frame_no == 30 {
+                            if frame_no == shot_frame {
                                 macroquad::texture::get_screen_data().export_png(path);
                                 std::process::exit(0);
                             }
@@ -783,6 +788,52 @@ impl<'a> Interp<'a> {
             "mouseX" => Ok(Value::Int(mq::mouse_position().0 as i64)),
             "mouseY" => Ok(Value::Int(mq::mouse_position().1 as i64)),
             "mousePressed" => Ok(Value::Bool(mq::is_mouse_button_pressed(mq::MouseButton::Left))),
+            "shaderNew" => {
+                use macroquad::miniquad::{UniformDesc, UniformType};
+                let Some(Value::Str(fragment)) = vals.first() else {
+                    return self.fatal(span, "`Gfx.shaderNew` needs a GLSL fragment String");
+                };
+                let result = macroquad::material::load_material(
+                    macroquad::miniquad::ShaderSource::Glsl {
+                        vertex: GFX_VERTEX_SHADER,
+                        fragment,
+                    },
+                    macroquad::material::MaterialParams {
+                        uniforms: vec![
+                            UniformDesc::new("iTime", UniformType::Float1),
+                            UniformDesc::new("iRes", UniformType::Float2),
+                        ],
+                        ..Default::default()
+                    },
+                );
+                match result {
+                    Ok(material) => Ok(Value::Int(MATERIALS.with(|m| {
+                        m.borrow_mut().push(material);
+                        m.borrow().len() as i64 - 1
+                    }))),
+                    Err(e) => {
+                        eprintln!("Gfx.shaderNew: shader failed to compile: {e}");
+                        Ok(Value::Int(-1))
+                    }
+                }
+            }
+            "shaderUse" => {
+                MATERIALS.with(|m| {
+                    if let Some(material) = m.borrow().get(int(0) as usize) {
+                        material.set_uniform("iTime", self.start.elapsed().as_secs_f32());
+                        material.set_uniform(
+                            "iRes",
+                            macroquad::math::Vec2::new(mq::screen_width(), mq::screen_height()),
+                        );
+                        macroquad::material::gl_use_material(material);
+                    }
+                });
+                Ok(Value::Unit)
+            }
+            "shaderOff" => {
+                macroquad::material::gl_use_default_material();
+                Ok(Value::Unit)
+            }
             _ => self.fatal(span, format!("unknown graphics call `Gfx.{name}`")),
         }
     }
@@ -1701,4 +1752,27 @@ impl<'s> JsonParser<'s> {
             text.parse().map(Json::Int).map_err(|_| "invalid number".to_string())
         }
     }
+}
+
+// ---- shader registry (interpreter gfx support) -------------------------------
+
+#[cfg(feature = "gfx")]
+const GFX_VERTEX_SHADER: &str = r#"#version 100
+attribute vec3 position;
+attribute vec2 texcoord;
+attribute vec4 color0;
+varying lowp vec4 color;
+varying vec2 uv;
+uniform mat4 Model;
+uniform mat4 Projection;
+void main() {
+    gl_Position = Projection * Model * vec4(position, 1);
+    color = color0 / 255.0;
+    uv = texcoord;
+}"#;
+
+#[cfg(feature = "gfx")]
+thread_local! {
+    static MATERIALS: RefCell<Vec<macroquad::material::Material>> =
+        const { RefCell::new(Vec::new()) };
 }

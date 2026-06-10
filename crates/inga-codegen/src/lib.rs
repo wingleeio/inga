@@ -1431,6 +1431,9 @@ impl<'a> Cg<'a> {
             return "0".to_string();
         }
         let (rt_name, arity, has_ret) = match name {
+            "shaderNew" => ("rt_gfx_shader_new", 1, true),
+            "shaderUse" => ("rt_gfx_shader_use", 1, false),
+            "shaderOff" => ("rt_gfx_shader_off", 0, false),
             "clear" => ("rt_gfx_clear", 3, false),
             "rect" => ("rt_gfx_rect", 8, false),
             "rectLines" => ("rt_gfx_rect_lines", 9, false),
@@ -2074,4 +2077,7 @@ declare i64 @rt_gfx_text_width(i64, i64)
 declare i64 @rt_gfx_mouse_x()
 declare i64 @rt_gfx_mouse_y()
 declare i64 @rt_gfx_mouse_pressed()
+declare i64 @rt_gfx_shader_new(i64)
+declare void @rt_gfx_shader_use(i64)
+declare void @rt_gfx_shader_off()
 "#;

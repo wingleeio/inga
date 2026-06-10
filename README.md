@@ -99,15 +99,18 @@ Editor support lives in [`editors/vscode`](editors/vscode) (TextMate grammar
 ## Graphics, and a game
 
 Inga has GL-backed graphics bindings — the `Gfx` module (window, rects,
-circles, text, mouse), implemented on OpenGL via miniquad/macroquad in the
-native runtime and available in both backends. The frame loop is owned by the
-runtime (`Gfx.run(w, h, title, frame)` calls your closure once per frame), so
-games don't need unbounded recursion — and the frame closure captures
-capability evidence like any other Inga closure.
+circles, text, mouse, **GLSL fragment shaders**), implemented on OpenGL via
+miniquad/macroquad in the native runtime and available in both backends. The
+frame loop is owned by the runtime (`Gfx.run(w, h, title, frame)` calls your
+closure once per frame), so games don't need unbounded recursion — and the
+frame closure captures capability evidence like any other Inga closure.
 
 The proof is [`games/balatro.inga`](games/balatro.inga): **INGA-LATRO**, a
-Balatro-style roguelike deckbuilder in ~600 lines of pure Inga — poker-hand
-scoring, escalating blinds and antes, money, and a joker shop:
+Balatro-style roguelike deckbuilder in ~900 lines of pure Inga — poker-hand
+scoring, escalating blinds and antes, fifteen jokers and a rerollable shop,
+animated card deals/hovers/score popups, and the signature swirling paint
+background written as a GLSL shader *inside the Inga source* and compiled at
+runtime via `Gfx.shaderNew`:
 
 ```sh
 inga build games/balatro.inga -o ingalatro && ./ingalatro

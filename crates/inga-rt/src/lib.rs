@@ -486,9 +486,13 @@ pub extern "C" fn rt_gfx_run(width: i64, height: i64, title: i64, closure: i64) 
         high_dpi: true,
         ..Default::default()
     };
-    // Debug/CI hook: INGA_GFX_SHOT=<path.png> renders 30 frames, saves a
-    // screenshot of the framebuffer, and exits.
+    // Debug/CI hook: INGA_GFX_SHOT=<path.png> renders INGA_GFX_SHOT_FRAME
+    // frames (default 30), saves a screenshot of the framebuffer, and exits.
     let shot = std::env::var("INGA_GFX_SHOT").ok();
+    let shot_frame: u32 = std::env::var("INGA_GFX_SHOT_FRAME")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
     macroquad::Window::from_config(conf, async move {
         let mut frame_no = 0u32;
         loop {
@@ -501,7 +505,7 @@ pub extern "C" fn rt_gfx_run(width: i64, height: i64, title: i64, closure: i64) 
             }
             frame_no += 1;
             if let Some(path) = &shot {
-                if frame_no == 30 {
+                if frame_no == shot_frame {
                     macroquad::texture::get_screen_data().export_png(path);
                     std::process::exit(0);
                 }
@@ -591,4 +595,83 @@ pub extern "C" fn rt_gfx_mouse_y() -> i64 {
 #[no_mangle]
 pub extern "C" fn rt_gfx_mouse_pressed() -> i64 {
     macroquad::input::is_mouse_button_pressed(macroquad::input::MouseButton::Left) as i64
+}
+
+// ---- shaders ---------------------------------------------------------------------
+//
+// Fragment shaders are written in Inga source as GLSL strings; the runtime
+// pairs them with a standard vertex shader and exposes two uniforms set
+// automatically on use: `iTime` (seconds) and `iRes` (drawable size).
+
+pub const GFX_VERTEX_SHADER: &str = r#"#version 100
+attribute vec3 position;
+attribute vec2 texcoord;
+attribute vec4 color0;
+varying lowp vec4 color;
+varying vec2 uv;
+uniform mat4 Model;
+uniform mat4 Projection;
+void main() {
+    gl_Position = Projection * Model * vec4(position, 1);
+    color = color0 / 255.0;
+    uv = texcoord;
+}"#;
+
+use std::cell::RefCell;
+
+thread_local! {
+    static MATERIALS: RefCell<Vec<macroquad::material::Material>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Compile a fragment shader; returns a handle, or -1 on compile error.
+#[no_mangle]
+pub extern "C" fn rt_gfx_shader_new(fragment: i64) -> i64 {
+    use macroquad::miniquad::{UniformDesc, UniformType};
+    let fragment = unsafe { String::from_utf8_lossy(str_bytes(fragment)).into_owned() };
+    let result = macroquad::material::load_material(
+        macroquad::miniquad::ShaderSource::Glsl {
+            vertex: GFX_VERTEX_SHADER,
+            fragment: &fragment,
+        },
+        macroquad::material::MaterialParams {
+            uniforms: vec![
+                UniformDesc::new("iTime", UniformType::Float1),
+                UniformDesc::new("iRes", UniformType::Float2),
+            ],
+            ..Default::default()
+        },
+    );
+    match result {
+        Ok(material) => MATERIALS.with(|m| {
+            m.borrow_mut().push(material);
+            m.borrow().len() as i64 - 1
+        }),
+        Err(e) => {
+            eprintln!("Gfx.shaderNew: shader failed to compile: {e}");
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_gfx_shader_use(handle: i64) {
+    MATERIALS.with(|m| {
+        if let Some(material) = m.borrow().get(handle as usize) {
+            let time = EPOCH.with(|e| e.elapsed().as_secs_f32());
+            material.set_uniform("iTime", time);
+            material.set_uniform(
+                "iRes",
+                macroquad::math::Vec2::new(
+                    macroquad::window::screen_width(),
+                    macroquad::window::screen_height(),
+                ),
+            );
+            macroquad::material::gl_use_material(material);
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn rt_gfx_shader_off() {
+    macroquad::material::gl_use_default_material();
 }

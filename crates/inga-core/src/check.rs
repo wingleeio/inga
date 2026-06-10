@@ -1145,11 +1145,14 @@ impl<'a> Checker<'a> {
             "textWidth" => Some((vec![Type::Str, Type::Int], Type::Int)),
             "mouseX" | "mouseY" => Some((vec![], Type::Int)),
             "mousePressed" => Some((vec![], Type::Bool)),
+            "shaderNew" => Some((vec![Type::Str], Type::Int)),
+            "shaderUse" => Some((vec![Type::Int], Type::Unit)),
+            "shaderOff" => Some((vec![], Type::Unit)),
             _ => {
                 self.error(
                     name_span,
                     format!(
-                        "unknown graphics call `Gfx.{name}` (run, clear, rect, rectLines, circle, text, textWidth, mouseX, mouseY, mousePressed)"
+                        "unknown graphics call `Gfx.{name}` (run, clear, rect, rectLines, circle, text, textWidth, mouseX, mouseY, mousePressed, shaderNew, shaderUse, shaderOff)"
                     ),
                 );
                 for arg in args {
@@ -2149,6 +2152,9 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("Gfx.mouseX", "Gfx.mouseX() -> Int"),
         ("Gfx.mouseY", "Gfx.mouseY() -> Int"),
         ("Gfx.mousePressed", "Gfx.mousePressed() -> Bool — left click this frame"),
+        ("Gfx.shaderNew", "Gfx.shaderNew(fragmentGlsl) -> Int — compile a fragment shader (uniforms: iTime, iRes)"),
+        ("Gfx.shaderUse", "Gfx.shaderUse(handle) — draw subsequent shapes through the shader"),
+        ("Gfx.shaderOff", "Gfx.shaderOff() — back to the default pipeline"),
         ("Some", "Some(value) -> value?"),
         ("None", "None : a?"),
         ("Schedule.exponential", "Schedule.exponential(base) -> Schedule"),

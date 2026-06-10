@@ -210,6 +210,8 @@ Gfx.rect(x, y, w, h, r, g, b, a)       Gfx.rectLines(x, y, w, h, thick, r, g, b,
 Gfx.circle(x, y, radius, r, g, b, a)   Gfx.text(s, x, y, size, r, g, b)
 Gfx.textWidth(s, size) -> Int          Gfx.mouseX() / Gfx.mouseY() -> Int
 Gfx.mousePressed() -> Bool
+Gfx.shaderNew(fragGlsl) -> Int         // compile GLSL ES; uniforms iTime, iRes
+Gfx.shaderUse(handle)                  Gfx.shaderOff()
 ```
 
 Inverting the loop (`Gfx.run` calls the closure, rather than the program

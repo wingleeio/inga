@@ -312,6 +312,25 @@ impl Printer {
                 format!("{recv_str}.{name}")
             }
             ExprKind::Binary { op, lhs, rhs } => {
+                // Long `+` chains (string building, e.g. shader sources) break
+                // with one operand per line; the parser continues `+` lines.
+                // Decide on the whole flattened chain so ancestors and inner
+                // nodes agree.
+                if *op == BinOp::Add {
+                    let mut operands = Vec::new();
+                    flatten_add_chain(expr, &mut operands);
+                    let rendered: Vec<String> = operands
+                        .iter()
+                        .map(|e| self.render_binary_operand(e, BinOp::Add, false, indent))
+                        .collect();
+                    let inline = rendered.join(" + ");
+                    if operands.len() > 2
+                        && (inline.contains('\n') || indent * 4 + inline.len() > MAX_WIDTH)
+                    {
+                        return rendered.join(&format!("\n{}+ ", indent_str(indent + 1)));
+                    }
+                    return inline;
+                }
                 let l = self.render_binary_operand(lhs, *op, true, indent);
                 let r = self.render_binary_operand(rhs, *op, false, indent);
                 format!("{l} {} {r}", op.symbol())
@@ -605,4 +624,14 @@ fn precedence(op: BinOp) -> u8 {
 
 fn indent_str(indent: usize) -> String {
     INDENT.repeat(indent)
+}
+
+/// Flatten a left-leaning `a + b + c` tree into its operands, in order.
+fn flatten_add_chain<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let ExprKind::Binary { op: BinOp::Add, lhs, rhs } = &expr.kind {
+        flatten_add_chain(lhs, out);
+        out.push(rhs);
+    } else {
+        out.push(expr);
+    }
 }

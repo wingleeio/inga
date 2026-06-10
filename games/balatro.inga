@@ -4,12 +4,11 @@
 //
 // Play poker hands to beat each blind's score target before you run out of
 // hands. Beat the blind, earn money, buy jokers in the shop, climb the antes.
-// Click cards to select (up to 5), then Play Hand or Discard. Reach ante 8's
-// boss blind to win.
+// Click cards to select (up to 5), hover to peek, sort by rank or suit, then
+// Play Hand or Discard. Reach ante 8's boss blind to win.
 //
-// Everything below is plain Inga: MutMaps for game state, range/map for
-// iteration, and the GL-backed Gfx module for drawing. The frame loop is
-// owned by the runtime (Gfx.run), so there is no unbounded recursion.
+// Everything below is plain Inga — including the swirling background, which
+// is a GLSL fragment shader compiled at runtime through Gfx.shaderNew.
 
 // ---- small helpers ----------------------------------------------------------
 
@@ -27,6 +26,23 @@ rgb :: (Int r, Int g, Int b) -> Int {
     r * 65536 + g * 256 + b
 }
 
+cap255 :: (Int v) -> Int {
+    if v > 255 {
+        255
+    } else {
+        v
+    }
+}
+
+brighten :: (Int packed, Int amount) -> Int {
+    rgb(cap255(packed / 65536 + amount), cap255(packed / 256 % 256 + amount), cap255(packed % 256 + amount))
+}
+
+// Scale a color toward black: keep = 0..255.
+dim :: (Int packed, Int keep) -> Int {
+    rgb(packed / 65536 * keep / 255, packed / 256 % 256 * keep / 255, packed % 256 * keep / 255)
+}
+
 textC :: (String s, Int x, Int y, Int size, Int packed) {
     Gfx.text(s, x, y, size, packed / 65536, packed / 256 % 256, packed % 256)
 }
@@ -41,22 +57,78 @@ hit :: (Int x, Int y, Int w, Int h) -> Bool {
     mx >= x && mx <= x + w && my >= y && my <= y + h
 }
 
-// Draws a button; returns true when it was clicked this frame.
+// Draws a button (brightens on hover); returns true when clicked this frame.
 button :: (String label, Int x, Int y, Int w, Int h, Bool enabled, Int packed) -> Bool {
+    hovered = enabled && hit(x, y, w, h)
     bg = if enabled {
-        packed
+        if hovered {
+            brighten(packed, 35)
+        } else {
+            packed
+        }
     } else {
         rgb(70, 75, 85)
     }
-    Gfx.rect(x, y, w, h, bg / 65536, bg / 256 % 256, bg % 256, 255)
-    Gfx.rectLines(x, y, w, h, 2, 15, 20, 25, 255)
+    lift = if hovered {
+        2
+    } else {
+        0
+    }
+    Gfx.rect(x, y - lift, w, h, bg / 65536, bg / 256 % 256, bg % 256, 235)
+    Gfx.rectLines(x, y - lift, w, h, 2, 15, 20, 25, 255)
     fg = if enabled {
         rgb(245, 245, 245)
     } else {
         rgb(140, 145, 150)
     }
-    centerText(label, x + w / 2, y + h / 2 + 7, 22, fg)
-    enabled && Gfx.mousePressed() && hit(x, y, w, h)
+    centerText(label, x + w / 2, (y - lift) + h / 2 + 7, 22, fg)
+    enabled && Gfx.mousePressed() && hovered
+}
+
+// ---- the background shader ----------------------------------------------------
+//
+// Balatro's signature is the swirling paint background. This is a GLSL ES
+// fragment shader, compiled at runtime; iTime/iRes are provided by Gfx.
+
+swirlSrc :: () -> String {
+    "#version 100\n"
+        + "precision highp float;\n"
+        + "varying vec2 uv;\n"
+        + "varying lowp vec4 color;\n"
+        + "uniform float iTime;\n"
+        + "uniform vec2 iRes;\n"
+        + "void main() {\n"
+        + "    vec2 p = uv - 0.5;\n"
+        + "    p.x *= iRes.x / iRes.y;\n"
+        + "    float r = length(p);\n"
+        + "    float a = atan(p.y, p.x);\n"
+        + "    float t = iTime * 0.35;\n"
+        + "    float s = sin(a * 2.0 + r * 9.0 - t)\n"
+        + "            + sin(a * 3.0 - r * 14.0 + t * 0.7)\n"
+        + "            + sin(r * 22.0 - t * 1.3 + sin(a * 4.0 + t * 0.5));\n"
+        + "    float v = s * 0.22 + 0.5;\n"
+        + "    vec3 deep = vec3(0.05, 0.10, 0.16);\n"
+        + "    vec3 teal = vec3(0.06, 0.26, 0.30);\n"
+        + "    vec3 red  = vec3(0.52, 0.12, 0.16);\n"
+        + "    vec3 col = mix(deep, teal, smoothstep(0.25, 0.62, v));\n"
+        + "    col = mix(col, red, smoothstep(0.64, 0.95, v) * 0.85);\n"
+        + "    col *= 1.0 - 0.45 * r;\n"
+        + "    gl_FragColor = vec4(col, 1.0);\n"
+        + "}\n"
+}
+
+drawBackground :: (g) {
+    if gv(g, "shInit") == 0 {
+        g.set("shInit", 1)
+        g.set("shH", Gfx.shaderNew(swirlSrc()))
+    }
+    Gfx.clear(22, 30, 40)
+    h = gv(g, "shH")
+    if h >= 0 {
+        Gfx.shaderUse(h)
+        Gfx.rect(0, 0, 960, 540, 255, 255, 255, 255)
+        Gfx.shaderOff()
+    }
 }
 
 // ---- cards -------------------------------------------------------------------
@@ -82,6 +154,7 @@ suitName :: (Int s) -> String {
     }
 }
 
+// Spades slate, hearts red, diamonds orange, clubs blue.
 suitCol :: (Int s) -> Int {
     match s {
         0 -> rgb(60, 60, 95)
@@ -89,10 +162,6 @@ suitCol :: (Int s) -> Int {
         2 -> rgb(235, 140, 50)
         _ -> rgb(50, 110, 215)
     }
-    // spades
-    // hearts
-    // diamonds
-    // clubs
 }
 
 chipsOf :: (Int card) -> Int {
@@ -110,31 +179,55 @@ chipsOf :: (Int card) -> Int {
 
 jokerName :: (Int j) -> String {
     match j {
-        0 -> "Greedy Joker"
-        1 -> "Banner"
-        2 -> "Lusty Joker"
-        3 -> "Stone Wall"
-        _ -> "Juggernaut"
+        0  -> "Joker"
+        1  -> "Greedy Joker"
+        2  -> "Lusty Joker"
+        3  -> "Wrathful Joker"
+        4  -> "Gluttonous"
+        5  -> "Banner"
+        6  -> "Sly Joker"
+        7  -> "Wily Joker"
+        8  -> "Half Joker"
+        9  -> "Mystic Summit"
+        10 -> "Bull"
+        11 -> "Acrobat"
+        12 -> "Even Steven"
+        13 -> "Odd Todd"
+        _  -> "Juggernaut"
     }
 }
 
 jokerDesc :: (Int j) -> String {
     match j {
-        0 -> "+4 Mult"
-        1 -> "+30 Chips"
-        2 -> "+3 Mult per Heart"
-        3 -> "+50 Chips if Flush"
-        _ -> "x2 Mult"
+        0  -> "+4 Mult"
+        1  -> "+3 Mult / Diamond"
+        2  -> "+3 Mult / Heart"
+        3  -> "+3 Mult / Spade"
+        4  -> "+3 Mult / Club"
+        5  -> "+30 Chips"
+        6  -> "+50 Chips w/ Pair"
+        7  -> "+100 Chips w/ Trips"
+        8  -> "+20 Mult if <=3 cards"
+        9  -> "+15 Mult if Straight"
+        10 -> "+2 Chips per \$1"
+        11 -> "x3 Mult on last hand"
+        12 -> "+1 Mult / even card"
+        13 -> "+31 Chips / odd card"
+        _  -> "x2 Mult"
     }
 }
 
 jokerPrice :: (Int j) -> Int {
     match j {
-        0 -> 4
-        1 -> 4
-        2 -> 5
-        3 -> 5
-        _ -> 8
+        0  -> 2
+        6  -> 3
+        7  -> 4
+        10 -> 6
+        11 -> 8
+        12 -> 4
+        13 -> 4
+        14 -> 10
+        _  -> 5
     }
 }
 
@@ -152,7 +245,9 @@ hasJoker :: (jok, g, Int j) -> Bool {
 // ---- poker evaluation -----------------------------------------------------------
 //
 // Result map keys: 0 hand type (-1 = nothing selected), 3 card chips,
-// 4 cards selected, 5 flush (0/1), 6 hearts, 7 total chips, 8 total mult.
+// 4 cards selected, 5 flush, 6 hearts, 9 spades, 10 clubs, 11 diamonds,
+// 12 even cards, 13 odd cards, 14 has pair, 15 has trips, 16 straight,
+// 7 total chips, 8 total mult.
 
 baseChips :: (Int t) -> Int {
     match t {
@@ -204,6 +299,14 @@ evalSelected :: (hand, sel, out) {
     out.set(4, 0)
     out.set(5, 0)
     out.set(6, 0)
+    out.set(9, 0)
+    out.set(10, 0)
+    out.set(11, 0)
+    out.set(12, 0)
+    out.set(13, 0)
+    out.set(14, 0)
+    out.set(15, 0)
+    out.set(16, 0)
     map(range(8), (i) -> {
         if gn(sel, i) == 1 && gn(hand, i) >= 0 {
             c = gn(hand, i)
@@ -213,8 +316,19 @@ evalSelected :: (hand, sel, out) {
             sc.set(s, gn(sc, s) + 1)
             out.set(3, gn(out, 3) + chipsOf(c))
             out.set(4, gn(out, 4) + 1)
-            if s == 1 {
-                out.set(6, gn(out, 6) + 1)
+            suitKey = match s {
+                0 -> 9
+                1 -> 6
+                2 -> 11
+                _ -> 10
+            }
+            out.set(suitKey, gn(out, suitKey) + 1)
+            // Even ranks: 2,4,6,8,10. Odd: A,3,5,7,9.
+            if r <= 8 && r % 2 == 0 {
+                out.set(12, gn(out, 12) + 1)
+            }
+            if r <= 7 && r % 2 == 1 || r == 12 {
+                out.set(13, gn(out, 13) + 1)
             }
         }
         0
@@ -236,6 +350,12 @@ evalSelected :: (hand, sel, out) {
             if c >= 4 {
                 t.set(2, gn(t, 2) + 1)
             }
+            if c >= 2 {
+                out.set(14, 1)
+            }
+            if c >= 3 {
+                out.set(15, 1)
+            }
             if c >= 1 {
                 t.set(3, gn(t, 3) + 1)
                 if r < gn(t, 4) {
@@ -252,6 +372,9 @@ evalSelected :: (hand, sel, out) {
         straight = n == 5 && gn(t, 3) == 5 && (gn(t, 5) - gn(t, 4) == 4 || wheel)
         if flush {
             out.set(5, 1)
+        }
+        if straight {
+            out.set(16, 1)
         }
         ty = if straight && flush {
             8
@@ -276,19 +399,34 @@ evalSelected :: (hand, sel, out) {
     }
 }
 
-// Full scoring including jokers; fills out[7] (chips) and out[8] (mult).
+// Full scoring including all fifteen jokers; fills out[7] and out[8].
 scoreSelected :: (hand, sel, jok, g, out) {
     evalSelected(hand, sel, out)
     t = gn(out, 0)
     if t >= 0 {
         chips = baseChips(t) + gn(out, 3)
-        chips = if hasJoker(jok, g, 1) {
+        chips = if hasJoker(jok, g, 5) {
             chips + 30
         } else {
             chips
         }
-        chips = if hasJoker(jok, g, 3) && gn(out, 5) == 1 {
+        chips = if hasJoker(jok, g, 6) && gn(out, 14) == 1 {
             chips + 50
+        } else {
+            chips
+        }
+        chips = if hasJoker(jok, g, 7) && gn(out, 15) == 1 {
+            chips + 100
+        } else {
+            chips
+        }
+        chips = if hasJoker(jok, g, 10) {
+            chips + 2 * gv(g, "money")
+        } else {
+            chips
+        }
+        chips = if hasJoker(jok, g, 13) {
+            chips + 31 * gn(out, 13)
         } else {
             chips
         }
@@ -298,12 +436,48 @@ scoreSelected :: (hand, sel, jok, g, out) {
         } else {
             mult
         }
+        mult = if hasJoker(jok, g, 1) {
+            mult + 3 * gn(out, 11)
+        } else {
+            mult
+        }
         mult = if hasJoker(jok, g, 2) {
             mult + 3 * gn(out, 6)
         } else {
             mult
         }
+        mult = if hasJoker(jok, g, 3) {
+            mult + 3 * gn(out, 9)
+        } else {
+            mult
+        }
         mult = if hasJoker(jok, g, 4) {
+            mult + 3 * gn(out, 10)
+        } else {
+            mult
+        }
+        mult = if hasJoker(jok, g, 8) && gn(out, 4) <= 3 {
+            mult + 20
+        } else {
+            mult
+        }
+        mult = if hasJoker(jok, g, 9) && gn(out, 16) == 1 {
+            mult + 15
+        } else {
+            mult
+        }
+        mult = if hasJoker(jok, g, 12) {
+            mult + gn(out, 12)
+        } else {
+            mult
+        }
+        // Multiplicative jokers apply last.
+        mult = if hasJoker(jok, g, 11) && gv(g, "hands") == 1 {
+            mult * 3
+        } else {
+            mult
+        }
+        mult = if hasJoker(jok, g, 14) {
             mult * 2
         } else {
             mult
@@ -361,12 +535,15 @@ shuffle :: (deck) {
     })
 }
 
-deal :: (g, deck, hand) {
+// Animation slots in `av`: 0..7 card lift (x1000), 10..17 deal slide (x1000).
+deal :: (g, deck, hand, av) {
     map(range(8), (i) -> {
         pos = gv(g, "deckPos")
         if gn(hand, i) < 0 && pos < 52 {
             hand.set(i, gn(deck, pos))
             g.set("deckPos", pos + 1)
+            av.set(10 + i, 480000 + i * 45000) // slide in from the right
+            av.set(i, 0)
         }
         0
     })
@@ -382,7 +559,7 @@ removeSelected :: (hand, sel) {
     })
 }
 
-setupBlind :: (g, deck, hand, sel) {
+setupBlind :: (g, deck, hand, sel, av) {
     g.set("score", 0)
     g.set("hands", 4)
     g.set("discards", 3)
@@ -395,29 +572,48 @@ setupBlind :: (g, deck, hand, sel) {
         sel.set(i, 0)
         0
     })
-    deal(g, deck, hand)
+    deal(g, deck, hand, av)
 }
 
-restart :: (g, deck, hand, sel) {
+restart :: (g, deck, hand, sel, av) {
     g.set("phase", 0)
     g.set("ante", 1)
     g.set("blind", 0)
     g.set("money", 4)
     g.set("jokers", 0)
-    setupBlind(g, deck, hand, sel)
+    g.set("popT", 0)
+    setupBlind(g, deck, hand, sel, av)
+}
+
+rollShop :: (g) {
+    first = random(15)
+    second = (first + 1 + random(14)) % 15
+    third = (second + 1 + random(13)) % 15
+    third = if third == first {
+        (third + 1) % 15
+    } else {
+        third
+    }
+    third = if third == second {
+        (third + 1) % 15
+    } else {
+        third
+    }
+    g.set("shop0", first)
+    g.set("shop1", second)
+    g.set("shop2", third)
+    g.set("bought0", 0)
+    g.set("bought1", 0)
+    g.set("bought2", 0)
 }
 
 openShop :: (g) {
     g.set("phase", 1)
-    first = random(5)
-    g.set("shop0", first)
-    g.set("shop1", (first + 1 + random(4)) % 5)
-    g.set("bought0", 0)
-    g.set("bought1", 0)
+    rollShop(g)
 }
 
 // Advance to the next blind (after the shop) and set it up.
-nextBlind :: (g, deck, hand, sel) {
+nextBlind :: (g, deck, hand, sel, av) {
     blind = gv(g, "blind") + 1
     if blind > 2 {
         g.set("blind", 0)
@@ -426,19 +622,21 @@ nextBlind :: (g, deck, hand, sel) {
         g.set("blind", blind)
     }
     g.set("phase", 0)
-    setupBlind(g, deck, hand, sel)
+    setupBlind(g, deck, hand, sel, av)
 }
 
-playHand :: (g, deck, hand, sel, jok, out) {
+playHand :: (g, deck, hand, sel, jok, out, av) {
     scoreSelected(hand, sel, jok, g, out)
     if gn(out, 0) >= 0 && gv(g, "hands") > 0 {
         gained = gn(out, 7) * gn(out, 8)
         g.set("score", gv(g, "score") + gained)
         g.set("lastType", gn(out, 0))
         g.set("lastGain", gained)
+        g.set("popT", 60)
+        g.set("popVal", gained)
         g.set("hands", gv(g, "hands") - 1)
         removeSelected(hand, sel)
-        deal(g, deck, hand)
+        deal(g, deck, hand, av)
         if gv(g, "score") >= gv(g, "target") {
             g.set("money", gv(g, "money") + 3 + gv(g, "blind") + gv(g, "hands"))
             if gv(g, "blind") == 2 && gv(g, "ante") == 8 {
@@ -452,12 +650,50 @@ playHand :: (g, deck, hand, sel, jok, out) {
     }
 }
 
-discardSelected :: (g, deck, hand, sel) {
+discardSelected :: (g, deck, hand, sel, av) {
     if gv(g, "discards") > 0 && selCount(sel) > 0 {
         g.set("discards", gv(g, "discards") - 1)
         removeSelected(hand, sel)
-        deal(g, deck, hand)
+        deal(g, deck, hand, av)
     }
+}
+
+// Selection-sort the hand, descending by rank or by suit; selections and
+// animations travel with their cards.
+sortKey :: (Int card, Bool bySuit) -> Int {
+    if card < 0 {
+        -1
+    } else if bySuit {
+        card % 4 * 16 + card / 4
+    } else {
+        card / 4 * 4 + (3 - card % 4)
+    }
+}
+
+sortHand :: (hand, sel, av, Bool bySuit) {
+    map(range(8), (i) -> {
+        best = MutMap()
+        best.set(0, i)
+        map(range(8), (j) -> {
+            if j > i && sortKey(gn(hand, j), bySuit) > sortKey(gn(hand, gn(best, 0)), bySuit) {
+                best.set(0, j)
+            }
+            0
+        })
+        b = gn(best, 0)
+        if b != i {
+            c = gn(hand, i)
+            hand.set(i, gn(hand, b))
+            hand.set(b, c)
+            s = gn(sel, i)
+            sel.set(i, gn(sel, b))
+            sel.set(b, s)
+            l = gn(av, i)
+            av.set(i, gn(av, b))
+            av.set(b, l)
+        }
+        0
+    })
 }
 
 // ---- drawing ----------------------------------------------------------------------
@@ -466,28 +702,35 @@ handX :: (Int i) -> Int {
     250 + i * 88
 }
 
-handY :: (Int selected) -> Int {
-    if selected == 1 {
-        404
+drawCard :: (Int card, Int x, Int y, Bool hovered) {
+    grow = if hovered {
+        3
     } else {
-        420
+        0
     }
-}
-
-drawCard :: (Int card, Int x, Int y) {
-    Gfx.rect(x, y, 80, 104, 240, 238, 230, 255)
-    Gfx.rectLines(x, y, 80, 104, 2, 40, 45, 55, 255)
+    cx = x - grow
+    cy = y - grow
+    cw = 80 + grow * 2
+    ch = 104 + grow * 2
+    Gfx.rect(cx + 3, cy + 4, cw, ch, 10, 14, 18, 120) // drop shadow
+    Gfx.rect(cx, cy, cw, ch, 240, 238, 230, 255)
+    border = if hovered {
+        rgb(255, 210, 80)
+    } else {
+        rgb(40, 45, 55)
+    }
+    Gfx.rectLines(cx, cy, cw, ch, 2, border / 65536, border / 256 % 256, border % 256, 255)
     r = card / 4
     s = card % 4
     col = suitCol(s)
-    textC(rankName(r), x + 8, y + 26, 26, col)
-    textC(suitName(s), x + 8, y + 48, 20, col)
-    centerText(suitName(s), x + 40, y + 84, 40, col)
-    textC("+${chipsOf(card)}", x + 46, y + 22, 15, rgb(90, 120, 200))
+    textC(rankName(r), cx + 8, cy + 26, 26, col)
+    textC(suitName(s), cx + 8, cy + 48, 20, col)
+    centerText(suitName(s), cx + cw / 2, cy + 84, 40, col)
+    textC("+${chipsOf(card)}", cx + cw - 34, cy + 22, 15, rgb(90, 120, 200))
 }
 
 drawSidebar :: (g, hand, sel, jok, out) {
-    Gfx.rect(0, 0, 230, 540, 18, 25, 33, 255)
+    Gfx.rect(0, 0, 230, 540, 14, 19, 26, 235)
     textC("INGA-LATRO", 20, 40, 30, rgb(255, 90, 90))
     target = gv(g, "target")
     score = gv(g, "score")
@@ -498,41 +741,74 @@ drawSidebar :: (g, hand, sel, jok, out) {
     textC(blindName(gv(g, "blind")), 20, 90, 26, rgb(120, 170, 255))
     textC("Target: ${target}", 20, 118, 22, rgb(230, 230, 230))
     textC("Score", 20, 162, 20, rgb(150, 155, 160))
-    textC("${score}", 20, 198, 38, rgb(250, 250, 250))
+    pop = gv(g, "popT")
+    scoreSize = 38 + pop / 4
+    textC("${score}", 20, 198 + pop / 8, scoreSize, rgb(250, 250, 250))
     textC("Hands: ${hands}", 20, 244, 22, rgb(120, 190, 255))
     textC("Discards: ${discards}", 20, 272, 22, rgb(255, 130, 130))
     textC("Money: \$${money}", 20, 314, 26, rgb(255, 210, 80))
     textC("Ante: ${ante}/8", 20, 352, 22, rgb(200, 200, 200))
+    deckLeft = 52 - gv(g, "deckPos")
+    textC("Deck: ${deckLeft}/52", 20, 384, 18, rgb(150, 155, 160))
     if gv(g, "lastType") >= 0 {
         gained = gv(g, "lastGain")
-        textC("Last hand:", 20, 400, 18, rgb(150, 155, 160))
-        textC(handTypeName(gv(g, "lastType")), 20, 422, 18, rgb(230, 230, 230))
-        textC("+${gained}", 20, 444, 18, rgb(255, 210, 80))
+        textC("Last hand:", 20, 430, 18, rgb(150, 155, 160))
+        textC(handTypeName(gv(g, "lastType")), 20, 452, 18, rgb(230, 230, 230))
+        textC("+${gained}", 20, 474, 18, rgb(255, 210, 80))
     }
 }
 
 drawJokers :: (g, jok) {
     owned = gv(g, "jokers")
-    textC("Jokers (${owned}/5)", 250, 44, 18, rgb(150, 155, 160))
-    map(range(gv(g, "jokers")), (i) -> {
+    textC("Jokers (${owned}/5)", 250, 44, 18, rgb(170, 175, 180))
+    map(range(owned), (i) -> {
         x = 250 + i * 140
+        hovered = hit(x, 54, 130, 76)
         j = gn(jok, i)
-        Gfx.rect(x, 54, 130, 76, 60, 45, 80, 255)
-        Gfx.rectLines(x, 54, 130, 76, 2, 130, 90, 180, 255)
-        textC(jokerName(j), x + 8, 78, 16, rgb(240, 230, 250))
-        textC(jokerDesc(j), x + 8, 102, 14, rgb(180, 170, 200))
+        lift = if hovered {
+            3
+        } else {
+            0
+        }
+        Gfx.rect(x + 2, 57, 130, 76, 10, 14, 18, 120)
+        Gfx.rect(x, 54 - lift, 130, 76, 60, 45, 80, 245)
+        Gfx.rectLines(x, 54 - lift, 130, 76, 2, 130, 90, 180, 255)
+        textC(jokerName(j), x + 8, 78 - lift, 16, rgb(240, 230, 250))
+        textC(jokerDesc(j), x + 8, 102 - lift, 13, rgb(185, 175, 205))
         0
     })
 }
 
-framePlay :: (g, deck, hand, sel, jok, out) {
-    // Card selection.
+// One animation step toward `target` (fixed-point x1000 easing).
+ease :: (av, Int key, Int target) {
+    cur = gn(av, key)
+    av.set(key, cur + (target - cur) / 4)
+}
+
+framePlay :: (g, deck, hand, sel, jok, out, av) {
+    // Animate and handle card input.
     map(range(8), (i) -> {
-        if gn(hand, i) >= 0 && Gfx.mousePressed() && hit(handX(i), handY(gn(sel, i)), 80, 104) {
-            if gn(sel, i) == 1 {
-                sel.set(i, 0)
-            } else if selCount(sel) < 5 {
-                sel.set(i, 1)
+        if gn(hand, i) >= 0 {
+            slide = gn(av, 10 + i)
+            av.set(10 + i, slide * 4 / 5)
+            x = handX(i) + slide / 1000
+            lift = gn(av, i) / 1000
+            y = 424 - lift
+            hovered = hit(x, y, 80, 104)
+            target = if gn(sel, i) == 1 {
+                26000
+            } else if hovered {
+                10000
+            } else {
+                0
+            }
+            ease(av, i, target)
+            if hovered && Gfx.mousePressed() {
+                if gn(sel, i) == 1 {
+                    sel.set(i, 0)
+                } else if selCount(sel) < 5 {
+                    sel.set(i, 1)
+                }
             }
         }
         0
@@ -545,77 +821,116 @@ framePlay :: (g, deck, hand, sel, jok, out) {
     n = selCount(sel)
     if n > 0 {
         scoreSelected(hand, sel, jok, g, out)
-        preview = "${handTypeName(gn(out, 0))}   ${gn(out, 7)} x ${gn(out, 8)} = ${gn(out, 7) * gn(out, 8)}"
+        chips = gn(out, 7)
+        mult = gn(out, 8)
+        total = chips * mult
+        preview = "${handTypeName(gn(out, 0))}   ${chips} x ${mult} = ${total}"
         textC(preview, 250, 346, 24, rgb(255, 240, 180))
     } else {
-        textC("Select up to 5 cards", 250, 346, 24, rgb(120, 125, 135))
+        textC("Select up to 5 cards", 250, 346, 24, rgb(140, 145, 155))
     }
 
     if button("Play Hand", 250, 360, 150, 46, n > 0 && gv(g, "hands") > 0, rgb(60, 130, 246)) {
-        playHand(g, deck, hand, sel, jok, out)
+        playHand(g, deck, hand, sel, jok, out, av)
     }
     if button("Discard", 420, 360, 150, 46, n > 0 && gv(g, "discards") > 0, rgb(220, 70, 80)) {
-        discardSelected(g, deck, hand, sel)
+        discardSelected(g, deck, hand, sel, av)
+    }
+    if button("Rank", 760, 360, 80, 46, true, rgb(90, 100, 120)) {
+        sortHand(hand, sel, av, false)
+    }
+    if button("Suit", 850, 360, 80, 46, true, rgb(90, 100, 120)) {
+        sortHand(hand, sel, av, true)
     }
 
     // The hand.
     map(range(8), (i) -> {
         if gn(hand, i) >= 0 {
-            drawCard(gn(hand, i), handX(i), handY(gn(sel, i)))
+            x = handX(i) + gn(av, 10 + i) / 1000
+            y = 424 - gn(av, i) / 1000
+            hovered = hit(x, y, 80, 104) && gn(sel, i) == 0
+            drawCard(gn(hand, i), x, y, hovered)
         }
         0
     })
+
+    // Floating score popup.
+    pop = gv(g, "popT")
+    if pop > 0 {
+        g.set("popT", pop - 1)
+        val = gv(g, "popVal")
+        y = 320 - (60 - pop)
+        size = 30 + pop / 3
+        centerText("+${val}", 600, y, size, dim(rgb(255, 215, 90), 55 + pop * 200 / 60))
+    }
     0
 }
 
 shopOffer :: (g, jok, Int slot) {
-    x = 360 + slot * 200
-    j = if slot == 0 {
-        gv(g, "shop0")
-    } else {
-        gv(g, "shop1")
+    x = 300 + slot * 200
+    j = match slot {
+        0 -> gv(g, "shop0")
+        1 -> gv(g, "shop1")
+        _ -> gv(g, "shop2")
     }
-    bought = if slot == 0 {
-        gv(g, "bought0")
-    } else {
-        gv(g, "bought1")
+    bought = match slot {
+        0 -> gv(g, "bought0")
+        1 -> gv(g, "bought1")
+        _ -> gv(g, "bought2")
     }
-    Gfx.rect(x, 170, 170, 180, 60, 45, 80, 255)
-    Gfx.rectLines(x, 170, 170, 180, 2, 130, 90, 180, 255)
-    textC(jokerName(j), x + 12, 200, 18, rgb(240, 230, 250))
-    textC(jokerDesc(j), x + 12, 228, 15, rgb(180, 170, 200))
+    hovered = bought == 0 && hit(x, 170, 170, 180)
+    lift = if hovered {
+        4
+    } else {
+        0
+    }
+    Gfx.rect(x + 3, 174, 170, 180, 8, 10, 14, 140)
+    Gfx.rect(x, 170 - lift, 170, 180, 60, 45, 80, 250)
+    border = if hovered {
+        rgb(255, 210, 80)
+    } else {
+        rgb(130, 90, 180)
+    }
+    Gfx.rectLines(x, 170 - lift, 170, 180, 2, border / 65536, border / 256 % 256, border % 256, 255)
+    textC(jokerName(j), x + 12, 200 - lift, 18, rgb(240, 230, 250))
+    textC(jokerDesc(j), x + 12, 228 - lift, 14, rgb(185, 175, 205))
     if bought == 1 {
         centerText("SOLD", x + 85, 300, 26, rgb(150, 150, 150))
     } else {
         affordable = gv(g, "money") >= jokerPrice(j) && gv(g, "jokers") < 5
-        if button("Buy  \$${jokerPrice(j)}", x + 25, 280, 120, 40, affordable, rgb(60, 130, 246)) {
+        if button("Buy  \$${jokerPrice(j)}", x + 25, 280 - lift, 120, 40, affordable, rgb(60, 130, 246)) {
             g.set("money", gv(g, "money") - jokerPrice(j))
             jok.set(gv(g, "jokers"), j)
             g.set("jokers", gv(g, "jokers") + 1)
-            if slot == 0 {
-                g.set("bought0", 1)
-            } else {
-                g.set("bought1", 1)
+            match slot {
+                0 -> g.set("bought0", 1)
+                1 -> g.set("bought1", 1)
+                _ -> g.set("bought2", 1)
             }
         }
     }
 }
 
-frameShop :: (g, deck, hand, sel, jok, out) {
+frameShop :: (g, deck, hand, sel, jok, out, av) {
     drawSidebar(g, hand, sel, jok, out)
     drawJokers(g, jok)
-    Gfx.rect(250, 90, 690, 400, 28, 22, 40, 255)
+    Gfx.rect(250, 90, 690, 400, 24, 18, 36, 235)
     Gfx.rectLines(250, 90, 690, 400, 3, 130, 90, 180, 255)
     centerText("SHOP", 595, 140, 36, rgb(255, 210, 80))
     shopOffer(g, jok, 0)
     shopOffer(g, jok, 1)
-    if button("Next Blind", 515, 410, 160, 46, true, rgb(60, 170, 110)) {
-        nextBlind(g, deck, hand, sel)
+    shopOffer(g, jok, 2)
+    if button("Reroll  \$2", 360, 410, 150, 46, gv(g, "money") >= 2, rgb(220, 140, 60)) {
+        g.set("money", gv(g, "money") - 2)
+        rollShop(g)
+    }
+    if button("Next Blind", 590, 410, 160, 46, true, rgb(60, 170, 110)) {
+        nextBlind(g, deck, hand, sel, av)
     }
     0
 }
 
-frameEnd :: (g, deck, hand, sel, Bool won) {
+frameEnd :: (g, deck, hand, sel, av, Bool won) {
     title = if won {
         "YOU WIN"
     } else {
@@ -628,22 +943,23 @@ frameEnd :: (g, deck, hand, sel, Bool won) {
     }
     centerText(title, 480, 240, 64, col)
     ante = gv(g, "ante")
-    centerText("Ante ${ante} - ${blindName(gv(g, "blind"))}", 480, 290, 24, rgb(200, 200, 200))
+    blind = blindName(gv(g, "blind"))
+    centerText("Ante ${ante} - ${blind}", 480, 290, 24, rgb(220, 220, 220))
     if button("New Run", 390, 330, 180, 50, true, rgb(60, 130, 246)) {
-        restart(g, deck, hand, sel)
+        restart(g, deck, hand, sel, av)
     }
     0
 }
 
-frame :: (g, deck, hand, sel, jok, out) {
-    Gfx.clear(32, 44, 56)
+frame :: (g, deck, hand, sel, jok, out, av) {
+    drawBackground(g)
     phase = gv(g, "phase")
     if phase == 0 {
-        framePlay(g, deck, hand, sel, jok, out)
+        framePlay(g, deck, hand, sel, jok, out, av)
     } else if phase == 1 {
-        frameShop(g, deck, hand, sel, jok, out)
+        frameShop(g, deck, hand, sel, jok, out, av)
     } else {
-        frameEnd(g, deck, hand, sel, phase == 3)
+        frameEnd(g, deck, hand, sel, av, phase == 3)
     }
 }
 
@@ -654,6 +970,7 @@ main :: () {
     sel = MutMap()
     jok = MutMap()
     out = MutMap()
-    restart(g, deck, hand, sel)
-    Gfx.run(960, 540, "INGA-LATRO", () -> frame(g, deck, hand, sel, jok, out))
+    av = MutMap()
+    restart(g, deck, hand, sel, av)
+    Gfx.run(960, 540, "INGA-LATRO", () -> frame(g, deck, hand, sel, jok, out, av))
 }

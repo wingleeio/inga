@@ -129,19 +129,30 @@ fn cmd_build(args: &[String]) -> ExitCode {
     }
 
     // The runtime staticlib is built next to this binary by cargo.
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_default();
     let rt_lib = match std::env::var("INGA_RT_LIB") {
         Ok(p) => std::path::PathBuf::from(p),
-        Err(_) => {
-            let exe_dir = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(Path::to_path_buf))
-                .unwrap_or_default();
-            exe_dir.join("libinga_rt.a")
-        }
+        Err(_) => exe_dir.join("libinga_rt.a"),
     };
     if !rt_lib.exists() {
+        // Dev convenience: inside the repo, build it on demand (a plain
+        // `cargo run -p inga-cli` doesn't build inga-rt, which is not a
+        // dependency — the staticlib is only an artifact of its own build).
+        eprintln!("runtime library missing; running `cargo build -p inga-rt`...");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let mut build_rt = std::process::Command::new(cargo);
+        build_rt.args(["build", "-p", "inga-rt"]);
+        if exe_dir.file_name().is_some_and(|n| n == "release") {
+            build_rt.arg("--release");
+        }
+        let _ = build_rt.status();
+    }
+    if !rt_lib.exists() {
         eprintln!(
-            "error: runtime library not found at {} (build it with `cargo build -p inga-rt`, or set INGA_RT_LIB)",
+            "error: runtime library not found at {} (build it with `cargo build -p inga-rt` from the Inga repo, or set INGA_RT_LIB to a built libinga_rt.a)",
             rt_lib.display()
         );
         return ExitCode::FAILURE;

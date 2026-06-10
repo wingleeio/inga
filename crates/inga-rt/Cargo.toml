@@ -9,3 +9,4 @@ license.workspace = true
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+macroquad = { version = "0.4", default-features = false }

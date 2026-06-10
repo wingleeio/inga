@@ -547,13 +547,16 @@ impl<'a> Cg<'a> {
     // ---- calls ----------------------------------------------------------------------
 
     fn gen_call(&mut self, f: &mut FnCtx, callee: &Expr, args: &[&Expr], span: Span) -> String {
-        // Schedule.exponential / Schedule.fixed
+        // Builtin modules: Schedule.*, Gfx.*
         if let ExprKind::Field { recv, name, .. } | ExprKind::Method { recv, name, .. } =
             &callee.kind
         {
             if let ExprKind::Var(module) = &recv.kind {
                 if module == "Schedule" && f.lookup(module).is_none() {
                     return self.gen_schedule(f, name, args, span);
+                }
+                if module == "Gfx" && f.lookup(module).is_none() {
+                    return self.gen_gfx(f, name, args, span);
                 }
             }
         }
@@ -647,6 +650,9 @@ impl<'a> Cg<'a> {
         if let ExprKind::Var(module) = &recv.kind {
             if module == "Schedule" && f.lookup(module).is_none() {
                 return self.gen_schedule(f, name, args, span);
+            }
+            if module == "Gfx" && f.lookup(module).is_none() {
+                return self.gen_gfx(f, name, args, span);
             }
         }
         let recv_ty = self.ctype_of(recv);
@@ -1408,6 +1414,53 @@ impl<'a> Cg<'a> {
         self.ptr_to_int(f, &ptr)
     }
 
+    /// The graphics module: thin calls into the GL-backed runtime. `run`
+    /// builds the frame closure and hands the loop to the runtime.
+    fn gen_gfx(&mut self, f: &mut FnCtx, name: &str, args: &[&Expr], span: Span) -> String {
+        if name == "run" {
+            if args.len() != 4 {
+                self.unsupported(span, "this `Gfx.run` call shape");
+                return "0".to_string();
+            }
+            let w = self.gen_expr(f, args[0]);
+            let h = self.gen_expr(f, args[1]);
+            let title = self.gen_expr(f, args[2]);
+            // The frame argument must be a closure value.
+            let frame = self.gen_expr(f, args[3]);
+            f.line(format!("call void @rt_gfx_run(i64 {w}, i64 {h}, i64 {title}, i64 {frame})"));
+            return "0".to_string();
+        }
+        let (rt_name, arity, has_ret) = match name {
+            "clear" => ("rt_gfx_clear", 3, false),
+            "rect" => ("rt_gfx_rect", 8, false),
+            "rectLines" => ("rt_gfx_rect_lines", 9, false),
+            "circle" => ("rt_gfx_circle", 7, false),
+            "text" => ("rt_gfx_text", 7, false),
+            "textWidth" => ("rt_gfx_text_width", 2, true),
+            "mouseX" => ("rt_gfx_mouse_x", 0, true),
+            "mouseY" => ("rt_gfx_mouse_y", 0, true),
+            "mousePressed" => ("rt_gfx_mouse_pressed", 0, true),
+            _ => {
+                self.unsupported(span, "this graphics call");
+                return "0".to_string();
+            }
+        };
+        if args.len() != arity {
+            self.unsupported(span, "this graphics call shape");
+            return "0".to_string();
+        }
+        let vals: Vec<String> =
+            args.iter().map(|a| format!("i64 {}", self.gen_expr(f, a))).collect();
+        if has_ret {
+            let out = self.tmp();
+            f.line(format!("{out} = call i64 @{rt_name}({})", vals.join(", ")));
+            out
+        } else {
+            f.line(format!("call void @{rt_name}({})", vals.join(", ")));
+            "0".to_string()
+        }
+    }
+
     /// Returns Some(value) when `name` is a builtin call.
     fn gen_builtin(&mut self, f: &mut FnCtx, name: &str, args: &[&Expr], span: Span) -> Option<String> {
         let v = match name {
@@ -1570,6 +1623,18 @@ impl<'a> Cg<'a> {
             "nowMicros" => {
                 let out = self.tmp();
                 f.line(format!("{out} = call i64 @rt_now_micros()"));
+                out
+            }
+            "range" if args.len() == 1 => {
+                let n = self.gen_expr(f, args[0]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_range(i64 {n})"));
+                out
+            }
+            "random" if args.len() == 1 => {
+                let n = self.gen_expr(f, args[0]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_random(i64 {n})"));
                 out
             }
             "MutMap" => {
@@ -1997,4 +2062,16 @@ declare void @rt_map_set_str(i64, i64, i64)
 declare i64 @rt_map_get_str(i64, i64)
 declare void @rt_map_del_str(i64, i64)
 declare i64 @rt_map_size(i64)
+declare i64 @rt_range(i64)
+declare i64 @rt_random(i64)
+declare void @rt_gfx_run(i64, i64, i64, i64)
+declare void @rt_gfx_clear(i64, i64, i64)
+declare void @rt_gfx_rect(i64, i64, i64, i64, i64, i64, i64, i64)
+declare void @rt_gfx_rect_lines(i64, i64, i64, i64, i64, i64, i64, i64, i64)
+declare void @rt_gfx_circle(i64, i64, i64, i64, i64, i64, i64)
+declare void @rt_gfx_text(i64, i64, i64, i64, i64, i64, i64)
+declare i64 @rt_gfx_text_width(i64, i64)
+declare i64 @rt_gfx_mouse_x()
+declare i64 @rt_gfx_mouse_y()
+declare i64 @rt_gfx_mouse_pressed()
 "#;

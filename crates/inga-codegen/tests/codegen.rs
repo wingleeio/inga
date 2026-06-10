@@ -32,6 +32,23 @@ fn bench_program_produces_ir() {
 }
 
 #[test]
+fn balatro_game_produces_ir() {
+    let path = format!("{}/../../games/balatro.inga", env!("CARGO_MANIFEST_DIR"));
+    let src = std::fs::read_to_string(path).unwrap();
+    let checked = check_source(&src);
+    let errors: Vec<&str> = checked
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == inga_core::diag::Severity::Error)
+        .map(|d| d.message.as_str())
+        .collect();
+    assert!(errors.is_empty(), "game has check errors: {errors:?}");
+    let ir = inga_codegen::compile(&checked.program, &checked.info).expect("game compiles");
+    assert!(ir.contains("@rt_gfx_run"), "game should hand the loop to the runtime");
+    assert!(ir.contains("@rt_gfx_rect"), "game should draw");
+}
+
+#[test]
 fn unsupported_constructs_are_clear_errors() {
     let src = example("user_service.inga");
     let checked = check_source(&src);

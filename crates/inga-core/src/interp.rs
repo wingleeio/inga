@@ -133,6 +133,8 @@ pub struct Interp<'a> {
     pub output: RefCell<Option<String>>,
     /// Epoch for `nowMillis()`.
     start: std::time::Instant,
+    /// xorshift64* state for `random()` (0 = unseeded).
+    rng: std::cell::Cell<u64>,
 }
 
 pub fn run(program: &Program, entry: &str) -> Result<(), RuntimeError> {
@@ -215,6 +217,7 @@ impl<'a> Interp<'a> {
             provided: RefCell::new(Vec::new()),
             output: RefCell::new(None),
             start: std::time::Instant::now(),
+            rng: std::cell::Cell::new(0),
         }
     }
 
@@ -488,11 +491,14 @@ impl<'a> Interp<'a> {
         span: Span,
         scope: &Scope<'a>,
     ) -> EvalResult<'a> {
-        // `Schedule.exponential(...)` / `Schedule.fixed(...)`
+        // Builtin modules: `Schedule.*`, `Gfx.*`.
         if let ExprKind::Field { recv, name, .. } = &callee.kind {
             if let ExprKind::Var(module) = &recv.kind {
                 if module == "Schedule" && scope.get(module).is_none() {
                     return self.eval_schedule_call(name, args, span, scope);
+                }
+                if module == "Gfx" && scope.get(module).is_none() {
+                    return self.eval_gfx_call(name, args, span, scope);
                 }
             }
         }
@@ -646,6 +652,155 @@ impl<'a> Interp<'a> {
         Ok(Value::Schedule(ScheduleVal { kind, base_ms, max_retries: None }))
     }
 
+    /// The graphics module (interpreter side). Available when inga-core is
+    /// built with the `gfx` feature (the CLI enables it; the LSP does not).
+    #[cfg(feature = "gfx")]
+    fn eval_gfx_call(
+        &self,
+        name: &str,
+        args: &[&'a Expr],
+        span: Span,
+        scope: &Scope<'a>,
+    ) -> EvalResult<'a> {
+        use macroquad::prelude as mq;
+
+        fn color(r: i64, g: i64, b: i64, a: i64) -> mq::Color {
+            mq::Color::from_rgba(r as u8, g as u8, b as u8, a as u8)
+        }
+        // Evaluate all args up front (every Gfx call is eager).
+        let mut vals = Vec::with_capacity(args.len());
+        for arg in args {
+            vals.push(self.eval(arg, scope)?);
+        }
+        let int = |i: usize| -> i64 {
+            match vals.get(i) {
+                Some(Value::Int(n)) => *n,
+                _ => 0,
+            }
+        };
+        match name {
+            "run" => {
+                let (Some(Value::Str(title)), Some(frame)) = (vals.get(2), vals.get(3)) else {
+                    return self.fatal(span, "`Gfx.run` takes (width, height, title, frame)");
+                };
+                let conf = macroquad::window::Conf {
+                    window_title: title.to_string(),
+                    window_width: int(0) as i32,
+                    window_height: int(1) as i32,
+                    high_dpi: true,
+                    ..Default::default()
+                };
+                // SAFETY: `Window::from_config` blocks until the window
+                // closes, and `self`/the AST outlive that call; the 'static
+                // lifetimes never escape it.
+                let interp: &'static Interp<'static> = unsafe { std::mem::transmute(self) };
+                let frame: Value<'static> = unsafe { std::mem::transmute(frame.clone()) };
+                // Debug/CI hook shared with the native runtime.
+                let shot = std::env::var("INGA_GFX_SHOT").ok();
+                macroquad::Window::from_config(conf, async move {
+                    let mut frame_no = 0u32;
+                    loop {
+                        match interp.apply(frame.clone(), Vec::new(), Span::default()) {
+                            Ok(_) => {}
+                            Err(Failure::Fatal(e)) => {
+                                eprintln!("runtime error: {}", e.message);
+                                std::process::exit(101);
+                            }
+                            Err(Failure::Error { value, .. }) => {
+                                eprintln!(
+                                    "runtime error: unhandled error in frame: {}",
+                                    show(&value)
+                                );
+                                std::process::exit(101);
+                            }
+                        }
+                        frame_no += 1;
+                        if let Some(path) = &shot {
+                            if frame_no == 30 {
+                                macroquad::texture::get_screen_data().export_png(path);
+                                std::process::exit(0);
+                            }
+                        }
+                        macroquad::window::next_frame().await;
+                    }
+                });
+                Ok(Value::Unit)
+            }
+            "clear" => {
+                mq::clear_background(color(int(0), int(1), int(2), 255));
+                Ok(Value::Unit)
+            }
+            "rect" => {
+                mq::draw_rectangle(
+                    int(0) as f32,
+                    int(1) as f32,
+                    int(2) as f32,
+                    int(3) as f32,
+                    color(int(4), int(5), int(6), int(7)),
+                );
+                Ok(Value::Unit)
+            }
+            "rectLines" => {
+                mq::draw_rectangle_lines(
+                    int(0) as f32,
+                    int(1) as f32,
+                    int(2) as f32,
+                    int(3) as f32,
+                    int(4) as f32,
+                    color(int(5), int(6), int(7), int(8)),
+                );
+                Ok(Value::Unit)
+            }
+            "circle" => {
+                mq::draw_circle(
+                    int(0) as f32,
+                    int(1) as f32,
+                    int(2) as f32,
+                    color(int(3), int(4), int(5), int(6)),
+                );
+                Ok(Value::Unit)
+            }
+            "text" => {
+                let Some(Value::Str(text)) = vals.first() else {
+                    return self.fatal(span, "`Gfx.text` needs a String first");
+                };
+                mq::draw_text(
+                    text.as_str(),
+                    int(1) as f32,
+                    int(2) as f32,
+                    int(3) as f32,
+                    color(int(4), int(5), int(6), 255),
+                );
+                Ok(Value::Unit)
+            }
+            "textWidth" => {
+                let Some(Value::Str(text)) = vals.first() else {
+                    return self.fatal(span, "`Gfx.textWidth` needs a String first");
+                };
+                let dims = mq::measure_text(text.as_str(), None, (int(1) as f32) as u16, 1.0);
+                Ok(Value::Int(dims.width as i64))
+            }
+            "mouseX" => Ok(Value::Int(mq::mouse_position().0 as i64)),
+            "mouseY" => Ok(Value::Int(mq::mouse_position().1 as i64)),
+            "mousePressed" => Ok(Value::Bool(mq::is_mouse_button_pressed(mq::MouseButton::Left))),
+            _ => self.fatal(span, format!("unknown graphics call `Gfx.{name}`")),
+        }
+    }
+
+    #[cfg(not(feature = "gfx"))]
+    fn eval_gfx_call(
+        &self,
+        _name: &str,
+        _args: &[&'a Expr],
+        span: Span,
+        _scope: &Scope<'a>,
+    ) -> EvalResult<'a> {
+        self.fatal(
+            span,
+            "this interpreter was built without graphics support — use `inga build`, or build the CLI with the `gfx` feature",
+        )
+    }
+
     /// Returns None if `name` is not a builtin.
     fn eval_builtin(
         &self,
@@ -760,6 +915,35 @@ impl<'a> Interp<'a> {
             "nowMicros" if args.is_empty() => {
                 Ok(Value::Int(self.start.elapsed().as_micros() as i64))
             }
+            "range" if args.len() == 1 => match self.eval(args[0], scope) {
+                Ok(Value::Int(n)) => {
+                    Ok(Value::List(Rc::new((0..n.max(0)).map(Value::Int).collect())))
+                }
+                Ok(_) => self.fatal(args[0].span, "`range` needs an Int"),
+                Err(e) => Err(e),
+            },
+            "random" if args.len() == 1 => match self.eval(args[0], scope) {
+                Ok(Value::Int(n)) if n > 0 => {
+                    let mut s = self.rng.get();
+                    if s == 0 {
+                        s = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(0x4d595df4d0f33173)
+                            | 1;
+                    }
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    self.rng.set(s);
+                    Ok(Value::Int(
+                        ((s.wrapping_mul(0x2545F4914F6CDD1D) >> 32) % n as u64) as i64,
+                    ))
+                }
+                Ok(Value::Int(_)) => Ok(Value::Int(0)),
+                Ok(_) => self.fatal(args[0].span, "`random` needs an Int"),
+                Err(e) => Err(e),
+            },
             "Some" if args.len() == 1 => match self.eval(args[0], scope) {
                 Ok(v) => Ok(Value::Option(Some(Rc::new(v)))),
                 Err(e) => Err(e),
@@ -877,6 +1061,9 @@ impl<'a> Interp<'a> {
         if let ExprKind::Var(module) = &recv.kind {
             if module == "Schedule" && scope.get(module).is_none() {
                 return self.eval_schedule_call(name, args, span, scope);
+            }
+            if module == "Gfx" && scope.get(module).is_none() {
+                return self.eval_gfx_call(name, args, span, scope);
             }
         }
         let recv_value = self.eval(recv, scope)?;

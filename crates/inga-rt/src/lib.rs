@@ -422,3 +422,173 @@ map_ops!(rt_map_set_str, rt_map_get_str, rt_map_get_or_str, rt_map_del_str, str_
 pub extern "C" fn rt_map_size(m: i64) -> i64 {
     map_ref(m).len as i64
 }
+
+// ---- range / random -------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn rt_range(n: i64) -> i64 {
+    let n = n.max(0);
+    let p = rt_alloc(8 * (n + 1)) as *mut i64;
+    unsafe {
+        *p = n;
+        for i in 0..n {
+            *p.add(1 + i as usize) = i;
+        }
+    }
+    p as i64
+}
+
+static mut RNG_STATE: u64 = 0;
+
+/// xorshift64*, seeded from the clock on first use.
+#[no_mangle]
+pub extern "C" fn rt_random(n: i64) -> i64 {
+    if n <= 0 {
+        return 0;
+    }
+    unsafe {
+        if RNG_STATE == 0 {
+            RNG_STATE = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x4d595df4d0f33173)
+                | 1;
+        }
+        RNG_STATE ^= RNG_STATE << 13;
+        RNG_STATE ^= RNG_STATE >> 7;
+        RNG_STATE ^= RNG_STATE << 17;
+        ((RNG_STATE.wrapping_mul(0x2545F4914F6CDD1D) >> 32) % n as u64) as i64
+    }
+}
+
+// ---- graphics (GL-backed via miniquad/macroquad) ----------------------------------
+//
+// `rt_gfx_run` owns the window and event loop and invokes the Inga frame
+// closure once per frame, so Inga programs never need an unbounded game-loop
+// recursion. The closure uses the standard closure ABI:
+// `{ fnptr, captures... }`, `fnptr(env) -> { value, err }`.
+
+#[repr(C)]
+pub struct RetPair {
+    pub value: i64,
+    pub err: i64,
+}
+
+type FrameFn = unsafe extern "C" fn(*mut u8) -> RetPair;
+
+#[no_mangle]
+pub extern "C" fn rt_gfx_run(width: i64, height: i64, title: i64, closure: i64) {
+    let title = unsafe { String::from_utf8_lossy(str_bytes(title)).into_owned() };
+    let conf = macroquad::window::Conf {
+        window_title: title,
+        window_width: width as i32,
+        window_height: height as i32,
+        high_dpi: true,
+        ..Default::default()
+    };
+    // Debug/CI hook: INGA_GFX_SHOT=<path.png> renders 30 frames, saves a
+    // screenshot of the framebuffer, and exits.
+    let shot = std::env::var("INGA_GFX_SHOT").ok();
+    macroquad::Window::from_config(conf, async move {
+        let mut frame_no = 0u32;
+        loop {
+            let env = closure as *mut u8;
+            let fp: FrameFn = unsafe { std::mem::transmute(*(env as *const i64)) };
+            let r = unsafe { fp(env) };
+            if r.err != 0 {
+                eprintln!("runtime error: unhandled error escaped the frame closure");
+                std::process::exit(101);
+            }
+            frame_no += 1;
+            if let Some(path) = &shot {
+                if frame_no == 30 {
+                    macroquad::texture::get_screen_data().export_png(path);
+                    std::process::exit(0);
+                }
+            }
+            macroquad::window::next_frame().await;
+        }
+    });
+}
+
+fn color(r: i64, g: i64, b: i64, a: i64) -> macroquad::color::Color {
+    macroquad::color::Color::from_rgba(r as u8, g as u8, b as u8, a as u8)
+}
+
+#[no_mangle]
+pub extern "C" fn rt_gfx_clear(r: i64, g: i64, b: i64) {
+    macroquad::window::clear_background(color(r, g, b, 255));
+}
+
+#[no_mangle]
+pub extern "C" fn rt_gfx_rect(x: i64, y: i64, w: i64, h: i64, r: i64, g: i64, b: i64, a: i64) {
+    macroquad::shapes::draw_rectangle(
+        x as f32,
+        y as f32,
+        w as f32,
+        h as f32,
+        color(r, g, b, a),
+    );
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn rt_gfx_rect_lines(
+    x: i64,
+    y: i64,
+    w: i64,
+    h: i64,
+    thickness: i64,
+    r: i64,
+    g: i64,
+    b: i64,
+    a: i64,
+) {
+    macroquad::shapes::draw_rectangle_lines(
+        x as f32,
+        y as f32,
+        w as f32,
+        h as f32,
+        thickness as f32,
+        color(r, g, b, a),
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn rt_gfx_circle(x: i64, y: i64, radius: i64, r: i64, g: i64, b: i64, a: i64) {
+    macroquad::shapes::draw_circle(x as f32, y as f32, radius as f32, color(r, g, b, a));
+}
+
+#[no_mangle]
+pub extern "C" fn rt_gfx_text(text: i64, x: i64, y: i64, size: i64, r: i64, g: i64, b: i64) {
+    let text = unsafe { std::str::from_utf8_unchecked(str_bytes(text)) };
+    macroquad::text::draw_text(
+        text,
+        x as f32,
+        y as f32,
+        size as f32,
+        color(r, g, b, 255),
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn rt_gfx_text_width(text: i64, size: i64) -> i64 {
+    let text = unsafe { std::str::from_utf8_unchecked(str_bytes(text)) };
+    let dims = macroquad::text::measure_text(text, None, (size as f32) as u16, 1.0);
+    dims.width as i64
+}
+
+#[no_mangle]
+pub extern "C" fn rt_gfx_mouse_x() -> i64 {
+    macroquad::input::mouse_position().0 as i64
+}
+
+#[no_mangle]
+pub extern "C" fn rt_gfx_mouse_y() -> i64 {
+    macroquad::input::mouse_position().1 as i64
+}
+
+#[no_mangle]
+pub extern "C" fn rt_gfx_mouse_pressed() -> i64 {
+    macroquad::input::is_mouse_button_pressed(macroquad::input::MouseButton::Left) as i64
+}

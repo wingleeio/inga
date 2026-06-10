@@ -147,14 +147,21 @@ fn cmd_build(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let status = std::process::Command::new("clang")
+    let mut clang = std::process::Command::new("clang");
+    clang
         .arg("-O2")
         .arg("-Wno-override-module")
         .arg(&ll_path)
         .arg(&rt_lib)
         .arg("-o")
-        .arg(&out_path)
-        .status();
+        .arg(&out_path);
+    // The runtime's GL window layer (miniquad) needs the system frameworks.
+    if cfg!(target_os = "macos") {
+        for framework in ["Cocoa", "OpenGL", "QuartzCore", "Metal", "MetalKit"] {
+            clang.arg("-framework").arg(framework);
+        }
+    }
+    let status = clang.status();
     match status {
         Ok(s) if s.success() => {
             if !emit_ir {

@@ -965,11 +965,14 @@ impl<'a> Checker<'a> {
     // ---- calls -----------------------------------------------------------------
 
     fn check_call(&mut self, callee: &Expr, args: &[&Expr], span: Span) -> Type {
-        // `Schedule.exponential(...)` / `Schedule.fixed(...)`
+        // Builtin modules: `Schedule.exponential(...)`, `Gfx.rect(...)`.
         if let ExprKind::Field { recv, name, name_span } = &callee.kind {
             if let ExprKind::Var(module) = &recv.kind {
                 if module == "Schedule" && !self.scope_has(module) {
                     return self.check_schedule_call(name, *name_span, args, span);
+                }
+                if module == "Gfx" && !self.scope_has(module) {
+                    return self.check_gfx_call(name, *name_span, args, span);
                 }
             }
         }
@@ -1117,6 +1120,85 @@ impl<'a> Checker<'a> {
                 Type::Schedule
             }
         }
+    }
+
+    /// The GL-backed graphics module. Signatures are (Int coordinates,
+    /// 0–255 Int color channels); `run` takes the per-frame closure.
+    fn check_gfx_call(
+        &mut self,
+        name: &str,
+        name_span: Span,
+        args: &[&Expr],
+        span: Span,
+    ) -> Type {
+        // (param types, return type); String = Str, closure handled separately.
+        let sig: Option<(Vec<Type>, Type)> = match name {
+            "run" => None, // special-cased below
+            "clear" => Some((vec![Type::Int; 3], Type::Unit)),
+            "rect" => Some((vec![Type::Int; 8], Type::Unit)),
+            "rectLines" => Some((vec![Type::Int; 9], Type::Unit)),
+            "circle" => Some((vec![Type::Int; 7], Type::Unit)),
+            "text" => Some((
+                vec![Type::Str, Type::Int, Type::Int, Type::Int, Type::Int, Type::Int, Type::Int],
+                Type::Unit,
+            )),
+            "textWidth" => Some((vec![Type::Str, Type::Int], Type::Int)),
+            "mouseX" | "mouseY" => Some((vec![], Type::Int)),
+            "mousePressed" => Some((vec![], Type::Bool)),
+            _ => {
+                self.error(
+                    name_span,
+                    format!(
+                        "unknown graphics call `Gfx.{name}` (run, clear, rect, rectLines, circle, text, textWidth, mouseX, mouseY, mousePressed)"
+                    ),
+                );
+                for arg in args {
+                    self.check_expr(arg);
+                }
+                return Type::Unknown;
+            }
+        };
+        if name == "run" {
+            // Gfx.run(Int width, Int height, String title, frame) — the
+            // runtime owns the event loop and calls `frame` once per frame.
+            if args.len() != 4 {
+                self.error(span, "`Gfx.run` takes (width, height, title, frame)");
+            }
+            for (i, expected) in [Type::Int, Type::Int, Type::Str].iter().enumerate() {
+                if let Some(arg) = args.get(i) {
+                    let ty = self.check_expr(arg);
+                    self.unify_at(expected, &ty, arg.span, "Gfx.run argument");
+                }
+            }
+            if let Some(frame) = args.get(3) {
+                let frame_ty = self.check_expr(frame);
+                let expected = Type::Func(Rc::new(FuncType {
+                    params: vec![],
+                    ret: self.ctx.fresh(),
+                    errors: BTreeSet::new(),
+                    caps: BTreeSet::new(),
+                }));
+                self.unify_at(&expected, &frame_ty, frame.span, "Gfx.run frame closure");
+                // The closure's rows surface at this call site.
+                self.add_func_arg_rows(&frame_ty);
+            }
+            return Type::Unit;
+        }
+        let (params, ret) = sig.unwrap();
+        if args.len() != params.len() {
+            self.error(
+                span,
+                format!("`Gfx.{name}` expects {} argument(s), found {}", params.len(), args.len()),
+            );
+        }
+        for (param, arg) in params.iter().zip(args.iter()) {
+            let ty = self.check_expr(arg);
+            self.unify_at(param, &ty, arg.span, "graphics argument");
+        }
+        for arg in args.iter().skip(params.len()) {
+            self.check_expr(arg);
+        }
+        ret
     }
 
     /// Handles builtin function calls; returns None when `name` is not builtin.
@@ -1298,6 +1380,20 @@ impl<'a> Checker<'a> {
                 check_arity(self, 0);
                 Type::Int
             }
+            "range" => {
+                if check_arity(self, 1) {
+                    let ty = self.check_expr(args[0]);
+                    self.unify_at(&Type::Int, &ty, args[0].span, "range bound");
+                }
+                Type::List(Box::new(Type::Int))
+            }
+            "random" => {
+                if check_arity(self, 1) {
+                    let ty = self.check_expr(args[0]);
+                    self.unify_at(&Type::Int, &ty, args[0].span, "random bound");
+                }
+                Type::Int
+            }
             "Some" => {
                 if !check_arity(self, 1) {
                     return Some(Type::Option(Box::new(Type::Unknown)));
@@ -1323,10 +1419,13 @@ impl<'a> Checker<'a> {
         args: &[&Expr],
         span: Span,
     ) -> Type {
-        // `Schedule.x(...)` arrives as Method when called directly.
+        // `Schedule.x(...)` / `Gfx.x(...)` arrive as Method when called directly.
         if let ExprKind::Var(module) = &recv.kind {
             if module == "Schedule" && !self.scope_has(module) {
                 return self.check_schedule_call(name, name_span, args, span);
+            }
+            if module == "Gfx" && !self.scope_has(module) {
+                return self.check_gfx_call(name, name_span, args, span);
             }
         }
         let recv_ty = self.check_expr(recv);
@@ -1997,7 +2096,7 @@ fn last_span(block: &Block) -> Span {
     }
 }
 
-const BUILTIN_NAMES: [&str; 17] = [
+const BUILTIN_NAMES: [&str; 19] = [
     "println",
     "print",
     "show",
@@ -2015,6 +2114,8 @@ const BUILTIN_NAMES: [&str; 17] = [
     "Some",
     "nowMillis",
     "nowMicros",
+    "range",
+    "random",
 ];
 
 /// Names the LSP offers as completions alongside user definitions.
@@ -2036,6 +2137,18 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("MutMap", "MutMap() -> MutMap<k, v>"),
         ("nowMillis", "nowMillis() -> Int — monotonic milliseconds since program start"),
         ("nowMicros", "nowMicros() -> Int — monotonic microseconds since program start"),
+        ("range", "range(n) -> [Int] — the list [0, 1, ..., n-1]"),
+        ("random", "random(n) -> Int — uniform in 0..n-1"),
+        ("Gfx.run", "Gfx.run(width, height, title, frame) — open a window, call frame each frame"),
+        ("Gfx.clear", "Gfx.clear(r, g, b)"),
+        ("Gfx.rect", "Gfx.rect(x, y, w, h, r, g, b, a)"),
+        ("Gfx.rectLines", "Gfx.rectLines(x, y, w, h, thickness, r, g, b, a)"),
+        ("Gfx.circle", "Gfx.circle(x, y, radius, r, g, b, a)"),
+        ("Gfx.text", "Gfx.text(s, x, y, size, r, g, b)"),
+        ("Gfx.textWidth", "Gfx.textWidth(s, size) -> Int"),
+        ("Gfx.mouseX", "Gfx.mouseX() -> Int"),
+        ("Gfx.mouseY", "Gfx.mouseY() -> Int"),
+        ("Gfx.mousePressed", "Gfx.mousePressed() -> Bool — left click this frame"),
         ("Some", "Some(value) -> value?"),
         ("None", "None : a?"),
         ("Schedule.exponential", "Schedule.exponential(base) -> Schedule"),

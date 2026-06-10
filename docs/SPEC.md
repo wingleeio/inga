@@ -196,7 +196,30 @@ so syntax doesn't paint us into a corner:
   Dependency injection and package dependencies are the same idea at two
   scales.
 
-## 8. Tooling (all in this repo)
+## 8. Graphics bindings
+
+The `Gfx` builtin module (like `Schedule`, resolved by name) provides
+GL-backed 2D graphics, implemented on OpenGL through miniquad/macroquad in
+both the interpreter (cargo feature `gfx`, enabled by the CLI) and the
+native runtime:
+
+```
+Gfx.run(width, height, title, frame)   // runtime-owned loop; frame: () -> a, once per frame
+Gfx.clear(r, g, b)                     // 0–255 channels everywhere
+Gfx.rect(x, y, w, h, r, g, b, a)       Gfx.rectLines(x, y, w, h, thick, r, g, b, a)
+Gfx.circle(x, y, radius, r, g, b, a)   Gfx.text(s, x, y, size, r, g, b)
+Gfx.textWidth(s, size) -> Int          Gfx.mouseX() / Gfx.mouseY() -> Int
+Gfx.mousePressed() -> Bool
+```
+
+Inverting the loop (`Gfx.run` calls the closure, rather than the program
+recursing) keeps stacks bounded, and the frame closure captures capability
+evidence like any closure — services work normally inside frames. Helpers:
+`range(n) -> [Int]` and `random(n) -> Int`. Setting `INGA_GFX_SHOT=<path>`
+renders 30 frames, writes a PNG of the framebuffer, and exits (CI smoke
+tests). See `games/balatro.inga` for a complete game.
+
+## 9. Tooling (all in this repo)
 
 | Tool | Where | Notes |
 |---|---|---|
@@ -206,7 +229,7 @@ so syntax doesn't paint us into a corner:
 | `inga lsp` | `crates/inga-lsp` | diagnostics, hover (inferred signatures with rows), go-to-definition, completion, formatting, semantic tokens |
 | VS Code extension | `editors/vscode` | TextMate grammar + LSP client |
 
-## 9. Grammar sketch
+## 10. Grammar sketch
 
 ```
 program   := decl*

@@ -1,0 +1,659 @@
+// INGA-LATRO — a Balatro-style roguelike deckbuilder in Inga.
+//
+//   inga build games/balatro.inga -o ingalatro && ./ingalatro
+//
+// Play poker hands to beat each blind's score target before you run out of
+// hands. Beat the blind, earn money, buy jokers in the shop, climb the antes.
+// Click cards to select (up to 5), then Play Hand or Discard. Reach ante 8's
+// boss blind to win.
+//
+// Everything below is plain Inga: MutMaps for game state, range/map for
+// iteration, and the GL-backed Gfx module for drawing. The frame loop is
+// owned by the runtime (Gfx.run), so there is no unbounded recursion.
+
+// ---- small helpers ----------------------------------------------------------
+
+// Int-keyed and string-keyed map reads (two helpers because user functions
+// are monomorphic in v0.2).
+gn :: (m, Int k) -> Int {
+    m.get(k) |> getOrElse(0)
+}
+
+gv :: (m, String k) -> Int {
+    m.get(k) |> getOrElse(0)
+}
+
+rgb :: (Int r, Int g, Int b) -> Int {
+    r * 65536 + g * 256 + b
+}
+
+textC :: (String s, Int x, Int y, Int size, Int packed) {
+    Gfx.text(s, x, y, size, packed / 65536, packed / 256 % 256, packed % 256)
+}
+
+centerText :: (String s, Int cx, Int y, Int size, Int packed) {
+    textC(s, cx - Gfx.textWidth(s, size) / 2, y, size, packed)
+}
+
+hit :: (Int x, Int y, Int w, Int h) -> Bool {
+    mx = Gfx.mouseX()
+    my = Gfx.mouseY()
+    mx >= x && mx <= x + w && my >= y && my <= y + h
+}
+
+// Draws a button; returns true when it was clicked this frame.
+button :: (String label, Int x, Int y, Int w, Int h, Bool enabled, Int packed) -> Bool {
+    bg = if enabled {
+        packed
+    } else {
+        rgb(70, 75, 85)
+    }
+    Gfx.rect(x, y, w, h, bg / 65536, bg / 256 % 256, bg % 256, 255)
+    Gfx.rectLines(x, y, w, h, 2, 15, 20, 25, 255)
+    fg = if enabled {
+        rgb(245, 245, 245)
+    } else {
+        rgb(140, 145, 150)
+    }
+    centerText(label, x + w / 2, y + h / 2 + 7, 22, fg)
+    enabled && Gfx.mousePressed() && hit(x, y, w, h)
+}
+
+// ---- cards -------------------------------------------------------------------
+
+// Card id 0..51: rank = id / 4 (0 = "2" … 12 = Ace), suit = id % 4.
+rankName :: (Int r) -> String {
+    match r {
+        8  -> "10"
+        9  -> "J"
+        10 -> "Q"
+        11 -> "K"
+        12 -> "A"
+        _  -> "${r + 2}"
+    }
+}
+
+suitName :: (Int s) -> String {
+    match s {
+        0 -> "S"
+        1 -> "H"
+        2 -> "D"
+        _ -> "C"
+    }
+}
+
+suitCol :: (Int s) -> Int {
+    match s {
+        0 -> rgb(60, 60, 95)
+        1 -> rgb(225, 60, 60)
+        2 -> rgb(235, 140, 50)
+        _ -> rgb(50, 110, 215)
+    }
+    // spades
+    // hearts
+    // diamonds
+    // clubs
+}
+
+chipsOf :: (Int card) -> Int {
+    r = card / 4
+    if r <= 8 {
+        r + 2
+    } else if r == 12 {
+        11
+    } else {
+        10
+    }
+}
+
+// ---- jokers -------------------------------------------------------------------
+
+jokerName :: (Int j) -> String {
+    match j {
+        0 -> "Greedy Joker"
+        1 -> "Banner"
+        2 -> "Lusty Joker"
+        3 -> "Stone Wall"
+        _ -> "Juggernaut"
+    }
+}
+
+jokerDesc :: (Int j) -> String {
+    match j {
+        0 -> "+4 Mult"
+        1 -> "+30 Chips"
+        2 -> "+3 Mult per Heart"
+        3 -> "+50 Chips if Flush"
+        _ -> "x2 Mult"
+    }
+}
+
+jokerPrice :: (Int j) -> Int {
+    match j {
+        0 -> 4
+        1 -> 4
+        2 -> 5
+        3 -> 5
+        _ -> 8
+    }
+}
+
+hasJoker :: (jok, g, Int j) -> Bool {
+    found = MutMap()
+    map(range(gv(g, "jokers")), (i) -> {
+        if gn(jok, i) == j {
+            found.set(0, 1)
+        }
+        0
+    })
+    gn(found, 0) == 1
+}
+
+// ---- poker evaluation -----------------------------------------------------------
+//
+// Result map keys: 0 hand type (-1 = nothing selected), 3 card chips,
+// 4 cards selected, 5 flush (0/1), 6 hearts, 7 total chips, 8 total mult.
+
+baseChips :: (Int t) -> Int {
+    match t {
+        0 -> 5
+        1 -> 10
+        2 -> 20
+        3 -> 30
+        4 -> 30
+        5 -> 35
+        6 -> 40
+        7 -> 60
+        _ -> 100
+    }
+}
+
+baseMult :: (Int t) -> Int {
+    match t {
+        0 -> 1
+        1 -> 2
+        2 -> 2
+        3 -> 3
+        4 -> 4
+        5 -> 4
+        6 -> 4
+        7 -> 7
+        _ -> 8
+    }
+}
+
+handTypeName :: (Int t) -> String {
+    match t {
+        0 -> "High Card"
+        1 -> "Pair"
+        2 -> "Two Pair"
+        3 -> "Three of a Kind"
+        4 -> "Straight"
+        5 -> "Flush"
+        6 -> "Full House"
+        7 -> "Four of a Kind"
+        _ -> "Straight Flush"
+    }
+}
+
+evalSelected :: (hand, sel, out) {
+    rc = MutMap() // rank counts
+    sc = MutMap() // suit counts
+    out.set(0, -1)
+    out.set(3, 0)
+    out.set(4, 0)
+    out.set(5, 0)
+    out.set(6, 0)
+    map(range(8), (i) -> {
+        if gn(sel, i) == 1 && gn(hand, i) >= 0 {
+            c = gn(hand, i)
+            r = c / 4
+            s = c % 4
+            rc.set(r, gn(rc, r) + 1)
+            sc.set(s, gn(sc, s) + 1)
+            out.set(3, gn(out, 3) + chipsOf(c))
+            out.set(4, gn(out, 4) + 1)
+            if s == 1 {
+                out.set(6, gn(out, 6) + 1)
+            }
+        }
+        0
+    })
+    n = gn(out, 4)
+    if n > 0 {
+        // t: 0 pairs, 1 trips, 2 quads, 3 distinct ranks, 4 min rank, 5 max rank
+        t = MutMap()
+        t.set(4, 99)
+        t.set(5, -1)
+        map(range(13), (r) -> {
+            c = gn(rc, r)
+            if c == 2 {
+                t.set(0, gn(t, 0) + 1)
+            }
+            if c == 3 {
+                t.set(1, gn(t, 1) + 1)
+            }
+            if c >= 4 {
+                t.set(2, gn(t, 2) + 1)
+            }
+            if c >= 1 {
+                t.set(3, gn(t, 3) + 1)
+                if r < gn(t, 4) {
+                    t.set(4, r)
+                }
+                if r > gn(t, 5) {
+                    t.set(5, r)
+                }
+            }
+            0
+        })
+        flush = n == 5 && (gn(sc, 0) == 5 || gn(sc, 1) == 5 || gn(sc, 2) == 5 || gn(sc, 3) == 5)
+        wheel = gn(rc, 12) > 0 && gn(rc, 0) > 0 && gn(rc, 1) > 0 && gn(rc, 2) > 0 && gn(rc, 3) > 0
+        straight = n == 5 && gn(t, 3) == 5 && (gn(t, 5) - gn(t, 4) == 4 || wheel)
+        if flush {
+            out.set(5, 1)
+        }
+        ty = if straight && flush {
+            8
+        } else if gn(t, 2) >= 1 {
+            7
+        } else if gn(t, 0) >= 1 && gn(t, 1) >= 1 {
+            6
+        } else if flush {
+            5
+        } else if straight {
+            4
+        } else if gn(t, 1) >= 1 {
+            3
+        } else if gn(t, 0) >= 2 {
+            2
+        } else if gn(t, 0) == 1 {
+            1
+        } else {
+            0
+        }
+        out.set(0, ty)
+    }
+}
+
+// Full scoring including jokers; fills out[7] (chips) and out[8] (mult).
+scoreSelected :: (hand, sel, jok, g, out) {
+    evalSelected(hand, sel, out)
+    t = gn(out, 0)
+    if t >= 0 {
+        chips = baseChips(t) + gn(out, 3)
+        chips = if hasJoker(jok, g, 1) {
+            chips + 30
+        } else {
+            chips
+        }
+        chips = if hasJoker(jok, g, 3) && gn(out, 5) == 1 {
+            chips + 50
+        } else {
+            chips
+        }
+        mult = baseMult(t)
+        mult = if hasJoker(jok, g, 0) {
+            mult + 4
+        } else {
+            mult
+        }
+        mult = if hasJoker(jok, g, 2) {
+            mult + 3 * gn(out, 6)
+        } else {
+            mult
+        }
+        mult = if hasJoker(jok, g, 4) {
+            mult * 2
+        } else {
+            mult
+        }
+        out.set(7, chips)
+        out.set(8, mult)
+    }
+}
+
+// ---- game state ------------------------------------------------------------------
+
+targetFor :: (Int ante, Int blind) -> Int {
+    base = match ante {
+        1 -> 300
+        2 -> 800
+        3 -> 2000
+        4 -> 5000
+        5 -> 11000
+        6 -> 20000
+        7 -> 35000
+        _ -> 50000
+    }
+    base * (2 + blind) / 2
+}
+
+blindName :: (Int blind) -> String {
+    match blind {
+        0 -> "Small Blind"
+        1 -> "Big Blind"
+        _ -> "Boss Blind"
+    }
+}
+
+selCount :: (sel) -> Int {
+    cnt = MutMap()
+    map(range(8), (i) -> {
+        cnt.set(0, gn(cnt, 0) + gn(sel, i))
+        0
+    })
+    gn(cnt, 0)
+}
+
+shuffle :: (deck) {
+    map(range(52), (i) -> {
+        deck.set(i, i)
+        0
+    })
+    map(range(51), (k) -> {
+        i = 51 - k
+        j = random(i + 1)
+        a = gn(deck, i)
+        deck.set(i, gn(deck, j))
+        deck.set(j, a)
+        0
+    })
+}
+
+deal :: (g, deck, hand) {
+    map(range(8), (i) -> {
+        pos = gv(g, "deckPos")
+        if gn(hand, i) < 0 && pos < 52 {
+            hand.set(i, gn(deck, pos))
+            g.set("deckPos", pos + 1)
+        }
+        0
+    })
+}
+
+removeSelected :: (hand, sel) {
+    map(range(8), (i) -> {
+        if gn(sel, i) == 1 {
+            hand.set(i, -1)
+            sel.set(i, 0)
+        }
+        0
+    })
+}
+
+setupBlind :: (g, deck, hand, sel) {
+    g.set("score", 0)
+    g.set("hands", 4)
+    g.set("discards", 3)
+    g.set("target", targetFor(gv(g, "ante"), gv(g, "blind")))
+    g.set("deckPos", 0)
+    g.set("lastType", -1)
+    shuffle(deck)
+    map(range(8), (i) -> {
+        hand.set(i, -1)
+        sel.set(i, 0)
+        0
+    })
+    deal(g, deck, hand)
+}
+
+restart :: (g, deck, hand, sel) {
+    g.set("phase", 0)
+    g.set("ante", 1)
+    g.set("blind", 0)
+    g.set("money", 4)
+    g.set("jokers", 0)
+    setupBlind(g, deck, hand, sel)
+}
+
+openShop :: (g) {
+    g.set("phase", 1)
+    first = random(5)
+    g.set("shop0", first)
+    g.set("shop1", (first + 1 + random(4)) % 5)
+    g.set("bought0", 0)
+    g.set("bought1", 0)
+}
+
+// Advance to the next blind (after the shop) and set it up.
+nextBlind :: (g, deck, hand, sel) {
+    blind = gv(g, "blind") + 1
+    if blind > 2 {
+        g.set("blind", 0)
+        g.set("ante", gv(g, "ante") + 1)
+    } else {
+        g.set("blind", blind)
+    }
+    g.set("phase", 0)
+    setupBlind(g, deck, hand, sel)
+}
+
+playHand :: (g, deck, hand, sel, jok, out) {
+    scoreSelected(hand, sel, jok, g, out)
+    if gn(out, 0) >= 0 && gv(g, "hands") > 0 {
+        gained = gn(out, 7) * gn(out, 8)
+        g.set("score", gv(g, "score") + gained)
+        g.set("lastType", gn(out, 0))
+        g.set("lastGain", gained)
+        g.set("hands", gv(g, "hands") - 1)
+        removeSelected(hand, sel)
+        deal(g, deck, hand)
+        if gv(g, "score") >= gv(g, "target") {
+            g.set("money", gv(g, "money") + 3 + gv(g, "blind") + gv(g, "hands"))
+            if gv(g, "blind") == 2 && gv(g, "ante") == 8 {
+                g.set("phase", 3) // won the run
+            } else {
+                openShop(g)
+            }
+        } else if gv(g, "hands") == 0 {
+            g.set("phase", 2) // out of hands
+        }
+    }
+}
+
+discardSelected :: (g, deck, hand, sel) {
+    if gv(g, "discards") > 0 && selCount(sel) > 0 {
+        g.set("discards", gv(g, "discards") - 1)
+        removeSelected(hand, sel)
+        deal(g, deck, hand)
+    }
+}
+
+// ---- drawing ----------------------------------------------------------------------
+
+handX :: (Int i) -> Int {
+    250 + i * 88
+}
+
+handY :: (Int selected) -> Int {
+    if selected == 1 {
+        404
+    } else {
+        420
+    }
+}
+
+drawCard :: (Int card, Int x, Int y) {
+    Gfx.rect(x, y, 80, 104, 240, 238, 230, 255)
+    Gfx.rectLines(x, y, 80, 104, 2, 40, 45, 55, 255)
+    r = card / 4
+    s = card % 4
+    col = suitCol(s)
+    textC(rankName(r), x + 8, y + 26, 26, col)
+    textC(suitName(s), x + 8, y + 48, 20, col)
+    centerText(suitName(s), x + 40, y + 84, 40, col)
+    textC("+${chipsOf(card)}", x + 46, y + 22, 15, rgb(90, 120, 200))
+}
+
+drawSidebar :: (g, hand, sel, jok, out) {
+    Gfx.rect(0, 0, 230, 540, 18, 25, 33, 255)
+    textC("INGA-LATRO", 20, 40, 30, rgb(255, 90, 90))
+    target = gv(g, "target")
+    score = gv(g, "score")
+    hands = gv(g, "hands")
+    discards = gv(g, "discards")
+    money = gv(g, "money")
+    ante = gv(g, "ante")
+    textC(blindName(gv(g, "blind")), 20, 90, 26, rgb(120, 170, 255))
+    textC("Target: ${target}", 20, 118, 22, rgb(230, 230, 230))
+    textC("Score", 20, 162, 20, rgb(150, 155, 160))
+    textC("${score}", 20, 198, 38, rgb(250, 250, 250))
+    textC("Hands: ${hands}", 20, 244, 22, rgb(120, 190, 255))
+    textC("Discards: ${discards}", 20, 272, 22, rgb(255, 130, 130))
+    textC("Money: \$${money}", 20, 314, 26, rgb(255, 210, 80))
+    textC("Ante: ${ante}/8", 20, 352, 22, rgb(200, 200, 200))
+    if gv(g, "lastType") >= 0 {
+        gained = gv(g, "lastGain")
+        textC("Last hand:", 20, 400, 18, rgb(150, 155, 160))
+        textC(handTypeName(gv(g, "lastType")), 20, 422, 18, rgb(230, 230, 230))
+        textC("+${gained}", 20, 444, 18, rgb(255, 210, 80))
+    }
+}
+
+drawJokers :: (g, jok) {
+    owned = gv(g, "jokers")
+    textC("Jokers (${owned}/5)", 250, 44, 18, rgb(150, 155, 160))
+    map(range(gv(g, "jokers")), (i) -> {
+        x = 250 + i * 140
+        j = gn(jok, i)
+        Gfx.rect(x, 54, 130, 76, 60, 45, 80, 255)
+        Gfx.rectLines(x, 54, 130, 76, 2, 130, 90, 180, 255)
+        textC(jokerName(j), x + 8, 78, 16, rgb(240, 230, 250))
+        textC(jokerDesc(j), x + 8, 102, 14, rgb(180, 170, 200))
+        0
+    })
+}
+
+framePlay :: (g, deck, hand, sel, jok, out) {
+    // Card selection.
+    map(range(8), (i) -> {
+        if gn(hand, i) >= 0 && Gfx.mousePressed() && hit(handX(i), handY(gn(sel, i)), 80, 104) {
+            if gn(sel, i) == 1 {
+                sel.set(i, 0)
+            } else if selCount(sel) < 5 {
+                sel.set(i, 1)
+            }
+        }
+        0
+    })
+
+    drawSidebar(g, hand, sel, jok, out)
+    drawJokers(g, jok)
+
+    // Preview of the selected hand (full scoring, jokers included).
+    n = selCount(sel)
+    if n > 0 {
+        scoreSelected(hand, sel, jok, g, out)
+        preview = "${handTypeName(gn(out, 0))}   ${gn(out, 7)} x ${gn(out, 8)} = ${gn(out, 7) * gn(out, 8)}"
+        textC(preview, 250, 346, 24, rgb(255, 240, 180))
+    } else {
+        textC("Select up to 5 cards", 250, 346, 24, rgb(120, 125, 135))
+    }
+
+    if button("Play Hand", 250, 360, 150, 46, n > 0 && gv(g, "hands") > 0, rgb(60, 130, 246)) {
+        playHand(g, deck, hand, sel, jok, out)
+    }
+    if button("Discard", 420, 360, 150, 46, n > 0 && gv(g, "discards") > 0, rgb(220, 70, 80)) {
+        discardSelected(g, deck, hand, sel)
+    }
+
+    // The hand.
+    map(range(8), (i) -> {
+        if gn(hand, i) >= 0 {
+            drawCard(gn(hand, i), handX(i), handY(gn(sel, i)))
+        }
+        0
+    })
+    0
+}
+
+shopOffer :: (g, jok, Int slot) {
+    x = 360 + slot * 200
+    j = if slot == 0 {
+        gv(g, "shop0")
+    } else {
+        gv(g, "shop1")
+    }
+    bought = if slot == 0 {
+        gv(g, "bought0")
+    } else {
+        gv(g, "bought1")
+    }
+    Gfx.rect(x, 170, 170, 180, 60, 45, 80, 255)
+    Gfx.rectLines(x, 170, 170, 180, 2, 130, 90, 180, 255)
+    textC(jokerName(j), x + 12, 200, 18, rgb(240, 230, 250))
+    textC(jokerDesc(j), x + 12, 228, 15, rgb(180, 170, 200))
+    if bought == 1 {
+        centerText("SOLD", x + 85, 300, 26, rgb(150, 150, 150))
+    } else {
+        affordable = gv(g, "money") >= jokerPrice(j) && gv(g, "jokers") < 5
+        if button("Buy  \$${jokerPrice(j)}", x + 25, 280, 120, 40, affordable, rgb(60, 130, 246)) {
+            g.set("money", gv(g, "money") - jokerPrice(j))
+            jok.set(gv(g, "jokers"), j)
+            g.set("jokers", gv(g, "jokers") + 1)
+            if slot == 0 {
+                g.set("bought0", 1)
+            } else {
+                g.set("bought1", 1)
+            }
+        }
+    }
+}
+
+frameShop :: (g, deck, hand, sel, jok, out) {
+    drawSidebar(g, hand, sel, jok, out)
+    drawJokers(g, jok)
+    Gfx.rect(250, 90, 690, 400, 28, 22, 40, 255)
+    Gfx.rectLines(250, 90, 690, 400, 3, 130, 90, 180, 255)
+    centerText("SHOP", 595, 140, 36, rgb(255, 210, 80))
+    shopOffer(g, jok, 0)
+    shopOffer(g, jok, 1)
+    if button("Next Blind", 515, 410, 160, 46, true, rgb(60, 170, 110)) {
+        nextBlind(g, deck, hand, sel)
+    }
+    0
+}
+
+frameEnd :: (g, deck, hand, sel, Bool won) {
+    title = if won {
+        "YOU WIN"
+    } else {
+        "GAME OVER"
+    }
+    col = if won {
+        rgb(120, 220, 140)
+    } else {
+        rgb(235, 80, 80)
+    }
+    centerText(title, 480, 240, 64, col)
+    ante = gv(g, "ante")
+    centerText("Ante ${ante} - ${blindName(gv(g, "blind"))}", 480, 290, 24, rgb(200, 200, 200))
+    if button("New Run", 390, 330, 180, 50, true, rgb(60, 130, 246)) {
+        restart(g, deck, hand, sel)
+    }
+    0
+}
+
+frame :: (g, deck, hand, sel, jok, out) {
+    Gfx.clear(32, 44, 56)
+    phase = gv(g, "phase")
+    if phase == 0 {
+        framePlay(g, deck, hand, sel, jok, out)
+    } else if phase == 1 {
+        frameShop(g, deck, hand, sel, jok, out)
+    } else {
+        frameEnd(g, deck, hand, sel, phase == 3)
+    }
+}
+
+main :: () {
+    g = MutMap()
+    deck = MutMap()
+    hand = MutMap()
+    sel = MutMap()
+    jok = MutMap()
+    out = MutMap()
+    restart(g, deck, hand, sel)
+    Gfx.run(960, 540, "INGA-LATRO", () -> frame(g, deck, hand, sel, jok, out))
+}

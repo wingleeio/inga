@@ -723,3 +723,21 @@ fn user_service_signatures_are_inferred() {
     );
     assert_eq!(hover("main"), "main :: () -> Unit");
 }
+
+#[test]
+fn builtins_hover_with_their_signature() {
+    let path = format!("{}/../../examples/user_service.inga", env!("CARGO_MANIFEST_DIR"));
+    let src = std::fs::read_to_string(path).unwrap();
+    let checked = check_source(&src);
+    let has = |prefix: &str| checked.info.hovers.iter().any(|(_, t)| t.starts_with(prefix));
+    // The example calls retry/orFail/decode/Schedule.exponential; hovering
+    // them shows the builtin's signature + doc, not just "(builtin)".
+    assert!(has("retry(lazy action, schedule) -> a"), "retry hover missing");
+    assert!(has("orFail(option, error) -> a"), "orFail hover missing");
+    assert!(has("decode(raw, StructName) -> a ! DecodeError"), "decode hover missing");
+    assert!(has("Schedule.exponential(base) -> Schedule"), "schedule hover missing");
+    assert!(
+        !checked.info.hovers.iter().any(|(_, t)| t.ends_with("(builtin)")),
+        "no builtin should fall back to the bare `(builtin)` hover"
+    );
+}

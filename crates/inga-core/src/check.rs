@@ -1020,6 +1020,11 @@ impl<'a> Checker<'a> {
             return Type::Unknown;
         }
         if let Some(ty) = self.builtin_value_type(name) {
+            if self.record_info {
+                if let Some(doc) = builtin_doc(name) {
+                    self.info.hovers.push((span, doc.to_string()));
+                }
+            }
             return ty;
         }
         self.error(span, format!("unknown name `{name}`"));
@@ -1206,6 +1211,11 @@ impl<'a> Checker<'a> {
                     let ty = self.check_expr(arg);
                     self.unify_at(&Type::Duration, &ty, arg.span, "schedule base");
                 }
+                if self.record_info {
+                    if let Some(doc) = builtin_doc(&format!("Schedule.{name}")) {
+                        self.info.hovers.push((name_span, doc.to_string()));
+                    }
+                }
                 Type::Schedule
             }
             _ => {
@@ -1260,6 +1270,11 @@ impl<'a> Checker<'a> {
                 return Type::Unknown;
             }
         };
+        if self.record_info {
+            if let Some(doc) = builtin_doc(&format!("Gfx.{name}")) {
+                self.info.hovers.push((name_span, doc.to_string()));
+            }
+        }
         if name == "run" {
             // Gfx.run(Int width, Int height, String title, frame) — the
             // runtime owns the event loop and calls `frame` once per frame.
@@ -1498,7 +1513,8 @@ impl<'a> Checker<'a> {
             _ => return None,
         };
         if self.record_info {
-            self.info.hovers.push((callee_span, format!("{name} (builtin)")));
+            let doc = builtin_doc(name).map(str::to_string).unwrap_or(format!("{name} (builtin)"));
+            self.info.hovers.push((callee_span, doc));
         }
         Some(ty)
     }
@@ -2213,6 +2229,12 @@ fn last_span(block: &Block) -> Span {
     }
 }
 
+/// Hover documentation for a builtin: the completion table doubles as the
+/// "definition" an editor can show, since builtins have no Inga source.
+pub fn builtin_doc(name: &str) -> Option<&'static str> {
+    builtin_completions().into_iter().find(|(n, _)| *n == name).map(|(_, doc)| doc)
+}
+
 const BUILTIN_NAMES: [&str; 19] = [
     "println",
     "print",
@@ -2238,20 +2260,20 @@ const BUILTIN_NAMES: [&str; 19] = [
 /// Names the LSP offers as completions alongside user definitions.
 pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("println", "println(value) -> Unit"),
-        ("print", "print(value) -> Unit"),
-        ("show", "show(value) -> String"),
-        ("encode", "encode(value) -> String"),
-        ("decode", "decode(raw, TypeName) -> a ! DecodeError"),
-        ("map", "map(container, f) -> mapped"),
+        ("println", "println(values...) -> Unit — print space-separated, with a newline"),
+        ("print", "print(values...) -> Unit"),
+        ("show", "show(value) -> String — developer-facing rendering (quotes strings)"),
+        ("encode", "encode(value) -> String — JSON"),
+        ("decode", "decode(raw, StructName) -> a ! DecodeError — parse JSON into a struct"),
+        ("map", "map(container, f) -> mapped — over a list or an option"),
         ("getOrElse", "getOrElse(option, default) -> a"),
-        ("orFail", "orFail(option, error) -> a ! error"),
-        ("retry", "retry(action, schedule) -> a"),
-        ("upTo", "upTo(schedule, times) -> Schedule"),
-        ("ignoreFailure", "ignoreFailure(action) -> Unit"),
+        ("orFail", "orFail(option, error) -> a — unwrap Some, or fail with `error`"),
+        ("retry", "retry(lazy action, schedule) -> a — re-run per the Schedule; the error row is kept (a retried action can still fail)"),
+        ("upTo", "upTo(schedule, times) -> Schedule — cap the retry count"),
+        ("ignoreFailure", "ignoreFailure(lazy action) -> Unit — swallow the error channel"),
         ("sleep", "sleep(duration) -> Unit"),
         ("len", "len(stringOrList) -> Int"),
-        ("MutMap", "MutMap() -> MutMap<k, v>"),
+        ("MutMap", "MutMap() -> MutMap<k, v> — built-in mutable map"),
         ("nowMillis", "nowMillis() -> Int — monotonic milliseconds since program start"),
         ("nowMicros", "nowMicros() -> Int — monotonic microseconds since program start"),
         ("range", "range(n) -> [Int] — the list [0, 1, ..., n-1]"),

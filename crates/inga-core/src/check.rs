@@ -47,6 +47,46 @@ pub struct CheckInfo {
     pub defs: Vec<DefInfo>,
     /// (use span, definition span)
     pub refs: Vec<(Span, Span)>,
+    /// Resolved type of every checked expression, keyed by span — consumed by
+    /// the LLVM backend.
+    pub expr_types: HashMap<(u32, u32), CType>,
+    /// Effect-row facts per function and per service method.
+    pub facts: Facts,
+}
+
+/// Codegen-facing view of a fully resolved type. Unresolved type variables
+/// (values that are never used) default to `Int`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CType {
+    Int,
+    Float,
+    Bool,
+    Str,
+    Unit,
+    Duration,
+    Schedule,
+    Option(Box<CType>),
+    List(Box<CType>),
+    Named(String),
+    ErrorTy(String),
+    Service(String),
+    Tag(String),
+    MutMap(Box<CType>, Box<CType>),
+    Func,
+}
+
+/// Effective effect rows (declared ∪ inferred), sorted, for codegen.
+#[derive(Debug, Clone, Default)]
+pub struct RowFact {
+    pub errors: Vec<String>,
+    pub caps: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct Facts {
+    pub funcs: HashMap<String, RowFact>,
+    /// Keyed by (service, method): the union row across all implementations.
+    pub methods: HashMap<(String, String), RowFact>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -116,6 +156,7 @@ pub fn check(program: &Program, diagnostics: &mut Vec<Diagnostic>) -> CheckInfo 
     checker.run_pass();
     checker.validate_declared_rows();
     checker.record_def_details();
+    checker.record_facts();
 
     diagnostics.append(&mut checker.diags.clone());
     checker.info
@@ -630,6 +671,71 @@ impl<'a> Checker<'a> {
     // ---- expressions ---------------------------------------------------------
 
     fn check_expr(&mut self, expr: &Expr) -> Type {
+        let ty = self.check_expr_inner(expr);
+        if self.record_info {
+            let resolved = self.ctype(&ty);
+            self.info.expr_types.insert((expr.span.start, expr.span.end), resolved);
+        }
+        ty
+    }
+
+    /// Resolve a checker type into the codegen-facing representation.
+    fn ctype(&self, ty: &Type) -> CType {
+        match self.ctx.resolve(ty) {
+            Type::Int => CType::Int,
+            Type::Float => CType::Float,
+            Type::Bool => CType::Bool,
+            Type::Str => CType::Str,
+            Type::Unit => CType::Unit,
+            Type::Duration => CType::Duration,
+            Type::Schedule => CType::Schedule,
+            Type::Option(t) => CType::Option(Box::new(self.ctype(&t))),
+            Type::List(t) => CType::List(Box::new(self.ctype(&t))),
+            Type::Named(n) => CType::Named(n),
+            Type::Error(n) => CType::ErrorTy(n),
+            Type::Service(n) => CType::Service(n),
+            Type::Tag(n) => CType::Tag(n),
+            Type::MutMap(k, v) => {
+                CType::MutMap(Box::new(self.ctype(&k)), Box::new(self.ctype(&v)))
+            }
+            Type::Func(_) => CType::Func,
+            // Unconstrained or error-recovery types default to Int.
+            Type::Var(_) | Type::Unknown => CType::Int,
+        }
+    }
+
+    /// Export effective rows for codegen (called once, after the final pass).
+    fn record_facts(&mut self) {
+        for name in self.funcs.keys().cloned().collect::<Vec<_>>() {
+            let rows = self.func_effective_rows(&name);
+            self.info.facts.funcs.insert(
+                name,
+                RowFact {
+                    errors: rows.errors.iter().cloned().collect(),
+                    caps: rows.caps.iter().cloned().collect(),
+                },
+            );
+        }
+        let pairs: Vec<(String, String)> = self
+            .services
+            .iter()
+            .flat_map(|(s, info)| {
+                info.methods.iter().map(move |(m, _)| (s.clone(), m.clone()))
+            })
+            .collect();
+        for (service, method) in pairs {
+            let rows = self.method_effective_rows(&service, &method);
+            self.info.facts.methods.insert(
+                (service, method),
+                RowFact {
+                    errors: rows.errors.iter().cloned().collect(),
+                    caps: rows.caps.iter().cloned().collect(),
+                },
+            );
+        }
+    }
+
+    fn check_expr_inner(&mut self, expr: &Expr) -> Type {
         match &expr.kind {
             ExprKind::Int(_) => Type::Int,
             ExprKind::Float(_) => Type::Float,
@@ -1188,7 +1294,7 @@ impl<'a> Checker<'a> {
                 let v = self.ctx.fresh();
                 Type::MutMap(Box::new(k), Box::new(v))
             }
-            "nowMillis" => {
+            "nowMillis" | "nowMicros" => {
                 check_arity(self, 0);
                 Type::Int
             }
@@ -1891,7 +1997,7 @@ fn last_span(block: &Block) -> Span {
     }
 }
 
-const BUILTIN_NAMES: [&str; 16] = [
+const BUILTIN_NAMES: [&str; 17] = [
     "println",
     "print",
     "show",
@@ -1908,6 +2014,7 @@ const BUILTIN_NAMES: [&str; 16] = [
     "MutMap",
     "Some",
     "nowMillis",
+    "nowMicros",
 ];
 
 /// Names the LSP offers as completions alongside user definitions.
@@ -1928,6 +2035,7 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("len", "len(stringOrList) -> Int"),
         ("MutMap", "MutMap() -> MutMap<k, v>"),
         ("nowMillis", "nowMillis() -> Int — monotonic milliseconds since program start"),
+        ("nowMicros", "nowMicros() -> Int — monotonic microseconds since program start"),
         ("Some", "Some(value) -> value?"),
         ("None", "None : a?"),
         ("Schedule.exponential", "Schedule.exponential(base) -> Schedule"),

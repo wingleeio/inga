@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/inga-core", "crates/inga-cli", "crates/inga-lsp"]
+members = [
+    "crates/inga-core",
+    "crates/inga-cli",
+    "crates/inga-lsp",
+    "crates/inga-codegen",
+    "crates/inga-rt",
+]
 
 [workspace.package]
 version = "0.1.0"

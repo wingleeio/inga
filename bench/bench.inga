@@ -87,10 +87,10 @@ fibStore :: (Int n) -> Int uses Store {
 
 // The workload is a `lazy` parameter, so it evaluates inside the timed window.
 bench :: (String name, lazy Int work) {
-    t0 = nowMillis()
+    t0 = nowMicros()
     result = work
-    t1 = nowMillis()
-    println("${name} ${t1 - t0} ms (result ${result})")
+    t1 = nowMicros()
+    println("${name} ${t1 - t0} us (result ${result})")
 }
 
 round :: (Int i) uses Adder, Store {

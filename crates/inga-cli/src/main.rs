@@ -12,7 +12,9 @@ const USAGE: &str = "\
 inga — the Inga language
 
 Usage:
-  inga run <file.inga>          type-check and run (entry point: main)
+  inga run <file.inga>          type-check and run in the interpreter
+  inga build <file.inga> [-o out] [--emit-ir]
+                                compile to a native binary via LLVM (clang)
   inga check <file.inga>...     type-check and report diagnostics
   inga fmt [--check] <file>...  format in place (--check: diff exit code only)
   inga highlight <file.inga>    print the file with ANSI syntax colors
@@ -24,6 +26,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("run") => cmd_run(&args[1..]),
+        Some("build") => cmd_build(&args[1..]),
         Some("check") => cmd_check(&args[1..]),
         Some("fmt") => cmd_fmt(&args[1..]),
         Some("highlight") => cmd_highlight(&args[1..]),
@@ -74,6 +77,100 @@ fn cmd_run(args: &[String]) -> ExitCode {
                 }
                 None => eprintln!("runtime error: {}", err.message),
             }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Compile to a native binary: emit LLVM IR, link against the runtime
+/// staticlib with clang (clang embeds LLVM, so there is no other dependency).
+fn cmd_build(args: &[String]) -> ExitCode {
+    let mut input: Option<&str> = None;
+    let mut output: Option<String> = None;
+    let mut emit_ir = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" => {
+                i += 1;
+                output = args.get(i).cloned();
+            }
+            "--emit-ir" => emit_ir = true,
+            other => input = Some(other),
+        }
+        i += 1;
+    }
+    let Some(path) = input else {
+        eprintln!("usage: inga build <file.inga> [-o out] [--emit-ir]");
+        return ExitCode::FAILURE;
+    };
+    let src = match read_file(path) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let checked = check_source(&src);
+    if print_diagnostics(path, &src, &checked.diagnostics) {
+        return ExitCode::FAILURE;
+    }
+    let ir = match inga_codegen::compile(&checked.program, &checked.info) {
+        Ok(ir) => ir,
+        Err(diagnostics) => {
+            print_diagnostics(path, &src, &diagnostics);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let stem = Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+    let out_path = output.unwrap_or_else(|| stem.to_string());
+    let ll_path = format!("{out_path}.ll");
+    if let Err(e) = std::fs::write(&ll_path, &ir) {
+        eprintln!("error: cannot write `{ll_path}`: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // The runtime staticlib is built next to this binary by cargo.
+    let rt_lib = match std::env::var("INGA_RT_LIB") {
+        Ok(p) => std::path::PathBuf::from(p),
+        Err(_) => {
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(Path::to_path_buf))
+                .unwrap_or_default();
+            exe_dir.join("libinga_rt.a")
+        }
+    };
+    if !rt_lib.exists() {
+        eprintln!(
+            "error: runtime library not found at {} (build it with `cargo build -p inga-rt`, or set INGA_RT_LIB)",
+            rt_lib.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let status = std::process::Command::new("clang")
+        .arg("-O2")
+        .arg("-Wno-override-module")
+        .arg(&ll_path)
+        .arg(&rt_lib)
+        .arg("-o")
+        .arg(&out_path)
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            if !emit_ir {
+                let _ = std::fs::remove_file(&ll_path);
+            } else {
+                println!("{ll_path}: LLVM IR");
+            }
+            println!("{out_path}: native binary");
+            ExitCode::SUCCESS
+        }
+        Ok(s) => {
+            eprintln!("error: clang failed with {s} (IR kept at {ll_path})");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("error: cannot run clang: {e} (install the Xcode command line tools or LLVM)");
             ExitCode::FAILURE
         }
     }

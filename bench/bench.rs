@@ -97,7 +97,7 @@ fn bench(name: &str, work: impl FnOnce() -> i64) {
     let t0 = Instant::now();
     let result = black_box(work());
     let elapsed = t0.elapsed();
-    println!("{name} {:.2} ms (result {result})", elapsed.as_secs_f64() * 1000.0);
+    println!("{name} {} us (result {result})", elapsed.as_micros());
 }
 
 fn round(i: u32) {

@@ -150,8 +150,16 @@ dependencies = [
 name = "inga-cli"
 version = "0.1.0"
 dependencies = [
+ "inga-codegen",
  "inga-core",
  "inga-lsp",
+]
+
+[[package]]
+name = "inga-codegen"
+version = "0.1.0"
+dependencies = [
+ "inga-core",
 ]
 
 [[package]]
@@ -168,6 +176,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "inga-rt"
+version = "0.1.0"
 
 [[package]]
 name = "itoa"

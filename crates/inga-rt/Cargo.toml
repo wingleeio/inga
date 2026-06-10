@@ -1,0 +1,11 @@
+[package]
+name = "inga-rt"
+description = "Native runtime for compiled Inga programs (linked as a staticlib)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]

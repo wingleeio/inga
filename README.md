@@ -86,7 +86,8 @@ One binary, everything included:
 
 | Command | What it does |
 |---|---|
-| `inga run file.inga` | type-check + run (tree-walking interpreter) |
+| `inga run file.inga` | type-check + run (reference interpreter, full language) |
+| `inga build file.inga [-o out]` | **compile to a native binary** (LLVM IR → clang -O2) |
 | `inga check files...` | diagnostics with source carets |
 | `inga fmt [--check] files...` | canonical formatter (idempotent, keeps comments) |
 | `inga highlight file.inga` | ANSI syntax highlighting in the terminal |
@@ -98,32 +99,40 @@ Editor support lives in [`editors/vscode`](editors/vscode) (TextMate grammar
 ## Repository layout
 
 ```
-crates/inga-core   lexer, parser, type & effect inference, interpreter, formatter
-crates/inga-cli    the `inga` binary
-crates/inga-lsp    language server (lsp-server / lsp-types)
-editors/vscode     VS Code extension + TextMate grammar
-examples/          hello.inga, retry.inga, user_service.inga
-bench/             the same workloads in Inga, JavaScript, and Rust (see bench/README.md)
-docs/SPEC.md       language design: semantics, effect rows, execution strategy
+crates/inga-core      lexer, parser, type & effect inference, interpreter, formatter
+crates/inga-codegen   LLVM backend (emits .ll; clang compiles and links)
+crates/inga-rt        native runtime staticlib (allocator, strings, maps, clock)
+crates/inga-cli       the `inga` binary
+crates/inga-lsp       language server (lsp-server / lsp-types)
+editors/vscode        VS Code extension + TextMate grammar
+examples/             hello.inga, retry.inga, user_service.inga
+bench/                the same workloads in Inga, JavaScript, and Rust (see bench/README.md)
+docs/SPEC.md          language design: semantics, effect rows, execution strategy
 ```
 
-Curious how the interpreter stacks up? `bench/run.sh` runs five identical
-workloads in Inga, node, and `rustc -O` — including one where Inga's typed
-errors beat JavaScript exceptions 3× ([results](bench/README.md)).
+`bench/run.sh` runs five identical workloads as native Inga, interpreted
+Inga, node, and `rustc -O` — compiled Inga wins every one against V8
+([results](bench/README.md)).
 
 ## How it runs
 
-v0.1 interprets the typed AST. Because Inga's effects are static — error and
-capability rows are compile-time name-sets — the compilation story is
-conventional: errors lower to tagged-union returns, capabilities to
-Koka-style evidence passing. The planned backend ladder is bytecode VM →
-Cranelift native code (LLVM only if release-grade optimization ever warrants
-the toolchain cost). The reasoning is laid out in
+Two backends, one front end. `inga run` interprets the typed AST (reference
+semantics, full language). `inga build` compiles to native code through LLVM
+— and because Inga's effects are static, **the effect system compiles
+away**: error rows become Rust-style `{value, err}` two-register returns,
+capability rows become Koka-style evidence parameters, and a capability
+method call is the same machine code as a Rust `dyn` call. Details in
 [docs/SPEC.md §6](docs/SPEC.md#6-execution-how-inga-runs).
+
+The result ([benchmarks](bench/README.md)): **compiled Inga beats Node/V8 on
+all five benchmark workloads** — ~2× on raw calls, DI dispatch, and string
+interpolation, ~860× on typed-error control flow — and beats idiomatic Rust
+on two of them.
 
 ## Status
 
-v0.1 — a complete, tested vertical slice: language, inference, runtime,
-formatter, LSP, editor tooling (`cargo test` covers all of it). Not yet:
-modules/packages, per-implementation capability precision, resumable
-handlers, native codegen.
+v0.2 — a complete, tested vertical slice: language, inference, interpreter,
+**native LLVM backend**, formatter, LSP, editor tooling (`cargo test` covers
+all of it). Not yet: modules/packages, GC for compiled programs (bump
+allocator today), `encode`/`decode` in compiled mode, per-implementation
+capability precision, resumable handlers.

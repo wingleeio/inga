@@ -757,6 +757,9 @@ impl<'a> Interp<'a> {
             "nowMillis" if args.is_empty() => {
                 Ok(Value::Int(self.start.elapsed().as_millis() as i64))
             }
+            "nowMicros" if args.is_empty() => {
+                Ok(Value::Int(self.start.elapsed().as_micros() as i64))
+            }
             "Some" if args.len() == 1 => match self.eval(args[0], scope) {
                 Ok(v) => Ok(Value::Option(Some(Rc::new(v)))),
                 Err(e) => Err(e),

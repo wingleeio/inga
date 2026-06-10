@@ -141,36 +141,48 @@ provides real implementations.
 
 ## 6. Execution: how Inga runs
 
-**v0.1 (this repository): a tree-walking interpreter** in Rust. Errors are a
-`Result` channel, capabilities a dynamically scoped stack of provided
-instances, `retry`/`lazy` re-evaluate thunked AST. An interpreter was chosen
-deliberately: language iteration speed dominates at this stage, and the
-checker — not the backend — is the product.
+Inga has two execution modes sharing one front end (lexer → parser → type +
+effect inference):
 
-**The path to native, in order:**
+**`inga run` — the reference interpreter.** A tree-walking interpreter in
+Rust: errors are a `Result` channel, capabilities a dynamically scoped stack
+of provided instances, `retry`/`lazy` re-evaluate thunked AST. It covers the
+whole language and is the semantics of record.
 
-1. **Bytecode VM** (next): a register VM with the same `Result`-style error
-   channel; removes tree-walking overhead, gives stable snapshots for a
-   future debugger.
-2. **Cranelift AOT/JIT**: Inga's effects are deliberately *static* — error
-   rows and capability rows are name-sets known at compile time — so they
-   compile away. Errors lower to tagged-union returns (as Rust/Swift do);
-   capabilities lower to **evidence passing** (Koka's strategy): each
-   function receives a hidden vector of the service vtables its row demands,
-   so `provide` is just constructing a record and `Cache cache` is an indexed
-   load. No stack switching, no continuations, no GC requirement beyond
-   refcounting (values are immutable; `MutMap` is an explicit cell).
-3. **Why Cranelift first, LLVM later (maybe)**: Cranelift is pure Rust, links
-   in minutes, compiles fast, and is production-proven (Wasmtime). LLVM buys
-   ~20–30% better generated code at the cost of a C++ toolchain dependency
-   and much slower builds — the right trade only when Inga has users who
-   need release-grade binaries. The IR is structured so the Cranelift and
-   LLVM backends would share the same lowering.
+**`inga build` — the LLVM backend (v0.2).** `crates/inga-codegen` lowers the
+checked AST to textual LLVM IR; `clang -O2` (which embeds LLVM — no other
+toolchain dependency) compiles and links it against a small Rust runtime
+staticlib (`crates/inga-rt`: bump allocator, strings, hash map, clock).
+Because Inga's effects are deliberately *static* — error rows and capability
+rows are name-sets known at compile time — **the effect system compiles
+away**:
 
-Full delimited-continuation effects (resumable handlers, generators, async)
-are explicitly out of scope for v0.1; the design reserves them — that's why
-handlers are syntax (`catch`, `provide`) rather than first-class values, so
-evidence passing remains sufficient.
+- **Values are native.** Every value is one `i64`; `Int`/`Bool`/`Duration`
+  are raw machine integers — no boxing, no tags, because types are static.
+- **Errors are return values.** A function with a non-empty `!` row returns
+  `{ i64 value, i64 err }` in two registers (Rust's `Result` shape). `fail`
+  is a store + branch; `catch` compares an error type id. Functions with
+  empty rows pay nothing — the checker proved they can't fail.
+- **Capabilities are evidence** (Koka's strategy). A `uses` row becomes
+  hidden leading parameters, one instance pointer per service; `provide`
+  allocates `{ method fn-ptrs..., fields... }`; `Cache cache` is just a
+  parameter reference; method calls are indirect calls — the same machine
+  code as Rust `dyn` dispatch.
+- The optimizer exploits staticness: `len("n=${n}")` folds to
+  `2 + digits(n)` with no string materialized; `map.get(k) |> getOrElse(d)`
+  fuses into a direct probe with no `Option` box.
+
+Measured result (bench/README.md): the compiled benchmarks beat Node/V8 on
+all five workloads — about 2× on calls, dispatch, and strings, ~860× on
+typed-error control flow — and run ~300× faster than the interpreter.
+
+**Current limits of the backend:** `encode`/`decode` (runtime JSON) and
+showing structs still require the interpreter, and compiled programs use a
+bump allocator that never frees (no GC yet — acceptable for short-lived
+processes, on the roadmap). Full delimited-continuation effects (resumable
+handlers, generators, async) remain out of scope; handlers are syntax
+(`catch`, `provide`) rather than first-class values precisely so that
+evidence passing stays sufficient.
 
 ## 7. Packages (future)
 

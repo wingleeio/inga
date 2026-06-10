@@ -1,0 +1,9 @@
+[package]
+name = "inga-codegen"
+description = "LLVM IR backend for Inga (emits textual .ll, compiled by clang)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+inga-core = { path = "../inga-core" }

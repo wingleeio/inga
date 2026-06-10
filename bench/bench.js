@@ -73,7 +73,7 @@ function bench(name, work) {
   const t0 = performance.now();
   const result = work();
   const t1 = performance.now();
-  console.log(`${name} ${(t1 - t0).toFixed(2)} ms (result ${result})`);
+  console.log(`${name} ${Math.round((t1 - t0) * 1000)} us (result ${result})`);
 }
 
 function round(i) {

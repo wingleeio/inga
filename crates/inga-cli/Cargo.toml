@@ -11,4 +11,5 @@ path = "src/main.rs"
 
 [dependencies]
 inga-core = { path = "../inga-core" }
+inga-codegen = { path = "../inga-codegen" }
 inga-lsp = { path = "../inga-lsp" }

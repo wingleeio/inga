@@ -12,7 +12,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/wing/inga"
+repository = "https://github.com/wingleeio/inga"
 
 [profile.release]
 lto = true

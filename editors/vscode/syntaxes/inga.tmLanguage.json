@@ -62,6 +62,21 @@
             "1": { "name": "entity.name.function.inga" },
             "2": { "name": "keyword.operator.signature.inga" }
           }
+        },
+        {
+          "comment": "builtin modules: `Gfx.rect(...)`, `Schedule.fixed(...)`",
+          "match": "\\b(Gfx|Schedule)(?=\\.)",
+          "captures": {
+            "1": { "name": "entity.name.namespace.inga" }
+          }
+        },
+        {
+          "comment": "capability binding: `Cache cache`",
+          "match": "^\\s*([A-Z][A-Za-z0-9_]*)\\s+([a-z][A-Za-z0-9_]*)\\s*$",
+          "captures": {
+            "1": { "name": "entity.name.type.interface.inga" },
+            "2": { "name": "variable.other.readwrite.inga" }
+          }
         }
       ]
     },

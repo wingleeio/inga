@@ -324,6 +324,11 @@ const T_NUMBER: u32 = 3;
 const T_COMMENT: u32 = 4;
 const T_OPERATOR: u32 = 5;
 const T_VARIABLE: u32 = 6;
+const T_FUNCTION: u32 = 7;
+const T_METHOD: u32 = 8;
+const T_PROPERTY: u32 = 9;
+const T_ENUM_MEMBER: u32 = 10;
+const T_NAMESPACE: u32 = 11;
 
 fn legend_types() -> Vec<SemanticTokenType> {
     vec![
@@ -334,25 +339,70 @@ fn legend_types() -> Vec<SemanticTokenType> {
         SemanticTokenType::COMMENT,
         SemanticTokenType::OPERATOR,
         SemanticTokenType::VARIABLE,
+        SemanticTokenType::FUNCTION,
+        SemanticTokenType::METHOD,
+        SemanticTokenType::PROPERTY,
+        SemanticTokenType::ENUM_MEMBER,
+        SemanticTokenType::NAMESPACE,
     ]
 }
 
+/// Context-aware classification over the raw token stream:
+/// `name ::` and `name(` are functions, `.name(` is a method, `.name` a
+/// property, `Some`/`None` enum members, `Gfx.`/`Schedule.` namespaces.
 fn collect_semantic_tokens(
     src: &str,
     lines: &LineIndex,
     tokens: &[Token],
     out: &mut Vec<(u32, u32, u32, u32)>,
 ) {
-    for token in tokens {
+    // Neighbor lookups skip trivia.
+    let significant: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !matches!(t.kind, TokenKind::Newline | TokenKind::Comment(_)))
+        .map(|(i, _)| i)
+        .collect();
+    let sig_pos = |i: usize| significant.binary_search(&i).ok();
+    let next_kind = |i: usize| -> Option<&TokenKind> {
+        sig_pos(i).and_then(|p| significant.get(p + 1)).map(|&j| &tokens[j].kind)
+    };
+    let prev_kind = |i: usize| -> Option<&TokenKind> {
+        sig_pos(i)
+            .and_then(|p| p.checked_sub(1))
+            .and_then(|p| significant.get(p))
+            .map(|&j| &tokens[j].kind)
+    };
+
+    for (i, token) in tokens.iter().enumerate() {
         let token_type = match &token.kind {
             TokenKind::Comment(_) => T_COMMENT,
             TokenKind::Str(parts) => {
-                // The string itself, then recurse into interpolation holes.
-                push_span(src, lines, token.span, T_STRING, out);
+                // Emit non-overlapping string segments around the `${...}`
+                // holes; hole contents classify themselves.
+                let mut cursor = token.span.start;
                 for part in parts {
                     if let StrPart::Expr(inner) = part {
+                        let exprs: Vec<&Token> =
+                            inner.iter().filter(|t| t.kind != TokenKind::Eof).collect();
+                        let (Some(first), Some(last)) = (exprs.first(), exprs.last()) else {
+                            continue;
+                        };
+                        if first.span.start > cursor {
+                            push_span(
+                                src,
+                                lines,
+                                Span::new(cursor, first.span.start),
+                                T_STRING,
+                                out,
+                            );
+                        }
                         collect_semantic_tokens(src, lines, inner, out);
+                        cursor = last.span.end;
                     }
+                }
+                if token.span.end > cursor {
+                    push_span(src, lines, Span::new(cursor, token.span.end), T_STRING, out);
                 }
                 continue;
             }
@@ -360,8 +410,27 @@ fn collect_semantic_tokens(
                 T_NUMBER
             }
             TokenKind::Ident(name) => {
-                if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-                    T_TYPE
+                let upper = name.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+                let after_dot = matches!(prev_kind(i), Some(TokenKind::Dot));
+                let before_paren = matches!(next_kind(i), Some(TokenKind::LParen));
+                if upper {
+                    if name == "Some" || name == "None" {
+                        T_ENUM_MEMBER
+                    } else if matches!(next_kind(i), Some(TokenKind::Dot))
+                        && (name == "Gfx" || name == "Schedule")
+                    {
+                        T_NAMESPACE
+                    } else {
+                        T_TYPE
+                    }
+                } else if matches!(next_kind(i), Some(TokenKind::ColonColon)) {
+                    T_FUNCTION // declaration
+                } else if after_dot && before_paren {
+                    T_METHOD
+                } else if after_dot {
+                    T_PROPERTY
+                } else if before_paren {
+                    T_FUNCTION // call
                 } else {
                     T_VARIABLE
                 }
@@ -377,9 +446,25 @@ fn collect_semantic_tokens(
             | TokenKind::KwLazy
             | TokenKind::KwIf
             | TokenKind::KwElse => T_KEYWORD,
-            TokenKind::ColonColon | TokenKind::Arrow | TokenKind::PipeOp | TokenKind::Bang => {
-                T_OPERATOR
-            }
+            TokenKind::ColonColon
+            | TokenKind::Arrow
+            | TokenKind::PipeOp
+            | TokenKind::Bang
+            | TokenKind::Question
+            | TokenKind::Eq
+            | TokenKind::EqEq
+            | TokenKind::NotEq
+            | TokenKind::Lt
+            | TokenKind::Le
+            | TokenKind::Gt
+            | TokenKind::Ge
+            | TokenKind::Plus
+            | TokenKind::Minus
+            | TokenKind::Star
+            | TokenKind::Slash
+            | TokenKind::Percent
+            | TokenKind::AndAnd
+            | TokenKind::OrOr => T_OPERATOR,
             _ => continue,
         };
         push_span(src, lines, token.span, token_type, out);

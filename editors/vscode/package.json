@@ -1,0 +1,55 @@
+{
+  "name": "inga",
+  "displayName": "Inga",
+  "description": "Language support for Inga: syntax highlighting, diagnostics, hover, formatting via the Inga language server",
+  "version": "0.1.0",
+  "publisher": "inga-lang",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Formatters",
+    "Linters"
+  ],
+  "main": "./src/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "languages": [
+      {
+        "id": "inga",
+        "aliases": [
+          "Inga"
+        ],
+        "extensions": [
+          ".inga"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "inga",
+        "scopeName": "source.inga",
+        "path": "./syntaxes/inga.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Inga",
+      "properties": {
+        "inga.serverPath": {
+          "type": "string",
+          "default": "inga",
+          "description": "Path to the `inga` executable (the language server runs as `inga lsp`)."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "scripts": {
+    "package": "vsce package"
+  }
+}

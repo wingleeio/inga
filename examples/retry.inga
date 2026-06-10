@@ -1,0 +1,45 @@
+// Effects in miniature: a flaky service, typed errors, retry schedules.
+
+error Flaky = { Int attempt }
+
+service Counter {
+    next :: () -> Int
+}
+
+memoryCounter :: Counter {
+    state = MutMap()
+
+    next :: () {
+        n = state.get("n") |> getOrElse(0)
+        state.set("n", n + 1)
+        n
+    }
+}
+
+// `flaky` fails its first three calls. Its error row (`! Flaky`) and
+// capability row (`uses Counter`) are inferred — hover in an editor shows
+// `flaky :: () -> Int ! Flaky uses Counter`.
+flaky :: () {
+    Counter counter
+
+    n = counter.next()
+    if n < 3 {
+        fail Flaky(n + 1)
+    }
+    n
+}
+
+main :: () {
+    provide memoryCounter {
+        value = flaky() |> retry(Schedule.fixed(1.millis) |> upTo(5)) |> catch { Flaky(e) -> -e.attempt }
+        println("settled on ${value} after retries")
+
+        // Exhaust the retry budget: 2 retries cannot survive 3 failures.
+        provide memoryCounter {
+            failed = flaky()
+                |> retry(Schedule.fixed(1.millis) |> upTo(2))
+                |> catch { Flaky(e) -> -e.attempt }
+            println("gave up with ${failed}")
+        }
+    }
+}

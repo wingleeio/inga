@@ -1,0 +1,354 @@
+//! The `inga` command-line tool.
+
+use std::path::Path;
+use std::process::ExitCode;
+
+use inga_core::diag::{Diagnostic, Severity};
+use inga_core::span::LineIndex;
+use inga_core::token::{StrPart, Token, TokenKind};
+use inga_core::{check_source, fmt as inga_fmt, interp, lexer};
+
+const USAGE: &str = "\
+inga — the Inga language
+
+Usage:
+  inga run <file.inga>          type-check and run (entry point: main)
+  inga check <file.inga>...     type-check and report diagnostics
+  inga fmt [--check] <file>...  format in place (--check: diff exit code only)
+  inga highlight <file.inga>    print the file with ANSI syntax colors
+  inga lsp                      run the language server over stdio
+  inga help                     show this message
+";
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("run") => cmd_run(&args[1..]),
+        Some("check") => cmd_check(&args[1..]),
+        Some("fmt") => cmd_fmt(&args[1..]),
+        Some("highlight") => cmd_highlight(&args[1..]),
+        Some("lsp") => {
+            inga_lsp::run_server();
+            ExitCode::SUCCESS
+        }
+        Some("help") | Some("--help") | Some("-h") | None => {
+            print!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        Some(other) => {
+            eprintln!("unknown command `{other}`\n");
+            eprint!("{USAGE}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn read_file(path: &str) -> Result<String, ExitCode> {
+    std::fs::read_to_string(path).map_err(|e| {
+        eprintln!("error: cannot read `{path}`: {e}");
+        ExitCode::FAILURE
+    })
+}
+
+fn cmd_run(args: &[String]) -> ExitCode {
+    let Some(path) = args.first() else {
+        eprintln!("usage: inga run <file.inga>");
+        return ExitCode::FAILURE;
+    };
+    let src = match read_file(path) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let checked = check_source(&src);
+    let has_errors = print_diagnostics(path, &src, &checked.diagnostics);
+    if has_errors {
+        return ExitCode::FAILURE;
+    }
+    match interp::run(&checked.program, "main") {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            match err.span {
+                Some(span) => {
+                    let diag = Diagnostic::error(span, format!("runtime error: {}", err.message));
+                    print_diagnostics(path, &src, &[diag]);
+                }
+                None => eprintln!("runtime error: {}", err.message),
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_check(args: &[String]) -> ExitCode {
+    if args.is_empty() {
+        eprintln!("usage: inga check <file.inga>...");
+        return ExitCode::FAILURE;
+    }
+    let mut failed = false;
+    for path in args {
+        let src = match read_file(path) {
+            Ok(s) => s,
+            Err(_) => {
+                failed = true;
+                continue;
+            }
+        };
+        let checked = check_source(&src);
+        if print_diagnostics(path, &src, &checked.diagnostics) {
+            failed = true;
+        } else if checked.diagnostics.is_empty() {
+            println!("{path}: ok");
+        }
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn cmd_fmt(args: &[String]) -> ExitCode {
+    let check_only = args.first().map(String::as_str) == Some("--check");
+    let files = if check_only { &args[1..] } else { args };
+    if files.is_empty() {
+        eprintln!("usage: inga fmt [--check] <file.inga>...");
+        return ExitCode::FAILURE;
+    }
+    let mut failed = false;
+    for path in files {
+        let src = match read_file(path) {
+            Ok(s) => s,
+            Err(_) => {
+                failed = true;
+                continue;
+            }
+        };
+        match inga_fmt::format(&src) {
+            Ok(formatted) => {
+                if formatted == src {
+                    continue;
+                }
+                if check_only {
+                    println!("{path}: needs formatting");
+                    failed = true;
+                } else if let Err(e) = std::fs::write(Path::new(path), &formatted) {
+                    eprintln!("error: cannot write `{path}`: {e}");
+                    failed = true;
+                } else {
+                    println!("{path}: formatted");
+                }
+            }
+            Err(diagnostics) => {
+                print_diagnostics(path, &src, &diagnostics);
+                eprintln!("{path}: not formatted (fix parse errors first)");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+// ---- diagnostics rendering -------------------------------------------------
+
+/// Prints diagnostics with source context. Returns true if any were errors.
+fn print_diagnostics(path: &str, src: &str, diagnostics: &[Diagnostic]) -> bool {
+    let lines = LineIndex::new(src);
+    let use_color = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let mut has_errors = false;
+    for diag in diagnostics {
+        let (severity, color) = match diag.severity {
+            Severity::Error => {
+                has_errors = true;
+                ("error", "\x1b[31;1m")
+            }
+            Severity::Warning => ("warning", "\x1b[33;1m"),
+        };
+        let (line, col) = lines.line_col(diag.span.start);
+        let (c0, c1, bold) = if use_color { (color, "\x1b[0m", "\x1b[1m") } else { ("", "", "") };
+        eprintln!(
+            "{c0}{severity}{c1}{bold}: {}{c1}\n  --> {path}:{}:{}",
+            diag.message,
+            line + 1,
+            col + 1
+        );
+        // Source line with a caret underline.
+        let line_start = lines.line_start(line) as usize;
+        let line_end = src[line_start..].find('\n').map(|i| line_start + i).unwrap_or(src.len());
+        let text = &src[line_start..line_end];
+        let line_no = format!("{}", line + 1);
+        let pad = " ".repeat(line_no.len());
+        eprintln!("{pad} |");
+        eprintln!("{line_no} | {text}");
+        let caret_start = (diag.span.start as usize).saturating_sub(line_start);
+        let caret_len =
+            ((diag.span.end as usize).min(line_end) as i64 - diag.span.start as i64).max(1) as usize;
+        let underline = " ".repeat(caret_start) + &"^".repeat(caret_len);
+        eprintln!("{pad} | {c0}{underline}{c1}");
+        eprintln!();
+    }
+    has_errors
+}
+
+// ---- terminal highlighter ----------------------------------------------------
+
+fn cmd_highlight(args: &[String]) -> ExitCode {
+    let Some(path) = args.first() else {
+        eprintln!("usage: inga highlight <file.inga>");
+        return ExitCode::FAILURE;
+    };
+    let src = match read_file(path) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let mut diagnostics = Vec::new();
+    let tokens = lexer::lex(&src, &mut diagnostics);
+    print!("{}", highlight_ansi(&src, &tokens));
+    ExitCode::SUCCESS
+}
+
+const RESET: &str = "\x1b[0m";
+const KEYWORD: &str = "\x1b[35m"; // magenta
+const TYPE: &str = "\x1b[33m"; // yellow — uppercase identifiers
+const STRING: &str = "\x1b[32m"; // green
+const NUMBER: &str = "\x1b[36m"; // cyan
+const COMMENT: &str = "\x1b[90m"; // bright black
+const OPERATOR: &str = "\x1b[34m"; // blue — ::, |>, ->, !
+
+/// Re-emit source with ANSI colors. Token spans index the original source, so
+/// whitespace and layout are preserved exactly.
+fn highlight_ansi(src: &str, tokens: &[Token]) -> String {
+    let mut out = String::with_capacity(src.len() * 2);
+    let mut cursor = 0usize;
+    emit_tokens(src, tokens, &mut cursor, &mut out);
+    out.push_str(&src[cursor.min(src.len())..]);
+    out
+}
+
+fn emit_tokens(src: &str, tokens: &[Token], cursor: &mut usize, out: &mut String) {
+    for token in tokens {
+        if token.kind == TokenKind::Eof {
+            continue;
+        }
+        let start = token.span.start as usize;
+        let end = (token.span.end as usize).min(src.len());
+        if start < *cursor || end < start {
+            continue;
+        }
+        out.push_str(&src[*cursor..start]);
+        let text = &src[start..end];
+        match &token.kind {
+            TokenKind::Comment(_) => {
+                out.push_str(COMMENT);
+                out.push_str(text);
+                out.push_str(RESET);
+            }
+            TokenKind::Str(parts) => {
+                emit_string(src, text, start, parts, out);
+            }
+            TokenKind::Int(_) | TokenKind::Float(_) => {
+                out.push_str(NUMBER);
+                out.push_str(text);
+                out.push_str(RESET);
+            }
+            TokenKind::Ident(name) => {
+                if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                    out.push_str(TYPE);
+                    out.push_str(text);
+                    out.push_str(RESET);
+                } else {
+                    out.push_str(text);
+                }
+            }
+            TokenKind::KwTrue | TokenKind::KwFalse => {
+                out.push_str(NUMBER);
+                out.push_str(text);
+                out.push_str(RESET);
+            }
+            k if is_keyword(k) => {
+                out.push_str(KEYWORD);
+                out.push_str(text);
+                out.push_str(RESET);
+            }
+            TokenKind::ColonColon | TokenKind::Arrow | TokenKind::PipeOp | TokenKind::Bang => {
+                out.push_str(OPERATOR);
+                out.push_str(text);
+                out.push_str(RESET);
+            }
+            _ => out.push_str(text),
+        }
+        *cursor = end;
+    }
+}
+
+/// Strings: green text, with `${...}` holes highlighted recursively.
+fn emit_string(src: &str, text: &str, start: usize, parts: &[StrPart], out: &mut String) {
+    let exprs: Vec<&Vec<Token>> = parts
+        .iter()
+        .filter_map(|p| match p {
+            StrPart::Expr(tokens) => Some(tokens),
+            _ => None,
+        })
+        .collect();
+    if exprs.is_empty() {
+        out.push_str(STRING);
+        out.push_str(text);
+        out.push_str(RESET);
+        return;
+    }
+    let end = start + text.len();
+    let mut cursor = start;
+    for tokens in exprs {
+        let Some(first) = tokens.iter().find(|t| t.kind != TokenKind::Eof) else { continue };
+        let Some(last) = tokens.iter().rev().find(|t| t.kind != TokenKind::Eof) else { continue };
+        let expr_start = first.span.start as usize;
+        let expr_end = (last.span.end as usize).min(src.len());
+        if expr_start < cursor {
+            continue;
+        }
+        // String text up to the `${`, then the hole contents.
+        let pre = &src[cursor..expr_start];
+        let dollar = pre.rfind("${").map(|i| cursor + i).unwrap_or(expr_start);
+        out.push_str(STRING);
+        out.push_str(&src[cursor..dollar]);
+        out.push_str(RESET);
+        out.push_str(KEYWORD);
+        out.push_str(&src[dollar..expr_start]);
+        out.push_str(RESET);
+        let mut inner_cursor = expr_start;
+        emit_tokens(src, tokens, &mut inner_cursor, out);
+        out.push_str(&src[inner_cursor..expr_end]);
+        // Closing `}`.
+        let close = src[expr_end..end.min(src.len())]
+            .find('}')
+            .map(|i| expr_end + i + 1)
+            .unwrap_or(expr_end);
+        out.push_str(KEYWORD);
+        out.push_str(&src[expr_end..close]);
+        out.push_str(RESET);
+        cursor = close;
+    }
+    out.push_str(STRING);
+    out.push_str(&src[cursor..end.min(src.len())]);
+    out.push_str(RESET);
+}
+
+fn is_keyword(kind: &TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::KwError
+            | TokenKind::KwType
+            | TokenKind::KwService
+            | TokenKind::KwMatch
+            | TokenKind::KwCatch
+            | TokenKind::KwFail
+            | TokenKind::KwProvide
+            | TokenKind::KwUses
+            | TokenKind::KwLazy
+            | TokenKind::KwIf
+            | TokenKind::KwElse
+    )
+}

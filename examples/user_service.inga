@@ -1,0 +1,125 @@
+// The user-service example: typed errors, inferred effect rows, capability
+// injection, retries — run it with `inga run examples/user_service.inga`.
+
+error UserNotFound = { Int id }
+error DbError      = { String cause }
+error CacheMiss    = { String key }
+
+type User = { Int id, String name, String email }
+
+service Logger {
+    info :: (String msg)
+    warn :: (String msg)
+}
+
+service Cache {
+    get :: (String key) -> String ! CacheMiss
+    set :: (String key, String value, Duration ttl)
+}
+
+service Database {
+    findUser :: (Int id) -> User? ! DbError
+}
+
+// Errors, dependencies, and the return type are inferred — this annotation is
+// optional and checked against what the compiler infers.
+getUserById :: (Int id) -> User ! UserNotFound uses Database, Cache, Logger {
+    match cached(id) {
+        Some(user) -> user
+        None       -> fetchAndCache(id)
+    }
+}
+
+cached :: (id) {
+    Cache cache
+    Logger logger
+
+    cache.get("user:${id}")
+        |> decode(User)
+        |> Some
+        |> catch {
+            CacheMiss      -> None
+            DecodeError(e) -> {
+                logger.warn("corrupt cache entry for ${id}: ${e.message}")
+                None
+            }
+        }
+}
+
+fetchAndCache :: (id) {
+    Database db
+    Cache cache
+    Logger logger
+
+    user = db.findUser(id)
+        |> retry(Schedule.exponential(100.millis) |> upTo(3))
+        |> orFail(UserNotFound(id))
+        |> catch {
+            DbError(e) -> {
+                logger.warn("db down after retries: ${e.cause}")
+                fail UserNotFound(id)
+            }
+        }
+
+    cache.set("user:${id}", encode(user), 5.minutes) |> ignoreFailure
+    logger.info("cache refreshed for ${id}")
+    user
+}
+
+// ---- implementations --------------------------------------------------------
+
+consoleLogger :: Logger {
+    info :: (msg) {
+        println("[info] ${msg}")
+    }
+    warn :: (msg) {
+        println("[warn] ${msg}")
+    }
+}
+
+memoryCache :: Cache {
+    store = MutMap()
+
+    get :: (key) {
+        store.get(key) |> orFail(CacheMiss(key))
+    }
+
+    set :: (key, value, ttl) {
+        store.set(key, value)
+    }
+}
+
+// A flaky in-memory database: refuses the first two connections, so
+// `retry` has something to do.
+fakeDb :: Database {
+    attempts = MutMap()
+
+    findUser :: (id) {
+        n = attempts.get("count") |> getOrElse(0)
+        attempts.set("count", n + 1)
+        if n < 2 {
+            fail DbError("connection refused (attempt ${n + 1})")
+        }
+        if id == 42 {
+            Some(User(42, "Wing", "wing@anara.com"))
+        } else {
+            None
+        }
+    }
+}
+
+main :: () {
+    provide consoleLogger, memoryCache, fakeDb {
+        // First lookup: cache miss -> flaky db (retried) -> cache refresh.
+        user = getUserById(42) |> catch { UserNotFound -> User(0, "anonymous", "n/a") }
+        println("fetched: ${user.name} <${user.email}>")
+
+        // Second lookup hits the cache: no retries, no database.
+        again = getUserById(42) |> catch { UserNotFound -> User(0, "anonymous", "n/a") }
+        println("cached:  ${again.name}")
+
+        // Unknown user: the typed error carries its payload.
+        missing = getUserById(7) |> catch { UserNotFound(e) -> User(e.id, "anonymous", "n/a") }
+        println("fallback for user ${missing.id}: ${missing.name}")
+    }
+}

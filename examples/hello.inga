@@ -1,0 +1,19 @@
+// Smallest Inga program: `inga run examples/hello.inga`
+
+greet :: (String name) -> String {
+    "hello, ${name}!"
+}
+
+main :: () {
+    println(greet("world"))
+
+    numbers = [1, 2, 3, 4]
+    doubled = map(numbers, (x) -> x * 2)
+    println("doubled: ${doubled}, total items: ${len(doubled)}")
+
+    answer = match Some(42) {
+        Some(n) -> "the answer is ${n}"
+        None    -> "no answer"
+    }
+    println(answer)
+}

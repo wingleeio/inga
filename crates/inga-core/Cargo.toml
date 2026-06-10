@@ -1,0 +1,8 @@
+[package]
+name = "inga-core"
+description = "Lexer, parser, type/effect inference, interpreter, and formatter for the Inga language"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

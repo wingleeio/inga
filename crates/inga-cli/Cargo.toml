@@ -1,0 +1,14 @@
+[package]
+name = "inga-cli"
+description = "The `inga` command-line tool: run, check, fmt, highlight, lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "inga"
+path = "src/main.rs"
+
+[dependencies]
+inga-core = { path = "../inga-core" }
+inga-lsp = { path = "../inga-lsp" }

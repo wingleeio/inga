@@ -18,14 +18,17 @@ use std::rc::Rc;
 pub const DURATION_SUFFIXES: [(&str, i64); 5] =
     [("millis", 1), ("seconds", 1000), ("minutes", 60_000), ("hours", 3_600_000), ("days", 86_400_000)];
 
-/// Builtin error raised by `decode`.
+/// Builtin struct raised by `decode`.
 pub const DECODE_ERROR: &str = "DecodeError";
+
+/// Surface names of primitive types that can appear in a `!` row.
+pub const PRIMITIVE_TAGS: [&str; 5] = ["Int", "Float", "Bool", "String", "Duration"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefKind {
     Func,
-    Error,
-    Type,
+    Struct,
+    Enum,
     Service,
     Impl,
     Method,
@@ -67,8 +70,8 @@ pub enum CType {
     Schedule,
     Option(Box<CType>),
     List(Box<CType>),
-    Named(String),
-    ErrorTy(String),
+    Struct(String),
+    Enum(String),
     Service(String),
     Tag(String),
     MutMap(Box<CType>, Box<CType>),
@@ -107,6 +110,12 @@ struct StructInfo {
     name_span: Span,
 }
 
+struct EnumInfo {
+    /// Variant name -> typed fields, in declaration order.
+    variants: Vec<(String, Vec<(String, Type)>)>,
+    name_span: Span,
+}
+
 struct MethodInfo {
     params: Vec<Type>,
     ret: Type,
@@ -138,6 +147,8 @@ struct FuncInfo {
 pub fn check(program: &Program, diagnostics: &mut Vec<Diagnostic>) -> CheckInfo {
     let mut checker = Checker::new(program);
     checker.collect_decls();
+    // Declaration-level diagnostics survive the fixpoint's per-pass clears.
+    let decl_diags = checker.diags.clone();
 
     // Fixpoint over effect rows; value-type unification state persists across
     // passes (re-unification is idempotent). Diagnostics from warm-up passes
@@ -158,6 +169,7 @@ pub fn check(program: &Program, diagnostics: &mut Vec<Diagnostic>) -> CheckInfo 
     checker.record_def_details();
     checker.record_facts();
 
+    diagnostics.extend(decl_diags);
     diagnostics.append(&mut checker.diags.clone());
     checker.info
 }
@@ -166,8 +178,10 @@ struct Checker<'a> {
     program: &'a Program,
     ctx: TypeCtx,
 
-    errors_decl: HashMap<String, StructInfo>,
-    types_decl: HashMap<String, StructInfo>,
+    structs: HashMap<String, StructInfo>,
+    enums: HashMap<String, EnumInfo>,
+    /// Variant name -> owning enum (variant names are globally unique).
+    variant_owner: HashMap<String, String>,
     services: HashMap<String, ServiceInfo>,
     impls: HashMap<String, ImplInfo>,
     funcs: HashMap<String, FuncInfo>,
@@ -190,8 +204,9 @@ impl<'a> Checker<'a> {
         let mut checker = Checker {
             program,
             ctx: TypeCtx::default(),
-            errors_decl: HashMap::new(),
-            types_decl: HashMap::new(),
+            structs: HashMap::new(),
+            enums: HashMap::new(),
+            variant_owner: HashMap::new(),
             services: HashMap::new(),
             impls: HashMap::new(),
             funcs: HashMap::new(),
@@ -205,8 +220,8 @@ impl<'a> Checker<'a> {
             scopes: Vec::new(),
             row_stack: Vec::new(),
         };
-        // Builtin error available to every program.
-        checker.errors_decl.insert(
+        // Builtin struct available to every program (raised by `decode`).
+        checker.structs.insert(
             DECODE_ERROR.to_string(),
             StructInfo {
                 fields: vec![("message".into(), Type::Str)],
@@ -230,15 +245,16 @@ impl<'a> Checker<'a> {
         // First sweep: names only, so types can reference each other.
         for decl in &self.program.decls {
             let (name, span, kind) = match decl {
-                Decl::Error(d) => (&d.name, d.name_span, DefKind::Error),
-                Decl::Type(d) => (&d.name, d.name_span, DefKind::Type),
+                Decl::Struct(d) => (&d.name, d.name_span, DefKind::Struct),
+                Decl::Enum(d) => (&d.name, d.name_span, DefKind::Enum),
                 Decl::Service(d) => (&d.name, d.name_span, DefKind::Service),
                 Decl::Impl(d) => (&d.name, d.name_span, DefKind::Impl),
                 Decl::Func(d) => (&d.name, d.name_span, DefKind::Func),
             };
             let dup = match kind {
-                DefKind::Error => self.errors_decl.contains_key(name),
-                DefKind::Type => self.types_decl.contains_key(name),
+                DefKind::Struct | DefKind::Enum => {
+                    self.structs.contains_key(name) || self.enums.contains_key(name)
+                }
                 DefKind::Service => self.services.contains_key(name),
                 DefKind::Impl | DefKind::Func | DefKind::Method => {
                     self.impls.contains_key(name) || self.funcs.contains_key(name)
@@ -249,16 +265,13 @@ impl<'a> Checker<'a> {
                 continue;
             }
             match kind {
-                DefKind::Error | DefKind::Type => {
-                    let table = if kind == DefKind::Error {
-                        &mut self.errors_decl
-                    } else {
-                        &mut self.types_decl
-                    };
-                    table.insert(
-                        name.clone(),
-                        StructInfo { fields: Vec::new(), name_span: span },
-                    );
+                DefKind::Struct => {
+                    self.structs
+                        .insert(name.clone(), StructInfo { fields: Vec::new(), name_span: span });
+                }
+                DefKind::Enum => {
+                    self.enums
+                        .insert(name.clone(), EnumInfo { variants: Vec::new(), name_span: span });
                 }
                 DefKind::Service => {
                     self.services.insert(
@@ -273,7 +286,7 @@ impl<'a> Checker<'a> {
         // Second sweep: full signatures.
         for decl in &self.program.decls {
             match decl {
-                Decl::Error(d) | Decl::Type(d) => {
+                Decl::Struct(d) => {
                     let mut fields = Vec::new();
                     let mut tyvars = HashMap::new();
                     for field in &d.fields {
@@ -283,13 +296,39 @@ impl<'a> Checker<'a> {
                         };
                         fields.push((field.name.clone(), ty));
                     }
-                    let table = if matches!(decl, Decl::Error(_)) {
-                        &mut self.errors_decl
-                    } else {
-                        &mut self.types_decl
-                    };
-                    if let Some(info) = table.get_mut(&d.name) {
+                    if let Some(info) = self.structs.get_mut(&d.name) {
                         info.fields = fields;
+                    }
+                }
+                Decl::Enum(d) => {
+                    let mut variants = Vec::new();
+                    for variant in &d.variants {
+                        let taken = variant.name == "Some"
+                            || variant.name == "None"
+                            || self.structs.contains_key(&variant.name)
+                            || self.enums.contains_key(&variant.name)
+                            || self.variant_owner.contains_key(&variant.name);
+                        if taken {
+                            self.error(
+                                variant.name_span,
+                                format!("variant name `{}` is already taken", variant.name),
+                            );
+                            continue;
+                        }
+                        let mut tyvars = HashMap::new();
+                        let mut fields = Vec::new();
+                        for field in &variant.fields {
+                            let ty = match &field.ty {
+                                Some(t) => self.resolve_type_expr(t, &mut tyvars),
+                                None => self.ctx.fresh(),
+                            };
+                            fields.push((field.name.clone(), ty));
+                        }
+                        self.variant_owner.insert(variant.name.clone(), d.name.clone());
+                        variants.push((variant.name.clone(), fields));
+                    }
+                    if let Some(info) = self.enums.get_mut(&d.name) {
+                        info.variants = variants;
                     }
                 }
                 Decl::Service(d) => {
@@ -386,16 +425,67 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// A `!` row names the *types* of values the function can fail with:
+    /// structs, enums, or primitives.
     fn resolve_error_list(&mut self, list: Option<&[(String, Span)]>) -> BTreeSet<String> {
         let mut set = BTreeSet::new();
         for (name, span) in list.unwrap_or(&[]) {
-            if self.errors_decl.contains_key(name) {
+            if PRIMITIVE_TAGS.contains(&name.as_str())
+                || self.structs.contains_key(name)
+                || self.enums.contains_key(name)
+            {
                 set.insert(name.clone());
             } else {
-                self.error(*span, format!("unknown error type `{name}`"));
+                self.error(*span, format!("unknown type `{name}` in `!` row"));
             }
         }
         set
+    }
+
+    /// The `!` row tag for a type, if values of it can be failed.
+    fn row_tag_of(&self, ty: &Type) -> Result<Option<String>, ()> {
+        Ok(match self.ctx.resolve(ty) {
+            Type::Named(n) | Type::Enum(n) => Some(n),
+            Type::Int => Some("Int".into()),
+            Type::Float => Some("Float".into()),
+            Type::Bool => Some("Bool".into()),
+            Type::Str => Some("String".into()),
+            Type::Duration => Some("Duration".into()),
+            Type::Var(_) | Type::Unknown => None,
+            _ => return Err(()),
+        })
+    }
+
+    /// Add a failed value's type to the error row; diagnose unfailable types.
+    fn add_fail_row(&mut self, ty: &Type, span: Span, what: &str) {
+        match self.row_tag_of(ty) {
+            Ok(Some(tag)) => self.add_error_row(&tag),
+            Ok(None) => {}
+            Err(()) => {
+                let rendered = self.render(&self.ctx.resolve(ty));
+                self.error(
+                    span,
+                    format!(
+                        "cannot `{what}` with a value of type {rendered} (use a struct, enum, or primitive value)"
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Resolve a row tag name back to a value type (`String` -> Str, struct
+    /// and enum names -> their nominal types).
+    fn tag_type(&self, name: &str) -> Option<Type> {
+        match name {
+            "Int" => Some(Type::Int),
+            "Float" => Some(Type::Float),
+            "Bool" => Some(Type::Bool),
+            "String" => Some(Type::Str),
+            "Duration" => Some(Type::Duration),
+            _ if self.structs.contains_key(name) => Some(Type::Named(name.to_string())),
+            _ if self.enums.contains_key(name) => Some(Type::Enum(name.to_string())),
+            _ => None,
+        }
     }
 
     fn resolve_type_expr(&mut self, ty: &TypeExpr, tyvars: &mut HashMap<String, Type>) -> Type {
@@ -408,8 +498,8 @@ impl<'a> Checker<'a> {
                 "Unit" => Type::Unit,
                 "Duration" => Type::Duration,
                 "Schedule" => Type::Schedule,
-                _ if self.types_decl.contains_key(name) => Type::Named(name.clone()),
-                _ if self.errors_decl.contains_key(name) => Type::Error(name.clone()),
+                _ if self.structs.contains_key(name) => Type::Named(name.clone()),
+                _ if self.enums.contains_key(name) => Type::Enum(name.clone()),
                 _ if self.services.contains_key(name) => Type::Service(name.clone()),
                 _ if !is_upper(name) => {
                     // Lowercase: a type parameter; same name = same variable
@@ -691,8 +781,8 @@ impl<'a> Checker<'a> {
             Type::Schedule => CType::Schedule,
             Type::Option(t) => CType::Option(Box::new(self.ctype(&t))),
             Type::List(t) => CType::List(Box::new(self.ctype(&t))),
-            Type::Named(n) => CType::Named(n),
-            Type::Error(n) => CType::ErrorTy(n),
+            Type::Named(n) => CType::Struct(n),
+            Type::Enum(n) => CType::Enum(n),
             Type::Service(n) => CType::Service(n),
             Type::Tag(n) => CType::Tag(n),
             Type::MutMap(k, v) => {
@@ -796,17 +886,7 @@ impl<'a> Checker<'a> {
             ExprKind::Match { scrutinee, arms } => self.check_match(scrutinee, arms),
             ExprKind::Fail { error } => {
                 let ty = self.check_expr(error);
-                match self.ctx.resolve(&ty) {
-                    Type::Error(name) => self.add_error_row(&name),
-                    Type::Unknown | Type::Var(_) => {}
-                    other => {
-                        let rendered = self.render(&other);
-                        self.error(
-                            error.span,
-                            format!("`fail` needs an error value, found {rendered}"),
-                        );
-                    }
-                }
+                self.add_fail_row(&ty, error.span, "fail");
                 // `fail` never produces a value; it unifies with anything.
                 self.ctx.fresh()
             }
@@ -892,22 +972,33 @@ impl<'a> Checker<'a> {
                 caps: BTreeSet::new(),
             }));
         }
-        if let Some(info) = self.errors_decl.get(name) {
-            let def_span = info.name_span;
-            let func = Type::Func(Rc::new(FuncType {
-                params: info.fields.iter().map(|(_, t)| t.clone()).collect(),
-                ret: Type::Error(name.to_string()),
+        if let Some(owner) = self.variant_owner.get(name).cloned() {
+            // Enum variants: fieldless ones are values, the rest construct.
+            let fields = self.variant_fields(&owner, name);
+            if self.record_info {
+                if let Some(info) = self.enums.get(&owner) {
+                    self.info.refs.push((span, info.name_span));
+                }
+            }
+            if fields.is_empty() {
+                return Type::Enum(owner);
+            }
+            return Type::Func(Rc::new(FuncType {
+                params: fields.iter().map(|(_, t)| t.clone()).collect(),
+                ret: Type::Enum(owner),
                 errors: BTreeSet::new(),
                 caps: BTreeSet::new(),
             }));
-            if self.record_info {
-                self.info.refs.push((span, def_span));
-            }
-            return func;
         }
-        if let Some(info) = self.types_decl.get(name) {
-            // A bare type name is a type tag (`decode(raw, User)`); calling it
-            // constructs a value — `check_call` handles that case directly.
+        if let Some(info) = self.structs.get(name) {
+            // A bare struct name is a type tag (`decode(raw, User)`); calling
+            // it constructs a value — `check_call` handles that case directly.
+            if self.record_info {
+                self.info.refs.push((span, info.name_span));
+            }
+            return Type::Tag(name.to_string());
+        }
+        if let Some(info) = self.enums.get(name) {
             if self.record_info {
                 self.info.refs.push((span, info.name_span));
             }
@@ -981,22 +1072,22 @@ impl<'a> Checker<'a> {
                 if let Some(ty) = self.check_builtin_call(name, callee.span, args, span) {
                     return ty;
                 }
-                // Error / type constructors.
-                if let Some(fields) =
-                    self.errors_decl.get(name).map(|i| i.fields.clone())
-                {
+                // Struct / enum-variant constructors.
+                if let Some(fields) = self.structs.get(name).map(|i| i.fields.clone()) {
                     if self.record_info {
-                        let def_span = self.errors_decl[name].name_span;
-                        self.info.refs.push((callee.span, def_span));
-                    }
-                    return self.check_ctor(name, &fields, args, span, Type::Error(name.clone()));
-                }
-                if let Some(fields) = self.types_decl.get(name).map(|i| i.fields.clone()) {
-                    if self.record_info {
-                        let def_span = self.types_decl[name].name_span;
+                        let def_span = self.structs[name].name_span;
                         self.info.refs.push((callee.span, def_span));
                     }
                     return self.check_ctor(name, &fields, args, span, Type::Named(name.clone()));
+                }
+                if let Some(owner) = self.variant_owner.get(name).cloned() {
+                    let fields = self.variant_fields(&owner, name);
+                    if self.record_info {
+                        if let Some(info) = self.enums.get(&owner) {
+                            self.info.refs.push((callee.span, info.name_span));
+                        }
+                    }
+                    return self.check_ctor(name, &fields, args, span, Type::Enum(owner));
                 }
             }
         }
@@ -1061,6 +1152,14 @@ impl<'a> Checker<'a> {
 
     fn scope_has(&self, name: &str) -> bool {
         self.scopes.iter().any(|s| s.contains_key(name))
+    }
+
+    fn variant_fields(&self, enum_name: &str, variant: &str) -> Vec<(String, Type)> {
+        self.enums
+            .get(enum_name)
+            .and_then(|e| e.variants.iter().find(|(n, _)| n == variant))
+            .map(|(_, fields)| fields.clone())
+            .unwrap_or_default()
     }
 
     fn check_ctor(
@@ -1242,13 +1341,15 @@ impl<'a> Checker<'a> {
                 self.add_error_row(DECODE_ERROR);
                 let tag_ty = self.check_expr(args[1]);
                 match self.ctx.resolve(&tag_ty) {
-                    Type::Tag(type_name) => Type::Named(type_name),
+                    Type::Tag(type_name) if self.structs.contains_key(&type_name) => {
+                        Type::Named(type_name)
+                    }
                     Type::Unknown => Type::Unknown,
                     other => {
                         let rendered = self.render(&other);
                         self.error(
                             args[1].span,
-                            format!("`decode` needs a type name (like `User`), found {rendered}"),
+                            format!("`decode` needs a struct name (like `User`), found {rendered}"),
                         );
                         Type::Unknown
                     }
@@ -1305,17 +1406,7 @@ impl<'a> Checker<'a> {
                 let opt = Type::Option(Box::new(a.clone()));
                 self.unify_at(&opt, &opt_ty, args[0].span, "orFail input");
                 let err_ty = self.check_expr(args[1]);
-                match self.ctx.resolve(&err_ty) {
-                    Type::Error(err_name) => self.add_error_row(&err_name),
-                    Type::Unknown | Type::Var(_) => {}
-                    other => {
-                        let rendered = self.render(&other);
-                        self.error(
-                            args[1].span,
-                            format!("`orFail` needs an error value, found {rendered}"),
-                        );
-                    }
-                }
+                self.add_fail_row(&err_ty, args[1].span, "orFail");
                 a
             }
             "retry" => {
@@ -1560,24 +1651,14 @@ impl<'a> Checker<'a> {
         }
 
         match resolved {
-            Type::Named(type_name) => {
-                self.struct_field_type(&self.types_decl, &type_name, name, name_span)
-            }
-            Type::Error(err_name) => {
-                self.struct_field_type(&self.errors_decl, &err_name, name, name_span)
-            }
+            Type::Named(type_name) => self.struct_field_type(&type_name, name, name_span),
             Type::Var(_) => {
-                // Try unique-field inference: if exactly one type/error has
-                // this field, the receiver must be it.
+                // Try unique-field inference: if exactly one struct has this
+                // field, the receiver must be it.
                 let mut owners: Vec<(Type, Type)> = Vec::new();
-                for (tname, info) in &self.types_decl {
+                for (tname, info) in &self.structs {
                     if let Some((_, fty)) = info.fields.iter().find(|(f, _)| f == name) {
                         owners.push((Type::Named(tname.clone()), fty.clone()));
-                    }
-                }
-                for (ename, info) in &self.errors_decl {
-                    if let Some((_, fty)) = info.fields.iter().find(|(f, _)| f == name) {
-                        owners.push((Type::Error(ename.clone()), fty.clone()));
                     }
                 }
                 if owners.len() == 1 {
@@ -1606,14 +1687,9 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn struct_field_type(
-        &self,
-        table: &HashMap<String, StructInfo>,
-        type_name: &str,
-        field: &str,
-        _name_span: Span,
-    ) -> Type {
-        match table
+    fn struct_field_type(&self, type_name: &str, field: &str, _name_span: Span) -> Type {
+        match self
+            .structs
             .get(type_name)
             .and_then(|i| i.fields.iter().find(|(f, _)| f == field))
         {
@@ -1640,25 +1716,85 @@ impl<'a> Checker<'a> {
             PipeTarget::Catch { arms, span: catch_span } => {
                 let (lhs_ty, mut rows) = self.with_rows(|s| s.check_expr(lhs));
                 let result_ty = lhs_ty;
+                // Variant arms only clear an enum's tag once every variant is
+                // covered; partially-caught enums stay in the row.
+                let mut covered: HashMap<String, BTreeSet<String>> = HashMap::new();
                 for arm in arms {
                     self.scopes.push(HashMap::new());
                     match &arm.pattern.kind {
                         PatternKind::Ctor { name, name_span, args } => {
-                            if !self.errors_decl.contains_key(name) {
+                            if self.structs.contains_key(name) {
+                                if !rows.errors.remove(name) {
+                                    self.warn_unreachable_arm(*name_span, name);
+                                }
+                                let fields = self.structs[name].fields.clone();
+                                self.bind_ctor_pattern(name, &fields, args, arm.pattern.span);
+                            } else if let Some(owner) = self.variant_owner.get(name).cloned() {
+                                let known = covered.contains_key(&owner);
+                                if !known && !rows.errors.contains(&owner) {
+                                    self.warn_unreachable_arm(*name_span, &owner);
+                                }
+                                let set = covered.entry(owner.clone()).or_default();
+                                set.insert(name.clone());
+                                let all = self.enums[&owner].variants.len();
+                                if set.len() == all {
+                                    rows.errors.remove(&owner);
+                                }
+                                let fields = self.variant_fields(&owner, name);
+                                self.bind_ctor_pattern(name, &fields, args, arm.pattern.span);
+                            } else if self.enums.contains_key(name) {
+                                if !rows.errors.remove(name) {
+                                    self.warn_unreachable_arm(*name_span, name);
+                                }
+                                self.bind_ctor_pattern(name, &[], args, arm.pattern.span);
+                            } else {
                                 self.error(
                                     *name_span,
-                                    format!("unknown error type `{name}` in `catch`"),
+                                    format!("unknown type `{name}` in `catch`"),
                                 );
-                            } else {
-                                if !rows.errors.remove(name) {
-                                    self.warn(
-                                        *name_span,
-                                        format!(
-                                            "this `catch` arm is unreachable: the expression cannot fail with `{name}`"
-                                        ),
+                            }
+                        }
+                        PatternKind::TypedBind { ty, ty_span, name: bind_name } => {
+                            match self.tag_type(ty) {
+                                Some(bound) => {
+                                    if !rows.errors.remove(ty) {
+                                        self.warn_unreachable_arm(*ty_span, ty);
+                                    }
+                                    if self.record_info {
+                                        let rendered = self.render(&bound);
+                                        self.info.hovers.push((
+                                            arm.pattern.span,
+                                            format!("{bind_name} : {rendered}"),
+                                        ));
+                                    }
+                                    self.scopes
+                                        .last_mut()
+                                        .unwrap()
+                                        .insert(bind_name.clone(), bound);
+                                }
+                                None => {
+                                    self.error(
+                                        *ty_span,
+                                        format!("unknown type `{ty}` in `catch`"),
                                     );
                                 }
-                                self.bind_error_pattern(name, args, arm.pattern.span);
+                            }
+                        }
+                        // Literal arms match one failed value; they never
+                        // clear a tag from the row.
+                        PatternKind::Int(_) => {
+                            if !rows.errors.contains("Int") {
+                                self.warn_unreachable_arm(arm.pattern.span, "Int");
+                            }
+                        }
+                        PatternKind::Str(_) => {
+                            if !rows.errors.contains("String") {
+                                self.warn_unreachable_arm(arm.pattern.span, "String");
+                            }
+                        }
+                        PatternKind::Bool(_) => {
+                            if !rows.errors.contains("Bool") {
+                                self.warn_unreachable_arm(arm.pattern.span, "Bool");
                             }
                         }
                         PatternKind::Bind(bind_name) => {
@@ -1670,12 +1806,6 @@ impl<'a> Checker<'a> {
                         }
                         PatternKind::Wildcard => {
                             rows.errors.clear();
-                        }
-                        _ => {
-                            self.error(
-                                arm.pattern.span,
-                                "`catch` patterns match errors: use `ErrorName`, `ErrorName(e)`, a name, or `_`",
-                            );
                         }
                     }
                     let arm_ty = self.check_expr(&arm.body);
@@ -1689,31 +1819,31 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn bind_error_pattern(&mut self, err_name: &str, args: &CtorPatArgs, span: Span) {
-        let fields = self.errors_decl[err_name].fields.clone();
+    fn warn_unreachable_arm(&mut self, span: Span, tag: &str) {
+        self.warn(
+            span,
+            format!("this `catch` arm is unreachable: the expression cannot fail with `{tag}`"),
+        );
+    }
+
+    /// Bind a constructor pattern's names: positional patterns destructure
+    /// the fields in order, `{ a, b }` binds the named fields. (To bind the
+    /// whole value use a typed-bind pattern: `DbError e`.)
+    fn bind_ctor_pattern(
+        &mut self,
+        display: &str,
+        fields: &[(String, Type)],
+        args: &CtorPatArgs,
+        span: Span,
+    ) {
         match args {
             CtorPatArgs::None => {}
             CtorPatArgs::Positional(pats) => {
-                if pats.len() == 1 {
-                    // Single pattern binds the whole error value.
-                    if let PatternKind::Bind(name) = &pats[0].kind {
-                        self.scopes
-                            .last_mut()
-                            .unwrap()
-                            .insert(name.clone(), Type::Error(err_name.to_string()));
-                        if self.record_info {
-                            self.info
-                                .hovers
-                                .push((pats[0].span, format!("{name} : {err_name}")));
-                        }
-                        return;
-                    }
-                }
                 if pats.len() != fields.len() {
                     self.error(
                         span,
                         format!(
-                            "`{err_name}` has {} field(s) but the pattern has {}",
+                            "`{display}` has {} field(s) but the pattern has {}",
                             fields.len(),
                             pats.len()
                         ),
@@ -1732,7 +1862,7 @@ impl<'a> Checker<'a> {
                         None => {
                             self.error(
                                 *fspan,
-                                format!("`{err_name}` has no field `{fname}`"),
+                                format!("`{display}` has no field `{fname}`"),
                             );
                         }
                     }
@@ -1802,52 +1932,36 @@ impl<'a> Checker<'a> {
                         self.error(pat.span, "`None` takes no arguments");
                     }
                 }
-                _ if self.errors_decl.contains_key(name) => {
-                    self.unify_at(&Type::Error(name.clone()), scrut_ty, pat.span, "pattern");
-                    self.bind_error_pattern(name, args, pat.span);
-                }
-                _ if self.types_decl.contains_key(name) => {
+                _ if self.structs.contains_key(name) => {
                     self.unify_at(&Type::Named(name.clone()), scrut_ty, pat.span, "pattern");
-                    let fields = self.types_decl[name].fields.clone();
-                    match args {
-                        CtorPatArgs::None => {}
-                        CtorPatArgs::Positional(pats) => {
-                            if pats.len() != fields.len() {
-                                self.error(
-                                    pat.span,
-                                    format!(
-                                        "`{name}` has {} field(s) but the pattern has {}",
-                                        fields.len(),
-                                        pats.len()
-                                    ),
-                                );
-                            }
-                            for (p, (_, fty)) in pats.iter().zip(fields.iter()) {
-                                self.check_pattern_against(p, fty);
-                            }
-                        }
-                        CtorPatArgs::Fields(names) => {
-                            for (fname, fspan) in names {
-                                match fields.iter().find(|(f, _)| f == fname) {
-                                    Some((_, fty)) => {
-                                        self.scopes
-                                            .last_mut()
-                                            .unwrap()
-                                            .insert(fname.clone(), fty.clone());
-                                    }
-                                    None => {
-                                        self.error(
-                                            *fspan,
-                                            format!("`{name}` has no field `{fname}`"),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let fields = self.structs[name].fields.clone();
+                    self.bind_ctor_pattern(name, &fields, args, pat.span);
+                }
+                _ if self.variant_owner.contains_key(name) => {
+                    let owner = self.variant_owner[name].clone();
+                    self.unify_at(&Type::Enum(owner.clone()), scrut_ty, pat.span, "pattern");
+                    let fields = self.variant_fields(&owner, name);
+                    self.bind_ctor_pattern(name, &fields, args, pat.span);
+                }
+                _ if self.enums.contains_key(name) => {
+                    self.unify_at(&Type::Enum(name.clone()), scrut_ty, pat.span, "pattern");
+                    self.bind_ctor_pattern(name, &[], args, pat.span);
                 }
                 _ => {
                     self.error(*name_span, format!("unknown constructor `{name}` in pattern"));
+                }
+            },
+            PatternKind::TypedBind { ty, ty_span, name } => match self.tag_type(ty) {
+                Some(bound) => {
+                    self.unify_at(&bound, scrut_ty, pat.span, "pattern");
+                    if self.record_info {
+                        let rendered = self.render(&bound);
+                        self.info.hovers.push((pat.span, format!("{name} : {rendered}")));
+                    }
+                    self.scopes.last_mut().unwrap().insert(name.clone(), bound);
+                }
+                None => {
+                    self.error(*ty_span, format!("unknown type `{ty}` in pattern"));
                 }
             },
         }
@@ -1991,24 +2105,24 @@ impl<'a> Checker<'a> {
         }
         for decl in &self.program.decls {
             let def = match decl {
-                Decl::Error(d) => DefInfo {
+                Decl::Struct(d) => DefInfo {
                     name: d.name.clone(),
                     span: d.name_span,
-                    kind: DefKind::Error,
+                    kind: DefKind::Struct,
                     detail: format!(
-                        "error {} = {{ {} }}",
+                        "struct {} = {{ {} }}",
                         d.name,
                         d.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>().join(", ")
                     ),
                 },
-                Decl::Type(d) => DefInfo {
+                Decl::Enum(d) => DefInfo {
                     name: d.name.clone(),
                     span: d.name_span,
-                    kind: DefKind::Type,
+                    kind: DefKind::Enum,
                     detail: format!(
-                        "type {} = {{ {} }}",
+                        "enum {} = {}",
                         d.name,
-                        d.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>().join(", ")
+                        d.variants.iter().map(|v| v.name.clone()).collect::<Vec<_>>().join(" | ")
                     ),
                 },
                 Decl::Service(d) => DefInfo {
@@ -2031,13 +2145,13 @@ impl<'a> Checker<'a> {
                 },
             };
             self.info.defs.push(def);
-            // Hover for error/type/service declarations themselves.
+            // Hover for struct/enum declarations themselves.
             match decl {
-                Decl::Error(d) => {
+                Decl::Struct(d) => {
                     let detail = self.info.defs.last().unwrap().detail.clone();
                     self.info.hovers.push((d.name_span, detail));
                 }
-                Decl::Type(d) => {
+                Decl::Enum(d) => {
                     let detail = self.info.defs.last().unwrap().detail.clone();
                     self.info.hovers.push((d.name_span, detail));
                 }

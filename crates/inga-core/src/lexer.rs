@@ -110,6 +110,7 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
                 TokenKind::OrOr
             }
+            b'|' => TokenKind::Bar,
             b'&' if self.peek() == b'&' => {
                 self.pos += 1;
                 TokenKind::AndAnd

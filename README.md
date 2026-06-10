@@ -3,12 +3,14 @@
 **Typed errors. Inferred dependencies. Direct style.**
 Inga is what Effect.ts would look like as its own language, with Koka's
 direct style: you write ordinary code, and the compiler infers — and
-enforces — what can fail (`!` row) and what it needs (`uses` row).
+enforces — what can fail (`!` row) and what it needs (`uses` row). Data is
+structs and enums; `fail` raises *any* value, and the `!` row names the
+types of the values a function can fail with.
 
 ```inga
-error UserNotFound = { Int id }
-error DbError      = { String cause }
-error CacheMiss    = { String key }
+struct UserNotFound = { Int id }
+struct DbError      = { String cause }
+struct CacheMiss    = { String key }
 
 // Fully annotated — but every annotation here is optional and inferred:
 getUserById :: (Int id) -> User ! UserNotFound uses Database, Cache, Logger {
@@ -27,8 +29,8 @@ fetchAndCache :: (id) {
         |> retry(Schedule.exponential(100.millis) |> upTo(3))
         |> orFail(UserNotFound(id))
         |> catch {
-            DbError(e) -> {
-                logger.warn("db down after retries: ${e.cause}")
+            DbError(cause) -> {
+                logger.warn("db down after retries: ${cause}")
                 fail UserNotFound(id)
             }
         }
@@ -129,7 +131,7 @@ crates/inga-lsp       language server (lsp-server / lsp-types)
 editors/vscode        VS Code extension + TextMate grammar
 editors/zed           Zed extension (tree-sitter highlighting + LSP)
 tree-sitter-inga      tree-sitter grammar (used by the Zed extension)
-examples/             hello.inga, retry.inga, user_service.inga
+examples/             hello.inga, retry.inga, shapes.inga, user_service.inga
 games/                balatro.inga — a Balatro-style deckbuilder on the Gfx module
 bench/                the same workloads in Inga, JavaScript, and Rust (see bench/README.md)
 docs/SPEC.md          language design: semantics, effect rows, execution strategy

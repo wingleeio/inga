@@ -115,13 +115,13 @@ impl Printer {
         let mut i = 0;
         let decls = &program.decls;
         while i < decls.len() {
-            // Align a run of consecutive `error` declarations.
-            if let Decl::Error(_) = decls[i] {
+            // Align a run of consecutive `struct` declarations.
+            if let Decl::Struct(_) = decls[i] {
                 let mut j = i;
                 let mut width = 0;
                 while j < decls.len() {
                     match &decls[j] {
-                        Decl::Error(d) if self.contiguous(i, j, decls) => {
+                        Decl::Struct(d) if self.contiguous(i, j, decls) => {
                             width = width.max(d.name.len());
                             j += 1;
                         }
@@ -129,16 +129,16 @@ impl Printer {
                     }
                 }
                 for d in &decls[i..j] {
-                    if let Decl::Error(d) = d {
-                        self.print_struct_decl(d, "error", width);
+                    if let Decl::Struct(d) = d {
+                        self.print_struct_decl(d, width);
                     }
                 }
                 i = j;
                 continue;
             }
             match &decls[i] {
-                Decl::Error(_) => unreachable!(),
-                Decl::Type(d) => self.print_struct_decl(d, "type", d.name.len()),
+                Decl::Struct(_) => unreachable!(),
+                Decl::Enum(d) => self.print_enum_decl(d),
                 Decl::Service(d) => self.print_service(d),
                 Decl::Impl(d) => self.print_impl(d),
                 Decl::Func(d) => self.print_func(d, 0),
@@ -155,35 +155,62 @@ impl Printer {
         }
     }
 
-    /// True when decls i..=j form a run with no comments between them
-    /// (blank lines do not break alignment, matching the napkin style).
+    /// True when decls i..=j form a run with no comments or blank lines
+    /// between them — only such runs get their `=` aligned.
     fn contiguous(&self, i: usize, j: usize, decls: &[Decl]) -> bool {
         if i == j {
             return true;
         }
         let prev_end = decl_span(&decls[j - 1]).end;
         let start = decl_span(&decls[j]).start;
+        if self.lines.line(start) > self.lines.line(prev_end) + 1 {
+            return false;
+        }
         !self.comments.iter().any(|(s, _)| s.start >= prev_end && s.start < start)
     }
 
-    fn print_struct_decl(&mut self, d: &StructDecl, keyword: &str, name_width: usize) {
+    fn print_struct_decl(&mut self, d: &StructDecl, name_width: usize) {
         self.flush_comments_before(d.span.start, 0);
         self.blank_line_if_gap(self.lines.line(d.span.start));
-        let fields: Vec<String> = d
-            .fields
+        let body = render_field_block(&d.fields);
+        let padded = format!("{:<width$}", d.name, width = name_width);
+        self.out.push_str(&format!("struct {padded} = {body}"));
+        self.attach_trailing_comment(d.span.end);
+        self.out.push('\n');
+        self.prev_end_line = Some(self.lines.line(d.span.end));
+    }
+
+    fn print_enum_decl(&mut self, d: &EnumDecl) {
+        self.flush_comments_before(d.span.start, 0);
+        self.blank_line_if_gap(self.lines.line(d.span.start));
+        let variants: Vec<String> = d
+            .variants
             .iter()
-            .map(|f| match &f.ty {
-                Some(ty) => format!("{} {}", render_type(ty), f.name),
-                None => f.name.clone(),
+            .map(|v| {
+                if v.fields.is_empty() {
+                    v.name.clone()
+                } else {
+                    format!("{} {}", v.name, render_field_block(&v.fields))
+                }
             })
             .collect();
-        let body = if fields.is_empty() {
-            "{}".to_string()
+        let inline = format!("enum {} = {}", d.name, variants.join(" | "));
+        if inline.len() <= MAX_WIDTH {
+            self.out.push_str(&inline);
         } else {
-            format!("{{ {} }}", fields.join(", "))
-        };
-        let padded = format!("{:<width$}", d.name, width = name_width);
-        self.out.push_str(&format!("{keyword} {padded} = {body}"));
+            // One variant per line, `|` leading.
+            self.out.push_str(&format!("enum {} =\n", d.name));
+            for (i, v) in variants.iter().enumerate() {
+                self.push_indent(1);
+                if i > 0 {
+                    self.out.push_str("| ");
+                }
+                self.out.push_str(v);
+                if i + 1 < variants.len() {
+                    self.out.push('\n');
+                }
+            }
+        }
         self.attach_trailing_comment(d.span.end);
         self.out.push('\n');
         self.prev_end_line = Some(self.lines.line(d.span.end));
@@ -530,11 +557,26 @@ impl Printer {
 
 fn decl_span(decl: &Decl) -> Span {
     match decl {
-        Decl::Error(d) | Decl::Type(d) => d.span,
+        Decl::Struct(d) => d.span,
+        Decl::Enum(d) => d.span,
         Decl::Service(d) => d.span,
         Decl::Impl(d) => d.span,
         Decl::Func(d) => d.span,
     }
+}
+
+fn render_field_block(fields: &[Field]) -> String {
+    if fields.is_empty() {
+        return "{}".to_string();
+    }
+    let rendered: Vec<String> = fields
+        .iter()
+        .map(|f| match &f.ty {
+            Some(ty) => format!("{} {}", render_type(ty), f.name),
+            None => f.name.clone(),
+        })
+        .collect();
+    format!("{{ {} }}", rendered.join(", "))
 }
 
 fn stmt_span(stmt: &Stmt) -> Span {
@@ -590,6 +632,7 @@ fn render_pattern(pat: &Pattern) -> String {
         PatternKind::Int(n) => n.to_string(),
         PatternKind::Str(s) => format!("{s:?}"),
         PatternKind::Bool(b) => b.to_string(),
+        PatternKind::TypedBind { ty, name, .. } => format!("{ty} {name}"),
         PatternKind::Ctor { name, args, .. } => match args {
             CtorPatArgs::None => name.clone(),
             CtorPatArgs::Positional(pats) => {

@@ -1,0 +1,63 @@
+// Enums and fail-with-any-value: the `!` row tracks the *types* of failed
+// values — structs, enum variants, or plain primitives.
+// Run with: inga run examples/shapes.inga
+
+enum Shape = Circle { Float radius } | Rect { Float w, Float h } | Dot
+
+struct TooBig = { Float area }
+
+area :: (Shape s) -> Float {
+    match s {
+        Circle(r)  -> 3.14159 * r * r
+        Rect(w, h) -> w * h
+        Dot        -> 0.0
+    }
+}
+
+// Inferred as `checked :: (Shape s) -> Float ! String, TooBig`:
+// `fail` takes any value, and the row names the failed values' types.
+checked :: (Shape s) -> Float ! String, TooBig {
+    a = area(s)
+    if a == 0.0 {
+        fail "a dot has no area"
+    }
+    if a > 100.0 {
+        fail TooBig(a)
+    }
+    a
+}
+
+// `String reason` is a typed-bind pattern (type-before-name, like
+// parameters); `TooBig(a)` destructures the struct positionally.
+describe :: (Shape s) -> String {
+    "area ${checked(s)}"
+        |> catch {
+            String reason -> "rejected: ${reason}"
+            TooBig(a)     -> "too big at ${a}"
+        }
+}
+
+main :: () {
+    println(describe(Circle(2.0)))
+    println(describe(Dot))
+    println(describe(Rect(20.0, 30.0)))
+
+    // Enums pattern-match in `catch` too; covering every variant clears
+    // the enum from the row.
+    pick = (Int n) -> {
+        if n == 0 {
+            fail Dot
+        }
+        if n > 9000 {
+            fail Rect(1.0, 2.0)
+        }
+        n
+    }
+    pick(9001)
+        |> catch {
+            Circle(r)  -> 0
+            Rect(w, h) -> 1
+            Dot        -> 2
+        }
+        |> println
+}

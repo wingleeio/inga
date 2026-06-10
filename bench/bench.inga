@@ -4,7 +4,7 @@
 // All workloads are fib-shaped tree recursion so call counts are large while
 // recursion depth stays small. Run with: inga run bench/bench.inga
 
-error Boom = { Int n }
+struct Boom = { Int n }
 
 service Adder {
     add :: (Int a, Int b) -> Int
@@ -68,7 +68,7 @@ boom :: (Int n) -> Int ! Boom {
 
 fibErrors :: (Int n) -> Int {
     if n < 2 {
-        boom(n) |> catch { Boom(e) -> e.n }
+        boom(n) |> catch { Boom(k) -> k }
     } else {
         fibErrors(n - 1) + fibErrors(n - 2)
     }

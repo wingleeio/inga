@@ -146,13 +146,13 @@ impl<'a> Parser<'a> {
 
     fn parse_decl(&mut self) -> Option<Decl> {
         match self.peek().kind.clone() {
-            TokenKind::KwError => {
+            TokenKind::KwStruct => {
                 self.bump();
-                Some(Decl::Error(self.parse_struct_decl()))
+                Some(Decl::Struct(self.parse_struct_decl()))
             }
-            TokenKind::KwType => {
+            TokenKind::KwEnum => {
                 self.bump();
-                Some(Decl::Type(self.parse_struct_decl()))
+                Some(Decl::Enum(self.parse_enum_decl()))
             }
             TokenKind::KwService => {
                 self.bump();
@@ -175,7 +175,7 @@ impl<'a> Parser<'a> {
             _ => {
                 let found = self.peek().kind.describe();
                 self.error_here(format!(
-                    "expected a declaration (`error`, `type`, `service`, or `name :: ...`), found {found}"
+                    "expected a declaration (`struct`, `enum`, `service`, or `name :: ...`), found {found}"
                 ));
                 // Synchronize to the next line.
                 while !matches!(self.peek().kind, TokenKind::Newline | TokenKind::Eof) {
@@ -186,7 +186,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// After `error` / `type`: `Name = { fields }`
+    /// After `struct`: `Name = { fields }`
     fn parse_struct_decl(&mut self) -> StructDecl {
         let start = self.prev_span();
         let (name, name_span) = self.expect_ident("a type name");
@@ -199,24 +199,84 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::Eq, "`=`");
         let mut fields = Vec::new();
         if self.expect(&TokenKind::LBrace, "`{`") {
-            loop {
-                self.skip_newlines();
-                if self.at(&TokenKind::RBrace) || self.at(&TokenKind::Eof) {
-                    break;
-                }
-                if let Some(field) = self.parse_field() {
-                    fields.push(field);
-                } else {
-                    break;
-                }
-                self.skip_newlines();
-                if self.at(&TokenKind::Comma) {
-                    self.bump();
-                }
-            }
-            self.expect(&TokenKind::RBrace, "`}`");
+            fields = self.parse_field_list();
         }
         StructDecl { name, name_span, fields, span: start.to(self.prev_span()) }
+    }
+
+    /// Fields inside an already-opened `{ ... }`; consumes the closing brace.
+    fn parse_field_list(&mut self) -> Vec<Field> {
+        let mut fields = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at(&TokenKind::RBrace) || self.at(&TokenKind::Eof) {
+                break;
+            }
+            if let Some(field) = self.parse_field() {
+                fields.push(field);
+            } else {
+                break;
+            }
+            self.skip_newlines();
+            if self.at(&TokenKind::Comma) {
+                self.bump();
+            }
+        }
+        self.expect(&TokenKind::RBrace, "`}`");
+        fields
+    }
+
+    /// After `enum`: `Name = Variant | Variant { fields } | ...`
+    /// A newline before `|` continues the variant list.
+    fn parse_enum_decl(&mut self) -> EnumDecl {
+        let start = self.prev_span();
+        let (name, name_span) = self.expect_ident("a type name");
+        if !is_upper(&name) && name != "<error>" {
+            self.diagnostics.push(Diagnostic::error(
+                name_span,
+                format!("type names start with an uppercase letter: `{name}`"),
+            ));
+        }
+        self.expect(&TokenKind::Eq, "`=`");
+        self.skip_newlines();
+        let mut variants = Vec::new();
+        loop {
+            let v_start = self.peek().span;
+            let (v_name, v_span) = self.expect_ident("a variant name");
+            if v_name == "<error>" {
+                break;
+            }
+            if !is_upper(&v_name) {
+                self.diagnostics.push(Diagnostic::error(
+                    v_span,
+                    format!("variant names start with an uppercase letter: `{v_name}`"),
+                ));
+            }
+            let mut fields = Vec::new();
+            if self.at(&TokenKind::LBrace) {
+                self.bump();
+                fields = self.parse_field_list();
+            }
+            variants.push(Variant {
+                name: v_name,
+                name_span: v_span,
+                fields,
+                span: v_start.to(self.prev_span()),
+            });
+            if self.at(&TokenKind::Bar) || self.continue_past_newlines(|k| *k == TokenKind::Bar) {
+                self.bump();
+                self.skip_newlines();
+            } else {
+                break;
+            }
+        }
+        if variants.is_empty() {
+            self.diagnostics.push(Diagnostic::error(
+                name_span,
+                format!("enum `{name}` needs at least one variant"),
+            ));
+        }
+        EnumDecl { name, name_span, variants, span: start.to(self.prev_span()) }
     }
 
     /// `String id` or `id` — type is optional.
@@ -1013,6 +1073,16 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(name) => {
                 self.bump();
                 let name_span = start;
+                // `String msg` / `Shape s` — a type name binding the value.
+                if let TokenKind::Ident(bind) = self.peek().kind.clone() {
+                    if !is_upper(&bind) && bind != "_" {
+                        self.bump();
+                        return Pattern {
+                            kind: PatternKind::TypedBind { ty: name, ty_span: name_span, name: bind },
+                            span: start.to(self.prev_span()),
+                        };
+                    }
+                }
                 let args = if self.at(&TokenKind::LParen) {
                     self.bump();
                     self.skip_newlines();

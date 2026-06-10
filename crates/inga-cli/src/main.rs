@@ -454,8 +454,8 @@ fn emit_string(src: &str, text: &str, start: usize, parts: &[StrPart], out: &mut
 fn is_keyword(kind: &TokenKind) -> bool {
     matches!(
         kind,
-        TokenKind::KwError
-            | TokenKind::KwType
+        TokenKind::KwStruct
+            | TokenKind::KwEnum
             | TokenKind::KwService
             | TokenKind::KwMatch
             | TokenKind::KwCatch

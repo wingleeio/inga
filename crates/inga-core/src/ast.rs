@@ -11,10 +11,10 @@ pub struct Program {
 
 #[derive(Debug)]
 pub enum Decl {
-    /// `error UserNotFound = { id }`
-    Error(StructDecl),
-    /// `type User = { Int id, String name }`
-    Type(StructDecl),
+    /// `struct User = { Int id, String name }`
+    Struct(StructDecl),
+    /// `enum Shape = Circle { Float radius } | Rect { Float w, Float h } | Dot`
+    Enum(EnumDecl),
     /// `service Logger { info :: (String msg) ... }`
     Service(ServiceDecl),
     /// `consoleLogger :: Logger { ... }`
@@ -25,6 +25,23 @@ pub enum Decl {
 
 #[derive(Debug)]
 pub struct StructDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub fields: Vec<Field>,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct EnumDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub variants: Vec<Variant>,
+    pub span: Span,
+}
+
+/// One enum variant: `Circle { Float radius }` or a bare `Dot`.
+#[derive(Debug)]
+pub struct Variant {
     pub name: String,
     pub name_span: Span,
     pub fields: Vec<Field>,
@@ -199,6 +216,9 @@ pub enum PatternKind {
     Bool(bool),
     /// `Some(x)`, `None`, `CacheMiss`, `DbError(e)`, `UserNotFound { id }`
     Ctor { name: String, name_span: Span, args: CtorPatArgs },
+    /// `String msg`, `Shape s` — matches a value by its type and binds it
+    /// (type-before-name, like parameters). Mainly for `catch` arms.
+    TypedBind { ty: String, ty_span: Span, name: String },
 }
 
 #[derive(Debug)]

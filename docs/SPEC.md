@@ -9,7 +9,7 @@ style instead of wrapper values. You write ordinary code; the compiler tracks
 what can fail and what it needs.
 
 ```inga
-error UserNotFound = { Int id }
+struct UserNotFound = { Int id }
 
 getUserById :: (Int id) -> User ! UserNotFound uses Database, Cache, Logger {
     match cached(id) {
@@ -24,12 +24,12 @@ Every function has three inferred facets beyond its value type:
 | Facet | Syntax | Effect.ts analogue |
 |---|---|---|
 | return type | `-> User` | `Effect<A, _, _>` success channel |
-| error row | `! UserNotFound, DbError` | `Effect<_, E, _>` error channel |
+| error row | `! UserNotFound, String` | `Effect<_, E, _>` error channel |
 | capability row | `uses Database, Cache` | `Effect<_, _, R>` requirements |
 
 All three are **inferred** and may be **annotated**; an annotation is a
 contract the compiler verifies (it is an error to fail with an undeclared
-error or use an undeclared capability). `main` must have *empty* rows: every
+type or use an undeclared capability). `main` must have *empty* rows: every
 error handled, every capability provided. That single rule is the whole
 safety story — a program that compiles cannot crash with an unhandled typed
 error or reach for a missing dependency.
@@ -56,8 +56,10 @@ expression to its left and *subtracts* the handled error names from the row.
 ## 2. Declarations
 
 ```inga
-error CacheMiss = { String key }            // an error type (fields optional, types optional)
-type  User      = { Int id, String name }   // a record type
+struct CacheMiss = { String key }            // a struct (fields optional, types optional)
+struct User      = { Int id, String name }
+enum   Shape     = Circle { Float radius }   // a sum type: variants separated by `|`,
+       | Rect { Float w, Float h } | Dot     //   each with optional struct-style fields
 service Cache {                              // a capability interface
     get :: (String key) -> String ! CacheMiss
     set :: (String key, String value, Duration ttl)
@@ -71,27 +73,38 @@ fetchAndCache :: (id) { ... }                // a function
 ```
 
 - Type-before-name everywhere: `(String id)` in parameters, `{ Int id }` in
-  fields, `Cache cache` for capability bindings. Omitted types are inferred.
+  fields, `Cache cache` for capability bindings, `String msg` in patterns.
+  Omitted types are inferred.
 - `Name?` is an option type, `[Name]` a list type.
 - Constructors are positional in field order: `User(42, "Wing")`,
-  `UserNotFound(id)`. A bare type name is a *type tag* for `decode(raw, User)`.
+  `Circle(2.0)`; a fieldless variant is a value (`Dot`). A bare struct name
+  is a *type tag* for `decode(raw, User)`.
 
 ## 3. Errors
 
-`fail UserNotFound(id)` raises; the error becomes part of the function's
-inferred `!` row. Handling is pattern-shaped:
+`fail` raises **any value** — a struct, an enum, or a primitive — and the
+*type* of the failed value joins the function's inferred `!` row:
+`fail UserNotFound(id)` adds `UserNotFound`; `fail "bad input"` adds
+`String`. Handling is pattern-shaped, matching the failed value itself:
 
 ```inga
 expr |> catch {
-    CacheMiss      -> None                       // by error name
-    DecodeError(e) -> { logger.warn(e.message); None }  // bind the whole error
-    UserNotFound { id } -> retryUser(id)         // destructure fields
-    other          -> fallback(other)            // catch-all (clears the row)
+    CacheMiss        -> None                     // by struct name
+    DecodeError e    -> { logger.warn(e.message); None } // typed-bind: binds the whole value
+    UserNotFound { id } -> retryUser(id)         // destructure named fields
+    DbError(cause)   -> retryLater(cause)        // destructure positionally
+    String reason    -> { logger.warn(reason); None }    // failed primitives, by type
+    404              -> None                     // literals match one value (row keeps `Int`)
+    other            -> fallback(other)          // catch-all (clears the row)
 }
 ```
 
-A `catch` arm for an error the expression cannot raise is an
-*unreachable-arm warning*. Helpers: `orFail(option, err)` unwraps or fails;
+An arm clears its type from the row when it matches *every* value of that
+type: struct arms and typed-bind arms subtract their tag; literal arms never
+subtract; enum **variant** arms subtract the enum only once all variants are
+covered — partially-caught enums stay in the row. A `catch` arm for a type
+the expression cannot fail with is an *unreachable-arm warning*. Helpers:
+`orFail(option, err)` unwraps or fails;
 `ignoreFailure(action)` swallows the error channel and returns `Unit`;
 `retry(action, schedule)` re-runs the action per a `Schedule`
 (`Schedule.exponential(100.millis) |> upTo(3)`, `Schedule.fixed(...)`).
@@ -127,8 +140,8 @@ provides real implementations.
   whole-program, monomorphic user functions in v0.1; builtins and
   constructors instantiate polymorphically. Primitives: `Int`, `Float`,
   `Bool`, `String`, `Unit`, `Duration`, `Schedule`; composites: `T?`, `[T]`,
-  records (`type`), errors, services, functions, `MutMap`.
-- **Effect rows**: finite sets of error/service *names*, computed as a
+  structs, enums, services, functions, `MutMap`.
+- **Effect rows**: finite sets of type/service *names*, computed as a
   monotone fixpoint over the call graph. `catch` and `provide` subtract;
   calls union. Service method rows are the union of all implementations'
   inferred rows plus the interface's declared `!` annotations (per-impl
@@ -160,9 +173,14 @@ away**:
 - **Values are native.** Every value is one `i64`; `Int`/`Bool`/`Duration`
   are raw machine integers — no boxing, no tags, because types are static.
 - **Errors are return values.** A function with a non-empty `!` row returns
-  `{ i64 value, i64 err }` in two registers (Rust's `Result` shape). `fail`
-  is a store + branch; `catch` compares an error type id. Functions with
-  empty rows pay nothing — the checker proved they can't fail.
+  `{ i64 value, i64 err }` in two registers (Rust's `Result` shape); `err`
+  points to the failed value boxed with its type tag. `fail` is an alloc +
+  branch; `catch` compares the tag. Functions with empty rows pay nothing —
+  the checker proved they can't fail.
+- **Structs are field tuples; enums are tagged boxes.** A struct is
+  `{ fields... }` with no header; an enum value is `{ variant_id, fields... }`
+  — or a raw variant id when every variant of the enum is fieldless, making
+  C-like enums free.
 - **Capabilities are evidence** (Koka's strategy). A `uses` row becomes
   hidden leading parameters, one instance pointer per service; `provide`
   allocates `{ method fn-ptrs..., fields... }`; `Cache cache` is just a
@@ -235,11 +253,12 @@ tests). See `games/balatro.inga` for a complete game.
 
 ```
 program   := decl*
-decl      := 'error' Upper '=' '{' field,* '}'
-           | 'type'  Upper '=' '{' field,* '}'
+decl      := 'struct' Upper '=' '{' field,* '}'
+           | 'enum' Upper '=' variant ('|' variant)*
            | 'service' Upper '{' (name '::' sig)* '}'
            | name '::' Upper '{' (name '=' expr | name '::' sig block)* '}'   -- impl
            | name '::' sig block                                              -- func
+variant   := Upper ('{' field,* '}')?
 sig       := '(' param,* ')' ('->' type)? ('!' Upper,+)? ('uses' Upper,+)?
 param     := 'lazy'? type? name
 type      := Upper | lower | '[' type ']' | type '?'
@@ -251,7 +270,8 @@ stmt      := Upper name                      -- capability bind
 expr      := pipe; pipe := or ('|>' (call | 'catch' arms))*
            | match | if | fail | provide | lambda | literals…
 arms      := '{' (pattern '->' expr)+ '}'
-pattern   := '_' | name | literal | Upper ('(' pattern,* ')' | '{' name,* '}')?
+pattern   := '_' | name | literal | Upper name              -- typed bind
+           | Upper ('(' pattern,* ')' | '{' name,* '}')?
 ```
 
 Statements end at newlines; expressions continue across a newline before

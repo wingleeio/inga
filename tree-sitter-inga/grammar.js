@@ -47,18 +47,30 @@ module.exports = grammar({
 
     _declaration: $ =>
       choice(
-        $.error_declaration,
-        $.type_declaration,
+        $.struct_declaration,
+        $.enum_declaration,
         $.service_declaration,
         $.function_declaration,
         $.implementation
       ),
 
-    error_declaration: $ =>
-      seq('error', field('name', $.type_identifier), '=', $.fields),
+    struct_declaration: $ =>
+      seq('struct', field('name', $.type_identifier), '=', $.fields),
 
-    type_declaration: $ =>
-      seq('type', field('name', $.type_identifier), '=', $.fields),
+    // `enum Shape = Circle { Float radius } | Rect { Float w, Float h } | Dot`
+    // A newline may precede each `|`, which works out because newlines are
+    // treated as whitespace.
+    enum_declaration: $ =>
+      seq(
+        'enum',
+        field('name', $.type_identifier),
+        '=',
+        $.enum_variant,
+        repeat(seq('|', $.enum_variant))
+      ),
+
+    enum_variant: $ =>
+      seq(field('name', $.type_identifier), optional($.fields)),
 
     fields: $ => seq('{', repeat(seq($.field, optional(','))), '}'),
 
@@ -184,6 +196,7 @@ module.exports = grammar({
 
     _pattern: $ =>
       choice(
+        $.typed_pattern,
         $.constructor_pattern,
         $.identifier,
         $.number,
@@ -191,6 +204,11 @@ module.exports = grammar({
         $.boolean,
         seq('-', $.number)
       ),
+
+    // `String reason -> ...` — a type name followed by a binder; matches a
+    // value of that type and binds it.
+    typed_pattern: $ =>
+      seq(field('type', $.type_identifier), field('name', $.identifier)),
 
     constructor_pattern: $ =>
       seq(

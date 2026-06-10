@@ -118,7 +118,7 @@ main :: () {
 #[test]
 fn fail_and_catch() {
     let out = run(r#"
-error Boom = { String why }
+struct Boom = { String why }
 
 risky :: (Bool go) {
     if go {
@@ -128,8 +128,8 @@ risky :: (Bool go) {
 }
 
 main :: () {
-    a = risky(false) |> catch { Boom(e) -> e.why }
-    b = risky(true) |> catch { Boom(e) -> e.why }
+    a = risky(false) |> catch { Boom(why) -> why }
+    b = risky(true) |> catch { Boom(why) -> why }
     println(a, b)
 }
 "#);
@@ -139,7 +139,7 @@ main :: () {
 #[test]
 fn uncaught_error_in_main_is_rejected() {
     let errors = check_errors(r#"
-error Boom = { String why }
+struct Boom = { String why }
 
 main :: () {
     fail Boom("x")
@@ -154,8 +154,8 @@ main :: () {
 #[test]
 fn declared_error_row_must_cover_inferred() {
     let errors = check_errors(r#"
-error A = { Int x }
-error B = { Int x }
+struct A = { Int x }
+struct B = { Int x }
 
 f :: (Bool go) -> Int ! A {
     if go {
@@ -177,8 +177,8 @@ main :: () {
 #[test]
 fn unreachable_catch_arm_warns() {
     let warnings = check_warnings(r#"
-error A = { Int x }
-error B = { Int x }
+struct A = { Int x }
+struct B = { Int x }
 
 f :: () {
     fail A(1)
@@ -197,7 +197,7 @@ main :: () {
 #[test]
 fn catch_all_with_binding() {
     let out = run(r#"
-error Boom = { Int code }
+struct Boom = { Int code }
 
 main :: () {
     n = { fail Boom(7) } |> catch { e -> e.code }
@@ -210,17 +210,154 @@ main :: () {
 #[test]
 fn or_fail_converts_none() {
     let out = run(r#"
-error Missing = { String key }
+struct Missing = { String key }
 
 lookup :: (String key) {
     None |> orFail(Missing(key))
 }
 
 main :: () {
-    println(lookup("a") |> catch { Missing(e) -> "missing ${e.key}" })
+    println(lookup("a") |> catch { Missing(key) -> "missing ${key}" })
 }
 "#);
     assert_eq!(out, "missing a\n");
+}
+
+#[test]
+fn fail_accepts_any_value() {
+    let out = run(r#"
+risky :: (Int n) -> Int ! String, Int {
+    if n == 0 {
+        fail "zero"
+    }
+    if n < 0 {
+        fail n
+    }
+    n
+}
+
+main :: () {
+    a = risky(5) |> catch { String s -> -1, Int m -> m }
+    b = risky(0) |> catch { String s -> -1, Int m -> m }
+    c = risky(-3) |> catch { String s -> -1, Int m -> m }
+    println(a, b, c)
+}
+"#);
+    assert_eq!(out, "5 -1 -3\n");
+}
+
+#[test]
+fn catch_literal_arms_match_by_value() {
+    let out = run(r#"
+risky :: (Int n) -> String ! Int {
+    if n > 0 {
+        fail n
+    }
+    "ok"
+}
+
+main :: () {
+    a = risky(404) |> catch { 404 -> "not found", Int m -> "code ${m}" }
+    b = risky(500) |> catch { 404 -> "not found", Int m -> "code ${m}" }
+    println(a)
+    println(b)
+}
+"#);
+    assert_eq!(out, "not found\ncode 500\n");
+}
+
+#[test]
+fn main_must_handle_primitive_failures() {
+    let errors = check_errors(r#"
+main :: () {
+    fail "boom"
+}
+"#);
+    assert!(
+        errors.iter().any(|e| e.contains("`main` does not handle the error `String`")),
+        "got: {errors:?}"
+    );
+}
+
+// ---- enums ---------------------------------------------------------------------
+
+#[test]
+fn enums_construct_and_match() {
+    let out = run(r#"
+enum Shape = Circle { Float radius } | Rect { Float w, Float h } | Dot
+
+area :: (Shape s) -> Float {
+    match s {
+        Circle(r)  -> 3.0 * r * r
+        Rect(w, h) -> w * h
+        Dot        -> 0.0
+    }
+}
+
+main :: () {
+    println(area(Circle(2.0)), area(Rect(3.0, 4.0)), area(Dot))
+    println(show(Dot), show(Circle(1.5)))
+    println(Dot == Dot, Circle(1.0) == Dot)
+}
+"#);
+    assert_eq!(out, "12.0 12.0 0.0\nDot Circle(radius: 1.5)\ntrue false\n");
+}
+
+#[test]
+fn failed_enums_catch_by_variant_with_full_coverage() {
+    let out = run(r#"
+enum Signal = Go | Stop { String why }
+
+drive :: (Bool ok) -> Int ! Signal {
+    if ok {
+        fail Go
+    }
+    fail Stop("red light")
+}
+
+main :: () {
+    a = drive(true) |> catch { Go -> 1, Stop(why) -> 0 }
+    b = drive(false) |> catch { Go -> 1, Stop(why) -> 0 }
+    c = drive(false) |> catch { Signal s -> 2 }
+    println(a, b, c)
+}
+"#);
+    assert_eq!(out, "1 0 2\n");
+}
+
+#[test]
+fn partial_variant_coverage_keeps_enum_in_row() {
+    let errors = check_errors(r#"
+enum Signal = Go | Stop { String why }
+
+drive :: () {
+    fail Go
+}
+
+main :: () {
+    drive() |> catch { Go -> 1 }
+}
+"#);
+    assert!(
+        errors.iter().any(|e| e.contains("`main` does not handle the error `Signal`")),
+        "got: {errors:?}"
+    );
+}
+
+#[test]
+fn duplicate_variant_names_are_rejected() {
+    let errors = check_errors(r#"
+enum A = Go | Halt
+enum B = Halt | Wait
+
+main :: () {
+    println(1)
+}
+"#);
+    assert!(
+        errors.iter().any(|e| e.contains("variant name `Halt` is already taken")),
+        "got: {errors:?}"
+    );
 }
 
 // ---- capabilities ----------------------------------------------------------------
@@ -345,7 +482,7 @@ main :: () {
 #[test]
 fn retry_reevaluates_until_success() {
     let out = run(r#"
-error Flaky = { Int n }
+struct Flaky = { Int n }
 
 service Counter {
     next :: () -> Int
@@ -387,7 +524,7 @@ main :: () {
 #[test]
 fn ignore_failure_swallows_errors() {
     let out = run(r#"
-error Boom = { Int x }
+struct Boom = { Int x }
 
 main :: () {
     { fail Boom(1) } |> ignoreFailure
@@ -400,7 +537,7 @@ main :: () {
 #[test]
 fn lazy_params_defer_evaluation() {
     let out = run(r#"
-error Boom = { Int x }
+struct Boom = { Int x }
 
 pick :: (Bool first, lazy Int a, lazy Int b) -> Int {
     if first {
@@ -439,12 +576,12 @@ main :: () {
 #[test]
 fn encode_decode_roundtrip() {
     let out = run(r#"
-type User = { Int id, String name }
+struct User = { Int id, String name }
 
 main :: () {
     raw = encode(User(7, "Ada"))
     println(raw)
-    user = decode(raw, User) |> catch { DecodeError(e) -> User(0, e.message) }
+    user = decode(raw, User) |> catch { DecodeError e -> User(0, e.message) }
     println(user.name)
 }
 "#);
@@ -454,10 +591,10 @@ main :: () {
 #[test]
 fn decode_failure_is_typed() {
     let out = run(r#"
-type User = { Int id, String name }
+struct User = { Int id, String name }
 
 main :: () {
-    user = decode("not json", User) |> catch { DecodeError(e) -> User(-1, "bad") }
+    user = decode("not json", User) |> catch { DecodeError(msg) -> User(-1, "bad") }
     println(user.id, user.name)
 }
 "#);

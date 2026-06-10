@@ -276,8 +276,8 @@ impl Server {
                 label: def.name.clone(),
                 kind: Some(match def.kind {
                     inga_core::check::DefKind::Func => CompletionItemKind::FUNCTION,
-                    inga_core::check::DefKind::Error => CompletionItemKind::CLASS,
-                    inga_core::check::DefKind::Type => CompletionItemKind::STRUCT,
+                    inga_core::check::DefKind::Struct => CompletionItemKind::STRUCT,
+                    inga_core::check::DefKind::Enum => CompletionItemKind::ENUM,
                     inga_core::check::DefKind::Service => CompletionItemKind::INTERFACE,
                     inga_core::check::DefKind::Impl => CompletionItemKind::MODULE,
                     inga_core::check::DefKind::Method => CompletionItemKind::METHOD,
@@ -295,7 +295,7 @@ impl Server {
             });
         }
         for keyword in
-            ["error", "type", "service", "match", "catch", "fail", "provide", "uses", "lazy", "if", "else"]
+            ["struct", "enum", "service", "match", "catch", "fail", "provide", "uses", "lazy", "if", "else"]
         {
             items.push(CompletionItem {
                 label: keyword.to_string(),
@@ -435,8 +435,8 @@ fn collect_semantic_tokens(
                     T_VARIABLE
                 }
             }
-            TokenKind::KwError
-            | TokenKind::KwType
+            TokenKind::KwStruct
+            | TokenKind::KwEnum
             | TokenKind::KwService
             | TokenKind::KwMatch
             | TokenKind::KwCatch

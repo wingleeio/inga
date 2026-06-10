@@ -1,11 +1,11 @@
 // The user-service example: typed errors, inferred effect rows, capability
 // injection, retries — run it with `inga run examples/user_service.inga`.
 
-error UserNotFound = { Int id }
-error DbError      = { String cause }
-error CacheMiss    = { String key }
+struct UserNotFound = { Int id }
+struct DbError      = { String cause }
+struct CacheMiss    = { String key }
 
-type User = { Int id, String name, String email }
+struct User = { Int id, String name, String email }
 
 service Logger {
     info :: (String msg)
@@ -38,8 +38,8 @@ cached :: (id) {
         |> decode(User)
         |> Some
         |> catch {
-            CacheMiss      -> None
-            DecodeError(e) -> {
+            CacheMiss     -> None
+            DecodeError e -> {
                 logger.warn("corrupt cache entry for ${id}: ${e.message}")
                 None
             }
@@ -55,8 +55,8 @@ fetchAndCache :: (id) {
         |> retry(Schedule.exponential(100.millis) |> upTo(3))
         |> orFail(UserNotFound(id))
         |> catch {
-            DbError(e) -> {
-                logger.warn("db down after retries: ${e.cause}")
+            DbError(cause) -> {
+                logger.warn("db down after retries: ${cause}")
                 fail UserNotFound(id)
             }
         }
@@ -119,7 +119,7 @@ main :: () {
         println("cached:  ${again.name}")
 
         // Unknown user: the typed error carries its payload.
-        missing = getUserById(7) |> catch { UserNotFound(e) -> User(e.id, "anonymous", "n/a") }
+        missing = getUserById(7) |> catch { UserNotFound(id) -> User(id, "anonymous", "n/a") }
         println("fallback for user ${missing.id}: ${missing.name}")
     }
 }

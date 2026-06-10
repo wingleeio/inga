@@ -23,8 +23,8 @@ pub enum TokenKind {
     Newline,
 
     // Keywords
-    KwError,
-    KwType,
+    KwStruct,
+    KwEnum,
     KwService,
     KwMatch,
     KwCatch,
@@ -55,6 +55,7 @@ pub enum TokenKind {
     Percent,
     Bang,     // !
     Question, // ? (option types: `User?`)
+    Bar,      // | (enum variant separator)
     AndAnd,   // &&
     OrOr,     // ||
     Dot,
@@ -74,8 +75,8 @@ pub enum TokenKind {
 impl TokenKind {
     pub fn keyword(ident: &str) -> Option<TokenKind> {
         Some(match ident {
-            "error" => TokenKind::KwError,
-            "type" => TokenKind::KwType,
+            "struct" => TokenKind::KwStruct,
+            "enum" => TokenKind::KwEnum,
             "service" => TokenKind::KwService,
             "match" => TokenKind::KwMatch,
             "catch" => TokenKind::KwCatch,
@@ -101,8 +102,8 @@ impl TokenKind {
             TokenKind::Comment(_) => "comment".into(),
             TokenKind::Newline => "end of line".into(),
             TokenKind::Eof => "end of file".into(),
-            TokenKind::KwError => "`error`".into(),
-            TokenKind::KwType => "`type`".into(),
+            TokenKind::KwStruct => "`struct`".into(),
+            TokenKind::KwEnum => "`enum`".into(),
             TokenKind::KwService => "`service`".into(),
             TokenKind::KwMatch => "`match`".into(),
             TokenKind::KwCatch => "`catch`".into(),
@@ -134,6 +135,7 @@ impl TokenKind {
                     TokenKind::Percent => "%",
                     TokenKind::Bang => "!",
                     TokenKind::Question => "?",
+                    TokenKind::Bar => "|",
                     TokenKind::AndAnd => "&&",
                     TokenKind::OrOr => "||",
                     TokenKind::Dot => ".",

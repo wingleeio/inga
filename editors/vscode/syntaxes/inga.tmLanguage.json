@@ -31,8 +31,8 @@
     "declarations": {
       "patterns": [
         {
-          "comment": "error / type declarations: `error UserNotFound = { id }`",
-          "match": "\\b(error|type)\\s+([A-Z][A-Za-z0-9_]*)",
+          "comment": "struct / enum declarations: `struct User = { Int id }`, `enum Shape = Circle | Dot`",
+          "match": "\\b(struct|enum)\\s+([A-Z][A-Za-z0-9_]*)",
           "captures": {
             "1": { "name": "keyword.declaration.inga" },
             "2": { "name": "entity.name.type.inga" }
@@ -88,7 +88,7 @@
         },
         {
           "name": "keyword.other.inga",
-          "match": "\\b(error|type|service|provide|uses|lazy)\\b"
+          "match": "\\b(struct|enum|service|provide|uses|lazy)\\b"
         },
         {
           "name": "constant.language.inga",
@@ -187,6 +187,11 @@
         {
           "name": "keyword.operator.logical.inga",
           "match": "(&&|\\|\\|)"
+        },
+        {
+          "comment": "enum variant separator (after |> and || have been tried)",
+          "name": "keyword.operator.enum-variant.inga",
+          "match": "\\|"
         },
         {
           "name": "keyword.operator.arithmetic.inga",

@@ -1,4 +1,5 @@
 {
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/grammar.schema.json",
   "name": "inga",
   "word": "identifier",
   "rules": {
@@ -52,11 +53,11 @@
       "members": [
         {
           "type": "SYMBOL",
-          "name": "error_declaration"
+          "name": "struct_declaration"
         },
         {
           "type": "SYMBOL",
-          "name": "type_declaration"
+          "name": "enum_declaration"
         },
         {
           "type": "SYMBOL",
@@ -72,12 +73,12 @@
         }
       ]
     },
-    "error_declaration": {
+    "struct_declaration": {
       "type": "SEQ",
       "members": [
         {
           "type": "STRING",
-          "value": "error"
+          "value": "struct"
         },
         {
           "type": "FIELD",
@@ -97,12 +98,12 @@
         }
       ]
     },
-    "type_declaration": {
+    "enum_declaration": {
       "type": "SEQ",
       "members": [
         {
           "type": "STRING",
-          "value": "type"
+          "value": "enum"
         },
         {
           "type": "FIELD",
@@ -118,7 +119,48 @@
         },
         {
           "type": "SYMBOL",
-          "name": "fields"
+          "name": "enum_variant"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SEQ",
+            "members": [
+              {
+                "type": "STRING",
+                "value": "|"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "enum_variant"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "enum_variant": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "type_identifier"
+          }
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "fields"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
         }
       ]
     },
@@ -1207,6 +1249,10 @@
       "members": [
         {
           "type": "SYMBOL",
+          "name": "typed_pattern"
+        },
+        {
+          "type": "SYMBOL",
           "name": "constructor_pattern"
         },
         {
@@ -1237,6 +1283,27 @@
               "name": "number"
             }
           ]
+        }
+      ]
+    },
+    "typed_pattern": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "type",
+          "content": {
+            "type": "SYMBOL",
+            "name": "type_identifier"
+          }
+        },
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "identifier"
+          }
         }
       ]
     },

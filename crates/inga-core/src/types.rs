@@ -22,10 +22,10 @@ pub enum Type {
     Option(Box<Type>),
     /// `[T]`
     List(Box<Type>),
-    /// A `type` declaration (nominal record).
+    /// A `struct` declaration (nominal record).
     Named(String),
-    /// An `error` declaration's value type.
-    Error(String),
+    /// An `enum` declaration (nominal sum type).
+    Enum(String),
     /// A capability bound by `Cache cache`.
     Service(String),
     /// A type name used as a value, e.g. `decode(raw, User)`.
@@ -161,7 +161,7 @@ impl TypeCtx {
                 }
             }
             Type::List(t) => format!("[{}]", self.render(&t, names)),
-            Type::Named(n) | Type::Error(n) | Type::Service(n) => n,
+            Type::Named(n) | Type::Enum(n) | Type::Service(n) => n,
             Type::Tag(n) => format!("Type<{n}>"),
             Type::MutMap(k, v) => {
                 format!("MutMap<{}, {}>", self.render(&k, names), self.render(&v, names))

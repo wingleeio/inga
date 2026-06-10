@@ -189,6 +189,10 @@
           "named": true
         },
         {
+          "type": "typed_pattern",
+          "named": true
+        },
+        {
           "type": "unary_expression",
           "named": true
         }
@@ -514,7 +518,33 @@
     }
   },
   {
-    "type": "error_declaration",
+    "type": "enum_declaration",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "type_identifier",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "enum_variant",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "enum_variant",
     "named": true,
     "fields": {
       "name": {
@@ -530,7 +560,7 @@
     },
     "children": {
       "multiple": false,
-      "required": true,
+      "required": false,
       "types": [
         {
           "type": "fields",
@@ -1745,6 +1775,10 @@
         {
           "type": "string",
           "named": true
+        },
+        {
+          "type": "typed_pattern",
+          "named": true
         }
       ]
     }
@@ -1941,13 +1975,14 @@
   {
     "type": "source_file",
     "named": true,
+    "root": true,
     "fields": {},
     "children": {
       "multiple": true,
       "required": false,
       "types": [
         {
-          "type": "error_declaration",
+          "type": "enum_declaration",
           "named": true
         },
         {
@@ -1963,7 +1998,7 @@
           "named": true
         },
         {
-          "type": "type_declaration",
+          "type": "struct_declaration",
           "named": true
         }
       ]
@@ -1989,7 +2024,7 @@
     }
   },
   {
-    "type": "type_declaration",
+    "type": "struct_declaration",
     "named": true,
     "fields": {
       "name": {
@@ -2012,6 +2047,32 @@
           "named": true
         }
       ]
+    }
+  },
+  {
+    "type": "typed_pattern",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "type_identifier",
+            "named": true
+          }
+        ]
+      }
     }
   },
   {
@@ -2229,7 +2290,7 @@
     "named": false
   },
   {
-    "type": "error",
+    "type": "enum",
     "named": false
   },
   {
@@ -2273,11 +2334,11 @@
     "named": false
   },
   {
-    "type": "true",
+    "type": "struct",
     "named": false
   },
   {
-    "type": "type",
+    "type": "true",
     "named": false
   },
   {
@@ -2290,6 +2351,10 @@
   },
   {
     "type": "{",
+    "named": false
+  },
+  {
+    "type": "|",
     "named": false
   },
   {

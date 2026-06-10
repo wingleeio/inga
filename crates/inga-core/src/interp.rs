@@ -32,8 +32,10 @@ pub enum Value<'a> {
     Duration(i64),
     Option(Option<Rc<Value<'a>>>),
     List(Rc<Vec<Value<'a>>>),
-    /// A `type` or `error` value. `is_error` distinguishes the two.
-    Struct { name: Rc<String>, fields: Rc<Vec<(String, Value<'a>)>>, is_error: bool },
+    /// A `struct` value.
+    Struct { name: Rc<String>, fields: Rc<Vec<(String, Value<'a>)>> },
+    /// An `enum` variant value.
+    Enum { enum_name: Rc<String>, variant: Rc<String>, fields: Rc<Vec<(String, Value<'a>)>> },
     /// A type name used as a value (`decode(raw, User)`).
     Tag(Rc<String>),
     Schedule(ScheduleVal),
@@ -112,11 +114,25 @@ impl<'a> Scope<'a> {
     }
 }
 
-/// A failure in flight: either an Inga error value (catchable) or a fatal
-/// runtime error (propagates to the top).
+/// A failure in flight: either a failed Inga value (catchable, tagged with
+/// its type name) or a fatal runtime error (propagates to the top).
 pub enum Failure<'a> {
     Error { name: String, value: Value<'a>, span: Span },
     Fatal(RuntimeError),
+}
+
+/// The `!` row tag for a runtime value, if values of its type can be failed.
+fn fail_tag(value: &Value) -> Option<String> {
+    match value {
+        Value::Struct { name, .. } => Some(name.to_string()),
+        Value::Enum { enum_name, .. } => Some(enum_name.to_string()),
+        Value::Int(_) => Some("Int".to_string()),
+        Value::Float(_) => Some("Float".to_string()),
+        Value::Bool(_) => Some("Bool".to_string()),
+        Value::Str(_) => Some("String".to_string()),
+        Value::Duration(_) => Some("Duration".to_string()),
+        _ => None,
+    }
 }
 
 pub type EvalResult<'a> = Result<Value<'a>, Failure<'a>>;
@@ -124,9 +140,10 @@ pub type EvalResult<'a> = Result<Value<'a>, Failure<'a>>;
 pub struct Interp<'a> {
     funcs: HashMap<&'a str, &'a FuncDecl>,
     impls: HashMap<&'a str, &'a ImplDecl>,
-    /// Field order for constructors, by name.
-    type_fields: HashMap<&'a str, Vec<&'a str>>,
-    error_fields: HashMap<&'a str, Vec<&'a str>>,
+    /// Field order for struct constructors, by name.
+    struct_fields: HashMap<&'a str, Vec<&'a str>>,
+    /// Variant name -> (owning enum, field order).
+    variants: HashMap<&'a str, (&'a str, Vec<&'a str>)>,
     /// Dynamically scoped provided services.
     provided: RefCell<Vec<HashMap<String, Rc<ServiceInstance<'a>>>>>,
     /// Output sink (stdout normally; captured in tests).
@@ -183,9 +200,9 @@ impl<'a> Interp<'a> {
     pub fn new(program: &'a Program) -> Interp<'a> {
         let mut funcs = HashMap::new();
         let mut impls = HashMap::new();
-        let mut type_fields = HashMap::new();
-        let mut error_fields: HashMap<&str, Vec<&str>> = HashMap::new();
-        error_fields.insert(DECODE_ERROR, vec!["message"]);
+        let mut struct_fields: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut variants: HashMap<&str, (&str, Vec<&str>)> = HashMap::new();
+        struct_fields.insert(DECODE_ERROR, vec!["message"]);
         for decl in &program.decls {
             match decl {
                 Decl::Func(d) => {
@@ -194,17 +211,19 @@ impl<'a> Interp<'a> {
                 Decl::Impl(d) => {
                     impls.insert(d.name.as_str(), d);
                 }
-                Decl::Type(d) => {
-                    type_fields.insert(
+                Decl::Struct(d) => {
+                    struct_fields.insert(
                         d.name.as_str(),
                         d.fields.iter().map(|f| f.name.as_str()).collect(),
                     );
                 }
-                Decl::Error(d) => {
-                    error_fields.insert(
-                        d.name.as_str(),
-                        d.fields.iter().map(|f| f.name.as_str()).collect(),
-                    );
+                Decl::Enum(d) => {
+                    for v in &d.variants {
+                        variants.insert(
+                            v.name.as_str(),
+                            (d.name.as_str(), v.fields.iter().map(|f| f.name.as_str()).collect()),
+                        );
+                    }
                 }
                 Decl::Service(_) => {}
             }
@@ -212,8 +231,8 @@ impl<'a> Interp<'a> {
         Interp {
             funcs,
             impls,
-            type_fields,
-            error_fields,
+            struct_fields,
+            variants,
             provided: RefCell::new(Vec::new()),
             output: RefCell::new(None),
             start: std::time::Instant::now(),
@@ -368,15 +387,14 @@ impl<'a> Interp<'a> {
             }
             ExprKind::Fail { error } => {
                 let value = self.eval(error, scope)?;
-                match &value {
-                    Value::Struct { name, is_error: true, .. } => Err(Failure::Error {
-                        name: name.to_string(),
-                        value: value.clone(),
-                        span: expr.span,
-                    }),
-                    other => self.fatal(
+                match fail_tag(&value) {
+                    Some(name) => Err(Failure::Error { name, value, span: expr.span }),
+                    None => self.fatal(
                         error.span,
-                        format!("`fail` needs an error value, found {}", show(other)),
+                        format!(
+                            "cannot `fail` with {} (use a struct, enum, or primitive value)",
+                            show(&value)
+                        ),
                     ),
                 }
             }
@@ -442,10 +460,18 @@ impl<'a> Interp<'a> {
             "encode" => return Ok(Value::Builtin("encode")),
             _ => {}
         }
-        if self.type_fields.contains_key(name) {
+        if self.struct_fields.contains_key(name) {
             return Ok(Value::Tag(Rc::new(name.to_string())));
         }
-        if self.error_fields.contains_key(name) {
+        if let Some((enum_name, fields)) = self.variants.get(name) {
+            // Fieldless variants are values; the rest are constructors.
+            if fields.is_empty() {
+                return Ok(Value::Enum {
+                    enum_name: Rc::new(enum_name.to_string()),
+                    variant: Rc::new(name.to_string()),
+                    fields: Rc::new(Vec::new()),
+                });
+            }
             return Ok(Value::Ctor(Rc::new(name.to_string())));
         }
         self.fatal(span, format!("unknown name `{name}`"))
@@ -472,9 +498,10 @@ impl<'a> Interp<'a> {
                 Ok(value) => Ok(value),
                 Err(Failure::Fatal(err)) => Err(Failure::Fatal(err)),
                 Err(Failure::Error { name, value, span: err_span }) => {
+                    // Catch arms pattern-match the failed value itself.
                     for arm in arms {
                         let arm_scope = scope.child();
-                        if self.match_error_pattern(&arm.pattern, &name, &value, &arm_scope) {
+                        if self.match_pattern(&arm.pattern, &value, &arm_scope) {
                             return self.eval(&arm.body, &arm_scope);
                         }
                     }
@@ -509,13 +536,13 @@ impl<'a> Interp<'a> {
                     return result;
                 }
                 // Constructors.
-                if let Some(fields) = self.error_fields.get(name.as_str()) {
+                if let Some(fields) = self.struct_fields.get(name.as_str()) {
                     let fields = fields.clone();
-                    return self.construct(name, &fields, args, true, span, scope);
+                    return self.construct(name, &fields, args, None, span, scope);
                 }
-                if let Some(fields) = self.type_fields.get(name.as_str()) {
-                    let fields = fields.clone();
-                    return self.construct(name, &fields, args, false, span, scope);
+                if let Some((enum_name, fields)) = self.variants.get(name.as_str()) {
+                    let (enum_name, fields) = (*enum_name, fields.clone());
+                    return self.construct(name, &fields, args, Some(enum_name), span, scope);
                 }
             }
         }
@@ -568,13 +595,10 @@ impl<'a> Interp<'a> {
                     }
                     return Ok(Value::Option(Some(Rc::new(args.into_iter().next().unwrap()))));
                 }
-                let is_error = self.error_fields.contains_key(name.as_str());
-                let field_names = self
-                    .error_fields
-                    .get(name.as_str())
-                    .or_else(|| self.type_fields.get(name.as_str()))
-                    .cloned()
-                    .unwrap_or_default();
+                let (enum_name, field_names) = match self.variants.get(name.as_str()) {
+                    Some((owner, fields)) => (Some(*owner), fields.clone()),
+                    None => (None, self.struct_fields.get(name.as_str()).cloned().unwrap_or_default()),
+                };
                 if field_names.len() != args.len() {
                     return self.fatal(
                         span,
@@ -587,7 +611,14 @@ impl<'a> Interp<'a> {
                 }
                 let fields: Vec<(String, Value<'a>)> =
                     field_names.iter().map(|f| f.to_string()).zip(args).collect();
-                Ok(Value::Struct { name: Rc::new(name.to_string()), fields: Rc::new(fields), is_error })
+                Ok(match enum_name {
+                    Some(owner) => Value::Enum {
+                        enum_name: Rc::new(owner.to_string()),
+                        variant: Rc::new(name.to_string()),
+                        fields: Rc::new(fields),
+                    },
+                    None => Value::Struct { name: Rc::new(name.to_string()), fields: Rc::new(fields) },
+                })
             }
             Value::Builtin(name) => match (name, args.as_slice()) {
                 ("show", [v]) => Ok(Value::Str(Rc::new(show(v)))),
@@ -609,7 +640,7 @@ impl<'a> Interp<'a> {
         name: &str,
         field_names: &[&str],
         args: &[&'a Expr],
-        is_error: bool,
+        enum_name: Option<&str>,
         span: Span,
         scope: &Scope<'a>,
     ) -> EvalResult<'a> {
@@ -627,7 +658,14 @@ impl<'a> Interp<'a> {
         for (field, arg) in field_names.iter().zip(args) {
             fields.push((field.to_string(), self.eval(arg, scope)?));
         }
-        Ok(Value::Struct { name: Rc::new(name.to_string()), fields: Rc::new(fields), is_error })
+        Ok(match enum_name {
+            Some(owner) => Value::Enum {
+                enum_name: Rc::new(owner.to_string()),
+                variant: Rc::new(name.to_string()),
+                fields: Rc::new(fields),
+            },
+            None => Value::Struct { name: Rc::new(name.to_string()), fields: Rc::new(fields) },
+        })
     }
 
     fn eval_schedule_call(
@@ -900,15 +938,14 @@ impl<'a> Interp<'a> {
             "orFail" if args.len() == 2 => match self.eval(args[0], scope) {
                 Ok(Value::Option(Some(v))) => Ok((*v).clone()),
                 Ok(Value::Option(None)) => match self.eval(args[1], scope) {
-                    Ok(err) => match &err {
-                        Value::Struct { name, is_error: true, .. } => Err(Failure::Error {
-                            name: name.to_string(),
-                            value: err.clone(),
-                            span,
-                        }),
-                        other => self.fatal(
+                    Ok(err) => match fail_tag(&err) {
+                        Some(name) => Err(Failure::Error { name, value: err, span }),
+                        None => self.fatal(
                             args[1].span,
-                            format!("`orFail` needs an error value, found {}", show(other)),
+                            format!(
+                                "cannot fail with {} (use a struct, enum, or primitive value)",
+                                show(&err)
+                            ),
                         ),
                     },
                     Err(e) => Err(e),
@@ -1018,7 +1055,7 @@ impl<'a> Interp<'a> {
         let Value::Tag(type_name) = &tag else {
             return self.fatal(args[1].span, "`decode` needs a type name (like `User`)");
         };
-        let Some(field_names) = self.type_fields.get(type_name.as_str()) else {
+        let Some(field_names) = self.struct_fields.get(type_name.as_str()) else {
             return self.fatal(args[1].span, format!("unknown type `{type_name}`"));
         };
         match decode_json(text, type_name, field_names) {
@@ -1089,11 +1126,7 @@ impl<'a> Interp<'a> {
     ) -> Failure<'a> {
         Failure::Error {
             name: name.to_string(),
-            value: Value::Struct {
-                name: Rc::new(name.to_string()),
-                fields: Rc::new(fields),
-                is_error: true,
-            },
+            value: Value::Struct { name: Rc::new(name.to_string()), fields: Rc::new(fields) },
             span,
         }
     }
@@ -1278,6 +1311,14 @@ impl<'a> Interp<'a> {
             (PatternKind::Int(p), Value::Int(n)) => p == n,
             (PatternKind::Str(p), Value::Str(s)) => p == s.as_str(),
             (PatternKind::Bool(p), Value::Bool(b)) => p == b,
+            (PatternKind::TypedBind { ty, name, .. }, v) => {
+                if type_matches(ty, v) {
+                    scope.set(name, v.clone());
+                    true
+                } else {
+                    false
+                }
+            }
             (PatternKind::Ctor { name, args, .. }, v) => match (name.as_str(), v) {
                 ("Some", Value::Option(Some(inner))) => match args {
                     CtorPatArgs::Positional(pats) if pats.len() == 1 => {
@@ -1287,8 +1328,18 @@ impl<'a> Interp<'a> {
                     _ => false,
                 },
                 ("None", Value::Option(None)) => true,
-                (_, Value::Struct { name: vname, fields, .. }) if name == vname.as_str() => {
-                    self.match_struct_args(args, value, fields, scope)
+                (_, Value::Struct { name: vname, fields }) if name == vname.as_str() => {
+                    self.match_struct_args(args, fields, scope)
+                }
+                (_, Value::Enum { enum_name, variant, fields }) => {
+                    if name == variant.as_str() {
+                        self.match_struct_args(args, fields, scope)
+                    } else if name == enum_name.as_str() {
+                        // The bare enum name matches any of its variants.
+                        matches!(args, CtorPatArgs::None)
+                    } else {
+                        false
+                    }
                 }
                 _ => false,
             },
@@ -1299,20 +1350,12 @@ impl<'a> Interp<'a> {
     fn match_struct_args(
         &self,
         args: &CtorPatArgs,
-        whole: &Value<'a>,
         fields: &[(String, Value<'a>)],
         scope: &Scope<'a>,
     ) -> bool {
         match args {
             CtorPatArgs::None => true,
             CtorPatArgs::Positional(pats) => {
-                if pats.len() == 1 {
-                    if let PatternKind::Bind(bind_name) = &pats[0].kind {
-                        // A single name binds the whole value.
-                        scope.set(bind_name, whole.clone());
-                        return true;
-                    }
-                }
                 pats.len() == fields.len()
                     && pats
                         .iter()
@@ -1331,25 +1374,19 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn match_error_pattern(
-        &self,
-        pat: &Pattern,
-        err_name: &str,
-        value: &Value<'a>,
-        scope: &Scope<'a>,
-    ) -> bool {
-        match &pat.kind {
-            PatternKind::Wildcard => true,
-            PatternKind::Bind(name) => {
-                scope.set(name, value.clone());
-                true
-            }
-            PatternKind::Ctor { name, args, .. } if name == err_name => {
-                let Value::Struct { fields, .. } = value else { return false };
-                self.match_struct_args(args, value, fields, scope)
-            }
-            _ => false,
-        }
+}
+
+/// Does a runtime value belong to the named type? (TypedBind patterns.)
+fn type_matches(ty: &str, value: &Value) -> bool {
+    match value {
+        Value::Int(_) => ty == "Int",
+        Value::Float(_) => ty == "Float",
+        Value::Bool(_) => ty == "Bool",
+        Value::Str(_) => ty == "String",
+        Value::Duration(_) => ty == "Duration",
+        Value::Struct { name, .. } => ty == name.as_str(),
+        Value::Enum { enum_name, .. } => ty == enum_name.as_str(),
+        _ => false,
     }
 }
 
@@ -1368,13 +1405,24 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::List(xs), Value::List(ys)) => {
             xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| values_equal(x, y))
         }
-        (Value::Struct { name: n1, fields: f1, .. }, Value::Struct { name: n2, fields: f2, .. }) => {
+        (Value::Struct { name: n1, fields: f1 }, Value::Struct { name: n2, fields: f2 }) => {
             n1 == n2
                 && f1.len() == f2.len()
                 && f1
                     .iter()
                     .zip(f2.iter())
                     .all(|((k1, v1), (k2, v2))| k1 == k2 && values_equal(v1, v2))
+        }
+        (
+            Value::Enum { variant: v1, fields: f1, .. },
+            Value::Enum { variant: v2, fields: f2, .. },
+        ) => {
+            v1 == v2
+                && f1.len() == f2.len()
+                && f1
+                    .iter()
+                    .zip(f2.iter())
+                    .all(|((k1, x), (k2, y))| k1 == k2 && values_equal(x, y))
         }
         _ => false,
     }
@@ -1405,10 +1453,19 @@ pub fn show(value: &Value) -> String {
             let inner: Vec<String> = items.iter().map(show).collect();
             format!("[{}]", inner.join(", "))
         }
-        Value::Struct { name, fields, .. } => {
+        Value::Struct { name, fields } => {
             let inner: Vec<String> =
                 fields.iter().map(|(k, v)| format!("{k}: {}", show(v))).collect();
             format!("{name}({})", inner.join(", "))
+        }
+        Value::Enum { variant, fields, .. } => {
+            if fields.is_empty() {
+                variant.to_string()
+            } else {
+                let inner: Vec<String> =
+                    fields.iter().map(|(k, v)| format!("{k}: {}", show(v))).collect();
+                format!("{variant}({})", inner.join(", "))
+            }
         }
         Value::Tag(name) => format!("Type<{name}>"),
         Value::Schedule(s) => {
@@ -1519,6 +1576,19 @@ fn encode_into(value: &Value, out: &mut String) {
             }
             out.push('}');
         }
+        Value::Enum { variant, fields, .. } => {
+            out.push('{');
+            encode_json_string("$variant", out);
+            out.push(':');
+            encode_json_string(variant, out);
+            for (k, v) in fields.iter() {
+                out.push(',');
+                encode_json_string(k, out);
+                out.push(':');
+                encode_into(v, out);
+            }
+            out.push('}');
+        }
         other => encode_json_string(&show(other), out),
     }
 }
@@ -1559,11 +1629,7 @@ fn decode_json<'a>(text: &str, type_name: &str, field_names: &[&str]) -> Result<
             None => return Err(format!("missing field `{fname}` for `{type_name}`")),
         }
     }
-    Ok(Value::Struct {
-        name: Rc::new(type_name.to_string()),
-        fields: Rc::new(fields),
-        is_error: false,
-    })
+    Ok(Value::Struct { name: Rc::new(type_name.to_string()), fields: Rc::new(fields) })
 }
 
 enum Json {
@@ -1587,7 +1653,6 @@ fn json_to_value<'a>(json: &Json) -> Value<'a> {
         Json::Object(entries) => Value::Struct {
             name: Rc::new("Object".to_string()),
             fields: Rc::new(entries.iter().map(|(k, v)| (k.clone(), json_to_value(v))).collect()),
-            is_error: false,
         },
     }
 }

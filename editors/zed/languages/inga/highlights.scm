@@ -14,8 +14,8 @@
 (boolean) @boolean
 
 [
-  "error"
-  "type"
+  "struct"
+  "enum"
   "service"
   "match"
   "catch"
@@ -47,6 +47,7 @@
   "%"
   "&&"
   "||"
+  "|"
 ] @operator
 
 [
@@ -74,6 +75,8 @@
 (field_expression field: (identifier) @property)
 (parameter name: (identifier) @variable.parameter)
 (acquire name: (identifier) @variable)
+(enum_variant name: (type_identifier) @constructor)
+(typed_pattern name: (identifier) @variable)
 
 ; Option constructors and builtin modules.
 ((type_identifier) @constructor

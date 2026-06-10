@@ -8,9 +8,13 @@
 //!   closures are pointers.
 //! - **Errors are return values.** A function whose error row is non-empty
 //!   (or that has `lazy` parameters) returns `{ i64 value, i64 err }`; `err`
-//!   is null on success, else a pointer to `{ i64 type_id, fields... }`.
-//!   `fail` is a store + branch; `catch` is a compare on `type_id`. Functions
+//!   is null on success, else a pointer to `{ i64 tag_id, i64 value }` — the
+//!   failed value boxed with its type tag (`fail` accepts any failable
+//!   value). `fail` is an alloc + branch; `catch` compares the tag. Functions
 //!   with empty rows pay nothing.
+//! - **Structs are field tuples** (`{ fields... }`, no header). **Enums** are
+//!   `{ i64 variant_id, fields... }` boxes — or raw variant ids when every
+//!   variant of the enum is fieldless.
 //! - **Capabilities are evidence.** A function's `uses` row becomes hidden
 //!   leading parameters, one instance pointer per service (sorted by name).
 //!   `provide` allocates an instance `{ method fn-ptrs..., fields... }`;
@@ -66,6 +70,17 @@ struct ImplMeta<'a> {
     fields: Vec<String>,
 }
 
+#[derive(Clone)]
+struct VariantMeta {
+    enum_name: String,
+    /// Position within the enum (the runtime variant id).
+    id: i64,
+    fields: Vec<String>,
+    /// True when every variant of the owning enum is fieldless — the whole
+    /// enum is then represented as raw variant ids, no box.
+    simple: bool,
+}
+
 struct Cg<'a> {
     program: &'a Program,
     info: &'a CheckInfo,
@@ -73,10 +88,14 @@ struct Cg<'a> {
     services: HashMap<String, ServiceMeta>,
     impls: HashMap<String, ImplMeta<'a>>,
     funcs: HashMap<String, &'a FuncDecl>,
-    /// error name -> (type id, field names)
-    error_meta: HashMap<String, (i64, Vec<String>)>,
-    /// type name -> field names
-    type_meta: HashMap<String, Vec<String>>,
+    /// struct name -> field names
+    struct_meta: HashMap<String, Vec<String>>,
+    /// variant name -> meta (variant names are globally unique)
+    variant_meta: HashMap<String, VariantMeta>,
+    /// enum name -> whether it is represented as raw variant ids
+    enum_simple: HashMap<String, bool>,
+    /// `!` row tag -> id (primitives, structs, and enums)
+    tag_ids: HashMap<String, i64>,
 
     globals: String,
     functions: String,
@@ -94,8 +113,10 @@ impl<'a> Cg<'a> {
             services: HashMap::new(),
             impls: HashMap::new(),
             funcs: HashMap::new(),
-            error_meta: HashMap::new(),
-            type_meta: HashMap::new(),
+            struct_meta: HashMap::new(),
+            variant_meta: HashMap::new(),
+            enum_simple: HashMap::new(),
+            tag_ids: HashMap::new(),
             globals: String::new(),
             functions: String::new(),
             str_consts: HashMap::new(),
@@ -113,20 +134,38 @@ impl<'a> Cg<'a> {
     }
 
     fn collect_decls(&mut self) {
-        self.error_meta.insert("DecodeError".into(), (0, vec!["message".into()]));
-        let mut next_error_id = 1i64;
+        // Fixed tag ids for the builtins, then one per struct/enum.
+        self.struct_meta.insert("DecodeError".into(), vec!["message".into()]);
+        for (i, tag) in
+            ["DecodeError", "Int", "Float", "Bool", "String", "Duration"].iter().enumerate()
+        {
+            self.tag_ids.insert(tag.to_string(), i as i64);
+        }
+        let mut next_tag_id = self.tag_ids.len() as i64;
         for decl in &self.program.decls {
             match decl {
-                Decl::Error(d) => {
-                    self.error_meta.insert(
-                        d.name.clone(),
-                        (next_error_id, d.fields.iter().map(|f| f.name.clone()).collect()),
-                    );
-                    next_error_id += 1;
-                }
-                Decl::Type(d) => {
-                    self.type_meta
+                Decl::Struct(d) => {
+                    self.struct_meta
                         .insert(d.name.clone(), d.fields.iter().map(|f| f.name.clone()).collect());
+                    self.tag_ids.insert(d.name.clone(), next_tag_id);
+                    next_tag_id += 1;
+                }
+                Decl::Enum(d) => {
+                    let simple = d.variants.iter().all(|v| v.fields.is_empty());
+                    self.enum_simple.insert(d.name.clone(), simple);
+                    for (i, v) in d.variants.iter().enumerate() {
+                        self.variant_meta.insert(
+                            v.name.clone(),
+                            VariantMeta {
+                                enum_name: d.name.clone(),
+                                id: i as i64,
+                                fields: v.fields.iter().map(|f| f.name.clone()).collect(),
+                                simple,
+                            },
+                        );
+                    }
+                    self.tag_ids.insert(d.name.clone(), next_tag_id);
+                    next_tag_id += 1;
                 }
                 Decl::Service(d) => {
                     self.services.insert(
@@ -438,7 +477,8 @@ impl<'a> Cg<'a> {
             ExprKind::Match { scrutinee, arms } => self.gen_match(f, scrutinee, arms, expr.span),
             ExprKind::Fail { error } => {
                 let v = self.gen_expr(f, error);
-                self.emit_failure(f, &v);
+                let cty = self.ctype_of(error);
+                self.emit_fail_value(f, &v, &cty, error.span);
                 // `fail` produces no value; continue in a dead block.
                 let dead = self.label("dead");
                 f.start_block(&dead);
@@ -490,12 +530,53 @@ impl<'a> Cg<'a> {
             "false" => return "0".to_string(),
             _ => {}
         }
-        if self.funcs.contains_key(name) || name == "Some" || self.error_meta.contains_key(name) {
+        if let Some(vmeta) = self.variant_meta.get(name).cloned() {
+            if vmeta.fields.is_empty() {
+                if vmeta.simple {
+                    return vmeta.id.to_string();
+                }
+                let ptr = self.gen_alloc(f, 1);
+                self.store_slot(f, &ptr, 0, &vmeta.id.to_string());
+                return self.ptr_to_int(f, &ptr);
+            }
+            self.unsupported(span, "using a constructor as a value");
+            return "0".to_string();
+        }
+        if self.funcs.contains_key(name) || name == "Some" || self.struct_meta.contains_key(name) {
             self.unsupported(span, "using a function or constructor as a value");
             return "0".to_string();
         }
         self.unsupported(span, &format!("the name `{name}` here"));
         "0".to_string()
+    }
+
+    /// The `!` row tag for a static type, if values of it can be failed.
+    fn tag_of_ctype(cty: &CType) -> Option<&str> {
+        match cty {
+            CType::Struct(n) | CType::Enum(n) => Some(n),
+            CType::Int => Some("Int"),
+            CType::Float => Some("Float"),
+            CType::Bool => Some("Bool"),
+            CType::Str => Some("String"),
+            CType::Duration => Some("Duration"),
+            _ => None,
+        }
+    }
+
+    /// Box a failed value with its type tag and route it to the handler.
+    fn emit_fail_value(&mut self, f: &mut FnCtx, v: &str, cty: &CType, span: Span) {
+        let id = match Self::tag_of_ctype(cty).and_then(|t| self.tag_ids.get(t)) {
+            Some(id) => *id,
+            None => {
+                self.unsupported(span, "failing with this value type");
+                return;
+            }
+        };
+        let ptr = self.gen_alloc(f, 2);
+        self.store_slot(f, &ptr, 0, &id.to_string());
+        self.store_slot(f, &ptr, 1, v);
+        let err = self.ptr_to_int(f, &ptr);
+        self.emit_failure(f, &err);
     }
 
     /// Force a lazy value: thunk = { fnptr, captures... }, fnptr(env) -> {v, err}.
@@ -565,11 +646,14 @@ impl<'a> Cg<'a> {
                 if let Some(v) = self.gen_builtin(f, name, args, span) {
                     return v;
                 }
-                if let Some((type_id, fields)) = self.error_meta.get(name).cloned() {
-                    return self.gen_construct(f, args, Some(type_id), fields.len());
-                }
-                if let Some(fields) = self.type_meta.get(name).cloned() {
+                if let Some(fields) = self.struct_meta.get(name).cloned() {
                     return self.gen_construct(f, args, None, fields.len());
+                }
+                if let Some(vmeta) = self.variant_meta.get(name).cloned() {
+                    if vmeta.simple {
+                        return vmeta.id.to_string();
+                    }
+                    return self.gen_construct(f, args, Some(vmeta.id), vmeta.fields.len());
                 }
                 if let Some(decl) = self.funcs.get(name.as_str()).copied() {
                     return self.gen_user_call(f, decl, args, span);
@@ -618,16 +702,18 @@ impl<'a> Cg<'a> {
         }
     }
 
+    /// Structs are plain field tuples; boxed enum variants carry their
+    /// variant id in slot 0.
     fn gen_construct(
         &mut self,
         f: &mut FnCtx,
         args: &[&Expr],
-        error_type_id: Option<i64>,
+        variant_id: Option<i64>,
         n_fields: usize,
     ) -> String {
-        let header = error_type_id.map(|_| 1).unwrap_or(0);
+        let header = variant_id.map(|_| 1).unwrap_or(0);
         let ptr = self.gen_alloc(f, (header + n_fields.max(args.len())) as i64);
-        if let Some(id) = error_type_id {
+        if let Some(id) = variant_id {
             self.store_slot(f, &ptr, 0, &id.to_string());
         }
         for (i, arg) in args.iter().enumerate() {
@@ -755,8 +841,7 @@ impl<'a> Cg<'a> {
             }
         }
         let (header, fields) = match &recv_ty {
-            CType::Named(n) => (0i64, self.type_meta.get(n).cloned()),
-            CType::ErrorTy(n) => (1i64, self.error_meta.get(n).map(|(_, f)| f.clone())),
+            CType::Struct(n) => (0i64, self.struct_meta.get(n).cloned()),
             _ => (0, None),
         };
         let Some(fields) = fields else {
@@ -997,10 +1082,9 @@ impl<'a> Cg<'a> {
         f.start_block(&handler);
         let err = self.tmp();
         f.line(format!("{err} = load i64, ptr %err.slot"));
-        let errp = self.tmp();
-        f.line(format!("{errp} = inttoptr i64 {err} to ptr"));
-        let type_id = self.tmp();
-        f.line(format!("{type_id} = load i64, ptr {errp}"));
+        // The error box is { tag_id, value }.
+        let tag = self.load_slot_from_int(f, &err, 0);
+        let payload = self.load_slot_from_int(f, &err, 1);
 
         let mut next = self.label("arm");
         f.line(format!("br label %{next}"));
@@ -1008,33 +1092,9 @@ impl<'a> Cg<'a> {
             f.start_block(&next);
             next = self.label("arm");
             f.scopes.push(HashMap::new());
-            match &arm.pattern.kind {
-                PatternKind::Ctor { name, args, .. } => {
-                    let Some((id, fields)) = self.error_meta.get(name).cloned() else {
-                        self.unsupported(arm.pattern.span, "this catch pattern");
-                        f.scopes.pop();
-                        continue;
-                    };
-                    let body_l = self.label("armbody");
-                    let m = self.tmp();
-                    f.line(format!("{m} = icmp eq i64 {type_id}, {id}"));
-                    f.line(format!("br i1 {m}, label %{body_l}, label %{next}"));
-                    f.start_block(&body_l);
-                    self.bind_error_pattern(f, args, &err, &fields);
-                }
-                PatternKind::Bind(name) => {
-                    let s = f.alloca(self, name);
-                    f.line(format!("store i64 {err}, ptr {s}"));
-                    f.scopes
-                        .last_mut()
-                        .unwrap()
-                        .insert(name.clone(), LocalVar { slot: s, lazy: false });
-                }
-                PatternKind::Wildcard => {}
-                _ => {
-                    self.unsupported(arm.pattern.span, "this catch pattern");
-                }
-            }
+            let body_l = self.label("armbody");
+            self.gen_catch_arm_test(f, &arm.pattern, &tag, &payload, &body_l, &next);
+            f.start_block(&body_l);
             let body_v = self.gen_expr(f, &arm.body);
             f.line(format!("store i64 {body_v}, ptr {slot}"));
             f.line(format!("br label %{cont}"));
@@ -1051,48 +1111,150 @@ impl<'a> Cg<'a> {
         out
     }
 
-    fn bind_error_pattern(
+    /// Test a catch arm against the failed value's tag and payload; on match
+    /// fall through to `ok` with bindings done, else branch to `fail`.
+    fn gen_catch_arm_test(
+        &mut self,
+        f: &mut FnCtx,
+        pat: &Pattern,
+        tag: &str,
+        payload: &str,
+        ok: &str,
+        fail: &str,
+    ) {
+        let tag_test = |cg: &mut Self, f: &mut FnCtx, name: &str, then_l: &str| -> bool {
+            let Some(id) = cg.tag_ids.get(name).copied() else {
+                cg.unsupported(pat.span, "this catch pattern");
+                f.line(format!("br label %{fail}"));
+                return false;
+            };
+            let m = cg.tmp();
+            f.line(format!("{m} = icmp eq i64 {tag}, {id}"));
+            f.line(format!("br i1 {m}, label %{then_l}, label %{fail}"));
+            f.start_block(then_l);
+            true
+        };
+        match &pat.kind {
+            PatternKind::Ctor { name, args, .. } => {
+                if let Some(fields) = self.struct_meta.get(name).cloned() {
+                    let bind_l = self.label("structpat");
+                    if !tag_test(self, f, name, &bind_l) {
+                        return;
+                    }
+                    self.bind_struct_fields(f, args, payload, &fields, 0);
+                    f.line(format!("br label %{ok}"));
+                } else if let Some(vmeta) = self.variant_meta.get(name).cloned() {
+                    let vtest_l = self.label("varianttag");
+                    if !tag_test(self, f, &vmeta.enum_name, &vtest_l) {
+                        return;
+                    }
+                    let vid = if vmeta.simple {
+                        payload.to_string()
+                    } else {
+                        self.load_slot_from_int(f, payload, 0)
+                    };
+                    let bind_l = self.label("variantpat");
+                    let m = self.tmp();
+                    f.line(format!("{m} = icmp eq i64 {vid}, {}", vmeta.id));
+                    f.line(format!("br i1 {m}, label %{bind_l}, label %{fail}"));
+                    f.start_block(&bind_l);
+                    self.bind_struct_fields(f, args, payload, &vmeta.fields, 1);
+                    f.line(format!("br label %{ok}"));
+                } else if self.enum_simple.contains_key(name) {
+                    // The bare enum name matches any of its variants.
+                    let _ = args;
+                    let bind_l = self.label("enumpat");
+                    if !tag_test(self, f, name, &bind_l) {
+                        return;
+                    }
+                    f.line(format!("br label %{ok}"));
+                } else {
+                    self.unsupported(pat.span, "this catch pattern");
+                    f.line(format!("br label %{fail}"));
+                }
+            }
+            PatternKind::TypedBind { ty, name, .. } => {
+                let bind_l = self.label("typedpat");
+                if !tag_test(self, f, ty, &bind_l) {
+                    return;
+                }
+                self.bind_local(f, name, payload);
+                f.line(format!("br label %{ok}"));
+            }
+            PatternKind::Int(n) => {
+                let val_l = self.label("intpat");
+                if !tag_test(self, f, "Int", &val_l) {
+                    return;
+                }
+                let m = self.tmp();
+                f.line(format!("{m} = icmp eq i64 {payload}, {n}"));
+                f.line(format!("br i1 {m}, label %{ok}, label %{fail}"));
+            }
+            PatternKind::Bool(b) => {
+                let val_l = self.label("boolpat");
+                if !tag_test(self, f, "Bool", &val_l) {
+                    return;
+                }
+                let m = self.tmp();
+                f.line(format!("{m} = icmp eq i64 {payload}, {}", *b as i64));
+                f.line(format!("br i1 {m}, label %{ok}, label %{fail}"));
+            }
+            PatternKind::Str(text) => {
+                let val_l = self.label("strpat");
+                if !tag_test(self, f, "String", &val_l) {
+                    return;
+                }
+                let lit = self.str_const(text);
+                let eq = self.tmp();
+                f.line(format!("{eq} = call i64 @rt_str_eq(i64 {payload}, i64 {lit})"));
+                let m = self.tmp();
+                f.line(format!("{m} = icmp ne i64 {eq}, 0"));
+                f.line(format!("br i1 {m}, label %{ok}, label %{fail}"));
+            }
+            PatternKind::Bind(name) => {
+                self.bind_local(f, name, payload);
+                f.line(format!("br label %{ok}"));
+            }
+            PatternKind::Wildcard => {
+                f.line(format!("br label %{ok}"));
+            }
+        }
+    }
+
+    fn bind_local(&mut self, f: &mut FnCtx, name: &str, value: &str) {
+        let s = f.alloca(self, name);
+        f.line(format!("store i64 {value}, ptr {s}"));
+        f.scopes
+            .last_mut()
+            .unwrap()
+            .insert(name.to_string(), LocalVar { slot: s, lazy: false });
+    }
+
+    /// Destructure a struct/variant pattern's bindings. `header` is the
+    /// number of leading non-field slots (1 for boxed enum variants).
+    fn bind_struct_fields(
         &mut self,
         f: &mut FnCtx,
         args: &CtorPatArgs,
-        err: &str,
+        base: &str,
         fields: &[String],
+        header: i64,
     ) {
         match args {
             CtorPatArgs::None => {}
-            CtorPatArgs::Positional(pats) if pats.len() == 1 => {
-                if let PatternKind::Bind(name) = &pats[0].kind {
-                    let s = f.alloca(self, name);
-                    f.line(format!("store i64 {err}, ptr {s}"));
-                    f.scopes
-                        .last_mut()
-                        .unwrap()
-                        .insert(name.clone(), LocalVar { slot: s, lazy: false });
-                }
-            }
             CtorPatArgs::Positional(pats) => {
                 for (i, pat) in pats.iter().enumerate() {
                     if let PatternKind::Bind(name) = &pat.kind {
-                        let v = self.load_slot_from_int(f, err, 1 + i as i64);
-                        let s = f.alloca(self, name);
-                        f.line(format!("store i64 {v}, ptr {s}"));
-                        f.scopes
-                            .last_mut()
-                            .unwrap()
-                            .insert(name.clone(), LocalVar { slot: s, lazy: false });
+                        let v = self.load_slot_from_int(f, base, header + i as i64);
+                        self.bind_local(f, &name.clone(), &v);
                     }
                 }
             }
             CtorPatArgs::Fields(names) => {
                 for (fname, _) in names {
                     if let Some(idx) = fields.iter().position(|x| x == fname) {
-                        let v = self.load_slot_from_int(f, err, 1 + idx as i64);
-                        let s = f.alloca(self, fname);
-                        f.line(format!("store i64 {v}, ptr {s}"));
-                        f.scopes
-                            .last_mut()
-                            .unwrap()
-                            .insert(fname.clone(), LocalVar { slot: s, lazy: false });
+                        let v = self.load_slot_from_int(f, base, header + idx as i64);
+                        self.bind_local(f, &fname.clone(), &v);
                     }
                 }
             }
@@ -1191,67 +1353,74 @@ impl<'a> Cg<'a> {
                     }
                 }
                 _ => {
-                    if let Some((id, fields)) = self.error_meta.get(name).cloned() {
-                        let type_id = self.load_slot_from_int(f, v, 0);
+                    if let Some(fields) = self.struct_meta.get(name).cloned() {
+                        // Nominal structs are statically typed: always match,
+                        // just destructure (fields start at slot 0).
+                        self.gen_destructure_test(f, args, v, &fields, 0, ok, fail);
+                    } else if let Some(vmeta) = self.variant_meta.get(name).cloned() {
+                        let vid = if vmeta.simple {
+                            v.to_string()
+                        } else {
+                            self.load_slot_from_int(f, v, 0)
+                        };
                         let c = self.tmp();
-                        let bind_l = self.label("errpat");
-                        f.line(format!("{c} = icmp eq i64 {type_id}, {id}"));
+                        let bind_l = self.label("variantpat");
+                        f.line(format!("{c} = icmp eq i64 {vid}, {}", vmeta.id));
                         f.line(format!("br i1 {c}, label %{bind_l}, label %{fail}"));
                         f.start_block(&bind_l);
-                        self.bind_error_pattern(f, args, v, &fields);
+                        self.gen_destructure_test(f, args, v, &vmeta.fields, 1, ok, fail);
+                    } else if self.enum_simple.contains_key(name) {
+                        // The bare enum name matches any of its variants.
                         f.line(format!("br label %{ok}"));
-                    } else if let Some(fields) = self.type_meta.get(name).cloned() {
-                        // Nominal structs are statically typed: always match,
-                        // just destructure.
-                        match args {
-                            CtorPatArgs::None => f.line(format!("br label %{ok}")),
-                            CtorPatArgs::Positional(pats) if pats.len() == 1 => {
-                                if let PatternKind::Bind(bname) = &pats[0].kind {
-                                    let s = f.alloca(self, bname);
-                                    f.line(format!("store i64 {v}, ptr {s}"));
-                                    f.scopes
-                                        .last_mut()
-                                        .unwrap()
-                                        .insert(bname.clone(), LocalVar { slot: s, lazy: false });
-                                    f.line(format!("br label %{ok}"));
-                                } else {
-                                    let inner = self.load_slot_from_int(f, v, 0);
-                                    self.gen_pattern_test(f, &pats[0], &inner, &CType::Int, ok, fail);
-                                }
-                            }
-                            CtorPatArgs::Positional(pats) => {
-                                // Chain sub-pattern tests.
-                                let mut cursor = self.label("sub");
-                                f.line(format!("br label %{cursor}"));
-                                for (i, sub) in pats.iter().enumerate() {
-                                    f.start_block(&cursor);
-                                    cursor = self.label("sub");
-                                    let field_v = self.load_slot_from_int(f, v, i as i64);
-                                    let target = if i + 1 == pats.len() { ok } else { &cursor };
-                                    self.gen_pattern_test(f, sub, &field_v, &CType::Int, target, fail);
-                                }
-                            }
-                            CtorPatArgs::Fields(names) => {
-                                for (fname, _) in names {
-                                    if let Some(idx) = fields.iter().position(|x| x == fname) {
-                                        let field_v = self.load_slot_from_int(f, v, idx as i64);
-                                        let s = f.alloca(self, fname);
-                                        f.line(format!("store i64 {field_v}, ptr {s}"));
-                                        f.scopes.last_mut().unwrap().insert(
-                                            fname.clone(),
-                                            LocalVar { slot: s, lazy: false },
-                                        );
-                                    }
-                                }
-                                f.line(format!("br label %{ok}"));
-                            }
-                        }
                     } else {
                         self.unsupported(pat.span, "this pattern");
                         f.line(format!("br label %{fail}"));
                     }
                 }
             },
+            PatternKind::TypedBind { name, .. } => {
+                // Statically typed: always matches, binds the whole value.
+                self.bind_local(f, name, v);
+                f.line(format!("br label %{ok}"));
+            }
+        }
+    }
+
+    /// Destructure positional/field sub-patterns of a matched constructor;
+    /// `header` is the number of leading non-field slots.
+    fn gen_destructure_test(
+        &mut self,
+        f: &mut FnCtx,
+        args: &CtorPatArgs,
+        v: &str,
+        fields: &[String],
+        header: i64,
+        ok: &str,
+        fail: &str,
+    ) {
+        match args {
+            CtorPatArgs::None => f.line(format!("br label %{ok}")),
+            CtorPatArgs::Positional(pats) => {
+                // Chain sub-pattern tests.
+                let mut cursor = self.label("sub");
+                f.line(format!("br label %{cursor}"));
+                for (i, sub) in pats.iter().enumerate() {
+                    f.start_block(&cursor);
+                    cursor = self.label("sub");
+                    let field_v = self.load_slot_from_int(f, v, header + i as i64);
+                    let target = if i + 1 == pats.len() { ok } else { &cursor };
+                    self.gen_pattern_test(f, sub, &field_v, &CType::Int, target, fail);
+                }
+            }
+            CtorPatArgs::Fields(names) => {
+                for (fname, _) in names {
+                    if let Some(idx) = fields.iter().position(|x| x == fname) {
+                        let field_v = self.load_slot_from_int(f, v, header + idx as i64);
+                        self.bind_local(f, &fname.clone(), &field_v);
+                    }
+                }
+                f.line(format!("br label %{ok}"));
+            }
         }
     }
 
@@ -1585,7 +1754,8 @@ impl<'a> Cg<'a> {
                 f.line(format!("br i1 {c}, label %{none_l}, label %{some_l}"));
                 f.start_block(&none_l);
                 let err = self.gen_expr(f, args[1]);
-                self.emit_failure(f, &err);
+                let err_cty = self.ctype_of(args[1]);
+                self.emit_fail_value(f, &err, &err_cty, args[1].span);
                 f.start_block(&some_l);
                 self.load_slot_from_int(f, &opt, 0)
             }

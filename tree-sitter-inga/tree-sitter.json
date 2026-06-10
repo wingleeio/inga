@@ -1,0 +1,30 @@
+{
+  "grammars": [
+    {
+      "name": "inga",
+      "camelcase": "Inga",
+      "scope": "source.inga",
+      "path": ".",
+      "file-types": [
+        "inga"
+      ],
+      "injection-regex": "^inga$"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT",
+    "description": "Tree-sitter grammar for the Inga language",
+    "links": {
+      "repository": "https://github.com/wingleeio/inga"
+    }
+  },
+  "bindings": {
+    "c": true,
+    "go": true,
+    "node": true,
+    "python": true,
+    "rust": true,
+    "swift": true
+  }
+}

@@ -58,6 +58,19 @@ pub jokerPrice :: (Int j) -> Int {
     }
 }
 
+// Which slot holds joker `j` (-1 when not owned).
+pub jokerSlot :: (jok, g, Int j) -> Int {
+    found = MutMap()
+    found.set(0, -1)
+    map(range(gv(g, "jokers")), (i) -> {
+        if gn(jok, i) == j {
+            found.set(0, i)
+        }
+        0
+    })
+    gn(found, 0)
+}
+
 pub hasJoker :: (jok, g, Int j) -> Bool {
     found = MutMap()
     map(range(gv(g, "jokers")), (i) -> {

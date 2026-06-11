@@ -79,6 +79,9 @@ pub removeSelected :: (hand, sel) {
 
 pub setupBlind :: (g, deck, hand, sel, av) {
     g.set("score", 0)
+    g.set("dispScore", 0)
+    g.set("anim", 0)
+    g.set("shake", 0)
     g.set("hands", 4)
     g.set("discards", 3)
     g.set("target", targetFor(gv(g, "ante"), gv(g, "blind")))
@@ -143,28 +146,45 @@ pub nextBlind :: (g, deck, hand, sel, av) {
     setupBlind(g, deck, hand, sel, av)
 }
 
-pub playHand :: (g, deck, hand, sel, jok, out, av) {
-    scoreSelected(hand, sel, jok, g, out)
-    if gn(out, 0) >= 0 && gv(g, "hands") > 0 {
-        gained = gn(out, 7) * gn(out, 8)
-        g.set("score", gv(g, "score") + gained)
-        g.set("lastType", gn(out, 0))
-        g.set("lastGain", gained)
-        g.set("popT", 60)
-        g.set("popVal", gained)
-        g.set("hands", gv(g, "hands") - 1)
-        removeSelected(hand, sel)
-        deal(g, deck, hand, av)
-        if gv(g, "score") >= gv(g, "target") {
-            g.set("money", gv(g, "money") + 3 + gv(g, "blind") + gv(g, "hands"))
-            if gv(g, "blind") == 2 && gv(g, "ante") == 8 {
-                g.set("phase", 3) // won the run
-            } else {
-                openShop(g)
-            }
-        } else if gv(g, "hands") == 0 {
-            g.set("phase", 2) // out of hands
+// Playing a hand kicks off the scoring choreography: the selected cards
+// move to the stage and each step (cards, then jokers) triggers in order.
+// `finishPlay` applies the result once the animation lands.
+pub playHand :: (g, hand, sel, jok, out, steps, av) {
+    nSteps = buildSteps(hand, sel, jok, g, out, steps)
+    if nSteps > 0 && gv(g, "hands") > 0 {
+        g.set("anim", 1)
+        g.set("animT", 0)
+        g.set("nSteps", nSteps)
+        g.set("pendType", gn(out, 0))
+        g.set("pendGain", gn(out, 7) * gn(out, 8))
+        map(range(8), (i) -> {
+            av.set(20 + i, 0)
+            0
+        })
+    }
+}
+
+pub finishPlay :: (g, deck, hand, sel, av) {
+    gained = gv(g, "pendGain")
+    g.set("anim", 0)
+    g.set("score", gv(g, "score") + gained)
+    g.set("lastType", gv(g, "pendType"))
+    g.set("lastGain", gained)
+    g.set("popT", 60)
+    g.set("popVal", gained)
+    g.set("hands", gv(g, "hands") - 1)
+    g.set("shake", 14)
+    removeSelected(hand, sel)
+    deal(g, deck, hand, av)
+    if gv(g, "score") >= gv(g, "target") {
+        g.set("money", gv(g, "money") + 3 + gv(g, "blind") + gv(g, "hands"))
+        if gv(g, "blind") == 2 && gv(g, "ante") == 8 {
+            g.set("phase", 3) // won the run
+        } else {
+            openShop(g)
         }
+    } else if gv(g, "hands") == 0 {
+        g.set("phase", 2) // out of hands
     }
 }
 

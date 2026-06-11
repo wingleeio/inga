@@ -216,8 +216,11 @@ fn cmd_check(args: &[String]) -> ExitCode {
                 continue;
             }
         };
-        let _ = &src;
-        let loaded = match load_program(Path::new(path)) {
+        // A library module (no `main`) is checked as part of the program
+        // that imports it; only this file's diagnostics are reported.
+        let entry = inga_core::modules::resolve_entry_for(Path::new(path), &src);
+        let entry_path = entry.as_deref().unwrap_or(Path::new(path));
+        let loaded = match load_program(entry_path) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("error: cannot read `{path}`: {e}");
@@ -226,7 +229,21 @@ fn cmd_check(args: &[String]) -> ExitCode {
             }
         };
         let (checked, mods) = check_loaded(loaded);
-        if print_diagnostics_modules(&mods, &checked.diagnostics) {
+        let this = std::fs::canonicalize(path).unwrap_or_else(|_| Path::new(path).to_path_buf());
+        let diags: Vec<Diagnostic> = checked
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                mods.iter()
+                    .find(|m| m.contains(d.span))
+                    .map(|m| {
+                        std::fs::canonicalize(&m.path).unwrap_or_else(|_| m.path.clone()) == this
+                    })
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        if print_diagnostics_modules(&mods, &diags) {
             failed = true;
         } else if checked.diagnostics.is_empty() {
             println!("{path}: ok");

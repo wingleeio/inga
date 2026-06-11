@@ -122,3 +122,59 @@ pub fn load_program_with(
 pub fn module_name(path: &Path) -> String {
     path.file_stem().and_then(|s| s.to_str()).unwrap_or("main").to_string()
 }
+
+/// Library modules are checked in the context of their program: if `path`
+/// does not define `main` and a sibling `.inga` file (transitively) imports
+/// it, return that sibling as the entry to load instead. Prefers siblings
+/// that define `main`.
+pub fn resolve_entry_for(path: &Path, src: &str) -> Option<PathBuf> {
+    let defines_main = |text: &str| {
+        text.lines().any(|l| {
+            let l = l.trim_start();
+            l.starts_with("main ::") || l.starts_with("pub main ::")
+        })
+    };
+    if defines_main(src) {
+        return None;
+    }
+    let target = module_name(path);
+    let dir = path.parent()?;
+    let mut candidates: Vec<(bool, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(dir).ok()? {
+        let sibling = entry.ok()?.path();
+        if sibling.extension().and_then(|e| e.to_str()) != Some("inga") || sibling == *path {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&sibling) else { continue };
+        // BFS over `use` names from the sibling, reading files in `dir`.
+        let mut seen = vec![module_name(&sibling)];
+        let mut queue: Vec<String> = use_names(&text);
+        let mut imports_target = false;
+        while let Some(name) = queue.pop() {
+            if seen.contains(&name) {
+                continue;
+            }
+            seen.push(name.clone());
+            if name == target {
+                imports_target = true;
+                break;
+            }
+            if let Ok(t) = std::fs::read_to_string(dir.join(format!("{name}.inga"))) {
+                queue.extend(use_names(&t));
+            }
+        }
+        if imports_target {
+            candidates.push((defines_main(&text), sibling));
+        }
+    }
+    candidates.sort_by_key(|(has_main, _)| !*has_main);
+    candidates.into_iter().next().map(|(_, p)| p)
+}
+
+fn use_names(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| l.trim_start().strip_prefix("use "))
+        .map(|n| n.trim().to_string())
+        .filter(|n| !STD_MODULES.contains(&n.as_str()))
+        .collect()
+}

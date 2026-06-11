@@ -36,6 +36,12 @@ pub dim :: (Int packed, Int keep) -> Int {
     rgb(packed / 65536 * keep / 255, packed / 256 % 256 * keep / 255, packed % 256 * keep / 255)
 }
 
+// Fake-rounded rectangle: two overlapping rects soften the corners.
+pub roundRect :: (Int x, Int y, Int w, Int h, Int r, Int g, Int b, Int a) {
+    Gfx.rect(x + 2, y, w - 4, h, r, g, b, a)
+    Gfx.rect(x, y + 2, w, h - 4, r, g, b, a)
+}
+
 pub textC :: (String s, Int x, Int y, Int size, Int packed) {
     Gfx.text(s, x, y, size, packed / 65536, packed / 256 % 256, packed % 256)
 }
@@ -67,7 +73,10 @@ pub button :: (String label, Int x, Int y, Int w, Int h, Bool enabled, Int packe
     } else {
         0
     }
-    Gfx.rect(x, y - lift, w, h, bg / 65536, bg / 256 % 256, bg % 256, 235)
+    Gfx.rect(x + 2, (y - lift) + 4, w, h, 8, 10, 14, 120) // drop shadow
+    roundRect(x, y - lift, w, h, bg / 65536, bg / 256 % 256, bg % 256, 245)
+    edge = dim(bg, 130)
+    Gfx.rect(x + 2, (y - lift) + h - 4, w - 4, 4, edge / 65536, edge / 256 % 256, edge % 256, 245)
     Gfx.rectLines(x, y - lift, w, h, 2, 15, 20, 25, 255)
     fg = if enabled {
         rgb(245, 245, 245)

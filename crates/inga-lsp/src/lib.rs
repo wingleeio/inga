@@ -34,21 +34,53 @@ use inga_core::Checked;
 /// the open file map 1:1.
 fn check_document(uri: &lsp_types::Url, src: &str, docs: &HashMap<Url, String>) -> Checked {
     let Ok(path) = uri.to_file_path() else { return check_single(src) };
-    let loaded = inga_core::modules::load_program_with(&path, src.to_string(), &mut |p| {
+    // A library module (no `main`) is checked in the context of the sibling
+    // program that imports it.
+    let entry = inga_core::modules::resolve_entry_for(&path, src).unwrap_or_else(|| path.clone());
+    let entry_src = if entry == path {
+        src.to_string()
+    } else {
+        std::fs::read_to_string(&entry).unwrap_or_default()
+    };
+    let this = path.canonicalize().unwrap_or_else(|_| path.clone());
+    let loaded = inga_core::modules::load_program_with(&entry, entry_src, &mut |p| {
         let abs = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        if abs == this {
+            return Some(src.to_string());
+        }
         Url::from_file_path(&abs)
             .ok()
             .and_then(|u| docs.get(&u).cloned())
             .or_else(|| std::fs::read_to_string(p).ok())
     });
     let (checked, modules) = inga_core::check_loaded(loaded);
-    // Only surface results that live in the entry module (base 0).
-    let entry_end = modules.first().map(|m| m.end).unwrap_or(u32::MAX);
+    // Surface only results that live in the open file, shifted back to its
+    // local span coordinates.
+    let module = modules
+        .iter()
+        .find(|m| std::fs::canonicalize(&m.path).unwrap_or_else(|_| m.path.clone()) == this);
+    let (base, end) = module.map(|m| (m.base, m.end)).unwrap_or((0, u32::MAX));
+    let inside = |s: inga_core::span::Span| s.start >= base && s.start <= end;
+    let shift =
+        |s: inga_core::span::Span| inga_core::span::Span::new(s.start - base, s.end - base);
     let mut checked = checked;
-    checked.diagnostics.retain(|d| d.span.start <= entry_end);
-    checked.info.hovers.retain(|(s, _)| s.start <= entry_end);
-    checked.info.defs.retain(|d| d.span.start <= entry_end);
-    checked.info.refs.retain(|(u, d)| u.start <= entry_end && d.start <= entry_end);
+    checked.diagnostics.retain(|d| inside(d.span));
+    for d in &mut checked.diagnostics {
+        d.span = shift(d.span);
+    }
+    checked.info.hovers.retain(|(s, _)| inside(*s));
+    for (s, _) in &mut checked.info.hovers {
+        *s = shift(*s);
+    }
+    checked.info.defs.retain(|d| inside(d.span));
+    for d in &mut checked.info.defs {
+        d.span = shift(d.span);
+    }
+    checked.info.refs.retain(|(u, d)| inside(*u) && inside(*d));
+    for (u, d) in &mut checked.info.refs {
+        *u = shift(*u);
+        *d = shift(*d);
+    }
     checked
 }
 use inga_core::diag::Severity;

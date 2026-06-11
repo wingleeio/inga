@@ -1037,3 +1037,23 @@ main :: () {
         "got: {errors:?}"
     );
 }
+
+#[test]
+fn stdlib_lists_strings_conversions() {
+    let out = run(r#"
+main :: () {
+    xs = [5, 1, 4, 2, 3]
+    println(filter(xs, (x) -> x >= 3), fold(xs, 0, (acc, x) -> acc + x))
+    println(at(xs, 2) |> getOrElse(-1), at(xs, 9) |> getOrElse(-1))
+    println(concat([1, 2], [3]), reverse([1, 2, 3]))
+    println(split("a,bb,ccc", ","), slice("hello world", 6, 11))
+    println(indexOf("hello", "ll"), indexOf("hello", "zz"), trim("  pad  "))
+    println(parseInt("42") |> getOrElse(0), parseInt("nope") |> getOrElse(-1))
+    println(toFloat(7) / 2.0, floor(3.9))
+}
+"#);
+    assert_eq!(
+        out,
+        "[5, 4, 3] 15\n4 -1\n[1, 2, 3] [3, 2, 1]\n[\"a\", \"bb\", \"ccc\"] world\n2 -1 pad\n42 -1\n3.5 3\n"
+    );
+}

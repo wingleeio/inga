@@ -2101,6 +2101,121 @@ impl<'a> Cg<'a> {
                 out
             }
             "map" if args.len() == 2 => return Some(self.gen_map_builtin(f, args, span)),
+            "filter" if args.len() == 2 => return Some(self.gen_filter_builtin(f, args, span)),
+            "fold" if args.len() == 3 => return Some(self.gen_fold_builtin(f, args, span)),
+            "at" if args.len() == 2 => {
+                let list = self.gen_expr(f, args[0]);
+                let idx = self.gen_expr(f, args[1]);
+                let n = self.load_slot_from_int(f, &list, 0);
+                let slot = f.fresh_slot(self);
+                f.line(format!("store i64 0, ptr {slot}"));
+                let (ok_l, done_l) = (self.label("at.ok"), self.label("at.done"));
+                let lo = self.tmp();
+                f.line(format!("{lo} = icmp sge i64 {idx}, 0"));
+                let hi = self.tmp();
+                f.line(format!("{hi} = icmp slt i64 {idx}, {n}"));
+                let both = self.tmp();
+                f.line(format!("{both} = and i1 {lo}, {hi}"));
+                f.line(format!("br i1 {both}, label %{ok_l}, label %{done_l}"));
+                f.start_block(&ok_l);
+                let p = self.tmp();
+                f.line(format!("{p} = inttoptr i64 {list} to ptr"));
+                let i1 = self.tmp();
+                f.line(format!("{i1} = add i64 {idx}, 1"));
+                let gep = self.tmp();
+                f.line(format!("{gep} = getelementptr i64, ptr {p}, i64 {i1}"));
+                let v = self.tmp();
+                f.line(format!("{v} = load i64, ptr {gep}"));
+                let rcty = self.ctype_of_span(span);
+                if let CType::Option(inner) = &rcty {
+                    self.dup_value(f, &v, &(**inner).clone());
+                }
+                let boxed = self.gen_alloc(f, 1);
+                self.store_slot(f, &boxed, 0, &v);
+                let bi = self.ptr_to_int(f, &boxed);
+                f.line(format!("store i64 {bi}, ptr {slot}"));
+                f.line(format!("br label %{done_l}"));
+                f.start_block(&done_l);
+                let out = self.tmp();
+                f.line(format!("{out} = load i64, ptr {slot}"));
+                self.pool_value(f, &out, &rcty);
+                out
+            }
+            "concat" if args.len() == 2 => {
+                let xs = self.gen_expr(f, args[0]);
+                let ys = self.gen_expr(f, args[1]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_list_concat(i64 {xs}, i64 {ys})"));
+                let rcty = self.ctype_of_span(span);
+                self.gen_dup_list_elems(f, &out, &rcty);
+                self.pool_value(f, &out, &rcty);
+                out
+            }
+            "reverse" if args.len() == 1 => {
+                let xs = self.gen_expr(f, args[0]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_list_reverse(i64 {xs})"));
+                let rcty = self.ctype_of_span(span);
+                self.gen_dup_list_elems(f, &out, &rcty);
+                self.pool_value(f, &out, &rcty);
+                out
+            }
+            "split" if args.len() == 2 => {
+                let s = self.gen_expr(f, args[0]);
+                let sep = self.gen_expr(f, args[1]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_str_split(i64 {s}, i64 {sep})"));
+                self.pool_value(f, &out, &CType::List(Box::new(CType::Str)));
+                out
+            }
+            "slice" if args.len() == 3 => {
+                let s = self.gen_expr(f, args[0]);
+                let a = self.gen_expr(f, args[1]);
+                let b = self.gen_expr(f, args[2]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_str_slice(i64 {s}, i64 {a}, i64 {b})"));
+                self.pool_value(f, &out, &CType::Str);
+                out
+            }
+            "indexOf" if args.len() == 2 => {
+                let s = self.gen_expr(f, args[0]);
+                let n = self.gen_expr(f, args[1]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_str_index_of(i64 {s}, i64 {n})"));
+                out
+            }
+            "trim" if args.len() == 1 => {
+                let s = self.gen_expr(f, args[0]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_str_trim(i64 {s})"));
+                self.pool_value(f, &out, &CType::Str);
+                out
+            }
+            "parseInt" if args.len() == 1 => {
+                let s = self.gen_expr(f, args[0]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_parse_int(i64 {s})"));
+                self.pool_value(f, &out, &CType::Option(Box::new(CType::Int)));
+                out
+            }
+            "toFloat" if args.len() == 1 => {
+                let n = self.gen_expr(f, args[0]);
+                let d = self.tmp();
+                f.line(format!("{d} = sitofp i64 {n} to double"));
+                let out = self.tmp();
+                f.line(format!("{out} = bitcast double {d} to i64"));
+                out
+            }
+            "floor" if args.len() == 1 => {
+                let v = self.gen_expr(f, args[0]);
+                let d = self.tmp();
+                f.line(format!("{d} = bitcast i64 {v} to double"));
+                let fl = self.tmp();
+                f.line(format!("{fl} = call double @llvm.floor.f64(double {d})"));
+                let out = self.tmp();
+                f.line(format!("{out} = fptosi double {fl} to i64"));
+                out
+            }
             "encode" | "decode" => {
                 self.unsupported(span, &format!("`{name}` (runtime JSON)"));
                 "0".to_string()
@@ -2211,6 +2326,151 @@ impl<'a> Cg<'a> {
         f.start_block(&done);
         let out = self.tmp();
         f.line(format!("{out} = load i64, ptr {result_slot}"));
+        out
+    }
+
+    /// Bump every element's refcount after a runtime list copy (the new
+    /// list owns its own references).
+    fn gen_dup_list_elems(&mut self, f: &mut FnCtx, list: &str, list_cty: &CType) {
+        let CType::List(inner) = list_cty else { return };
+        if !self.is_rc(&(**inner).clone()) {
+            return;
+        }
+        let i_slot = f.fresh_slot(self);
+        f.line(format!("store i64 0, ptr {i_slot}"));
+        let n = self.load_slot_from_int(f, list, 0);
+        let (loop_l, body_l, done_l) =
+            (self.label("dup.loop"), self.label("dup.body"), self.label("dup.done"));
+        f.line(format!("br label %{loop_l}"));
+        f.start_block(&loop_l);
+        let i = self.tmp();
+        f.line(format!("{i} = load i64, ptr {i_slot}"));
+        let c = self.tmp();
+        f.line(format!("{c} = icmp slt i64 {i}, {n}"));
+        f.line(format!("br i1 {c}, label %{body_l}, label %{done_l}"));
+        f.start_block(&body_l);
+        let p = self.tmp();
+        f.line(format!("{p} = inttoptr i64 {list} to ptr"));
+        let i1 = self.tmp();
+        f.line(format!("{i1} = add i64 {i}, 1"));
+        let gep = self.tmp();
+        f.line(format!("{gep} = getelementptr i64, ptr {p}, i64 {i1}"));
+        let e = self.tmp();
+        f.line(format!("{e} = load i64, ptr {gep}"));
+        let t = self.tmp();
+        f.line(format!("{t} = call i64 @rt_dup(i64 {e})"));
+        f.line(format!("store i64 {i1}, ptr {i_slot}"));
+        f.line(format!("br label %{loop_l}"));
+        f.start_block(&done_l);
+    }
+
+    fn gen_filter_builtin(&mut self, f: &mut FnCtx, args: &[&Expr], span: Span) -> String {
+        let list = self.gen_expr(f, args[0]);
+        let func = self.gen_expr(f, args[1]);
+        let result_cty = self.ctype_of_span(span);
+        let elem_cty = match &result_cty {
+            CType::List(t) => (**t).clone(),
+            _ => CType::Int,
+        };
+        let n = self.load_slot_from_int(f, &list, 0);
+        // Over-allocate to the input length; the kept count becomes the len.
+        let bytes = self.tmp();
+        f.line(format!("{bytes} = add i64 {n}, 1"));
+        let bytes8 = self.tmp();
+        f.line(format!("{bytes8} = mul i64 {bytes}, 8"));
+        let out_p = self.tmp();
+        f.line(format!("{out_p} = call ptr @rt_alloc(i64 {bytes8})"));
+        let i_slot = f.fresh_slot(self);
+        let k_slot = f.fresh_slot(self);
+        f.line(format!("store i64 0, ptr {i_slot}"));
+        f.line(format!("store i64 0, ptr {k_slot}"));
+        let (loop_l, body_l, keep_l, next_l, done_l) = (
+            self.label("flt.loop"),
+            self.label("flt.body"),
+            self.label("flt.keep"),
+            self.label("flt.next"),
+            self.label("flt.done"),
+        );
+        f.line(format!("br label %{loop_l}"));
+        f.start_block(&loop_l);
+        let i = self.tmp();
+        f.line(format!("{i} = load i64, ptr {i_slot}"));
+        let c = self.tmp();
+        f.line(format!("{c} = icmp slt i64 {i}, {n}"));
+        f.line(format!("br i1 {c}, label %{body_l}, label %{done_l}"));
+        f.start_block(&body_l);
+        let i1 = self.tmp();
+        f.line(format!("{i1} = add i64 {i}, 1"));
+        let src_p = self.tmp();
+        f.line(format!("{src_p} = inttoptr i64 {list} to ptr"));
+        let gep = self.tmp();
+        f.line(format!("{gep} = getelementptr i64, ptr {src_p}, i64 {i1}"));
+        let item = self.tmp();
+        f.line(format!("{item} = load i64, ptr {gep}"));
+        let keep = self.gen_closure_call(f, &func, &[item.clone()], &CType::Bool);
+        let kc = self.tmp();
+        f.line(format!("{kc} = icmp ne i64 {keep}, 0"));
+        f.line(format!("br i1 {kc}, label %{keep_l}, label %{next_l}"));
+        f.start_block(&keep_l);
+        self.dup_value(f, &item, &elem_cty);
+        let k = self.tmp();
+        f.line(format!("{k} = load i64, ptr {k_slot}"));
+        let k1 = self.tmp();
+        f.line(format!("{k1} = add i64 {k}, 1"));
+        let ogep = self.tmp();
+        f.line(format!("{ogep} = getelementptr i64, ptr {out_p}, i64 {k1}"));
+        f.line(format!("store i64 {item}, ptr {ogep}"));
+        f.line(format!("store i64 {k1}, ptr {k_slot}"));
+        f.line(format!("br label %{next_l}"));
+        f.start_block(&next_l);
+        f.line(format!("store i64 {i1}, ptr {i_slot}"));
+        f.line(format!("br label %{loop_l}"));
+        f.start_block(&done_l);
+        let kfinal = self.tmp();
+        f.line(format!("{kfinal} = load i64, ptr {k_slot}"));
+        f.line(format!("store i64 {kfinal}, ptr {out_p}"));
+        let out = self.ptr_to_int(f, &out_p);
+        self.pool_value(f, &out, &result_cty);
+        out
+    }
+
+    fn gen_fold_builtin(&mut self, f: &mut FnCtx, args: &[&Expr], span: Span) -> String {
+        let list = self.gen_expr(f, args[0]);
+        let init = self.gen_expr(f, args[1]);
+        let func = self.gen_expr(f, args[2]);
+        let acc_cty = self.ctype_of_span(span);
+        let n = self.load_slot_from_int(f, &list, 0);
+        let acc_slot = f.fresh_slot(self);
+        let i_slot = f.fresh_slot(self);
+        f.line(format!("store i64 {init}, ptr {acc_slot}"));
+        f.line(format!("store i64 0, ptr {i_slot}"));
+        let (loop_l, body_l, done_l) =
+            (self.label("fold.loop"), self.label("fold.body"), self.label("fold.done"));
+        f.line(format!("br label %{loop_l}"));
+        f.start_block(&loop_l);
+        let i = self.tmp();
+        f.line(format!("{i} = load i64, ptr {i_slot}"));
+        let c = self.tmp();
+        f.line(format!("{c} = icmp slt i64 {i}, {n}"));
+        f.line(format!("br i1 {c}, label %{body_l}, label %{done_l}"));
+        f.start_block(&body_l);
+        let p = self.tmp();
+        f.line(format!("{p} = inttoptr i64 {list} to ptr"));
+        let i1 = self.tmp();
+        f.line(format!("{i1} = add i64 {i}, 1"));
+        let gep = self.tmp();
+        f.line(format!("{gep} = getelementptr i64, ptr {p}, i64 {i1}"));
+        let item = self.tmp();
+        f.line(format!("{item} = load i64, ptr {gep}"));
+        let acc = self.tmp();
+        f.line(format!("{acc} = load i64, ptr {acc_slot}"));
+        let next = self.gen_closure_call(f, &func, &[acc, item], &acc_cty);
+        f.line(format!("store i64 {next}, ptr {acc_slot}"));
+        f.line(format!("store i64 {i1}, ptr {i_slot}"));
+        f.line(format!("br label %{loop_l}"));
+        f.start_block(&done_l);
+        let out = self.tmp();
+        f.line(format!("{out} = load i64, ptr {acc_slot}"));
         out
     }
 
@@ -2772,6 +3032,14 @@ declare i64 @rt_dup(i64)
 declare i64 @rt_release(i64)
 declare void @rt_free(i64)
 declare i64 @rt_range(i64)
+declare i64 @rt_str_split(i64, i64)
+declare i64 @rt_str_slice(i64, i64, i64)
+declare i64 @rt_str_index_of(i64, i64)
+declare i64 @rt_str_trim(i64)
+declare i64 @rt_parse_int(i64)
+declare i64 @rt_list_concat(i64, i64)
+declare i64 @rt_list_reverse(i64)
+declare double @llvm.floor.f64(double)
 declare i64 @rt_random(i64)
 declare void @rt_gfx_run(i64, i64, i64, i64)
 declare void @rt_gfx_clear(i64, i64, i64)

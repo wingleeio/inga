@@ -1836,6 +1836,136 @@ impl<'a> Checker<'a> {
                 }
                 Type::Unit
             }
+            "filter" => {
+                if !check_arity(self, 2) {
+                    return Some(Type::Unknown);
+                }
+                let list_ty = self.check_expr(args[0]);
+                let a = self.ctx.fresh();
+                self.unify_at(&Type::List(Box::new(a.clone())), &list_ty, args[0].span, "filter input");
+                let func_ty = self.check_expr(args[1]);
+                self.add_func_arg_rows(&func_ty);
+                let expected_f = Type::Func(Rc::new(FuncType {
+                    params: vec![a.clone()],
+                    ret: Type::Bool,
+                    errors: BTreeSet::new(),
+                    caps: BTreeSet::new(),
+                }));
+                self.unify_at(&expected_f, &func_ty, args[1].span, "filter predicate");
+                Type::List(Box::new(a))
+            }
+            "fold" => {
+                if !check_arity(self, 3) {
+                    return Some(Type::Unknown);
+                }
+                let list_ty = self.check_expr(args[0]);
+                let a = self.ctx.fresh();
+                self.unify_at(&Type::List(Box::new(a.clone())), &list_ty, args[0].span, "fold input");
+                let acc = self.check_expr(args[1]);
+                let func_ty = self.check_expr(args[2]);
+                self.add_func_arg_rows(&func_ty);
+                let expected_f = Type::Func(Rc::new(FuncType {
+                    params: vec![acc.clone(), a],
+                    ret: acc.clone(),
+                    errors: BTreeSet::new(),
+                    caps: BTreeSet::new(),
+                }));
+                self.unify_at(&expected_f, &func_ty, args[2].span, "fold function");
+                acc
+            }
+            "at" => {
+                if !check_arity(self, 2) {
+                    return Some(Type::Unknown);
+                }
+                let list_ty = self.check_expr(args[0]);
+                let a = self.ctx.fresh();
+                self.unify_at(&Type::List(Box::new(a.clone())), &list_ty, args[0].span, "at input");
+                let i_ty = self.check_expr(args[1]);
+                self.unify_at(&Type::Int, &i_ty, args[1].span, "index");
+                Type::Option(Box::new(a))
+            }
+            "concat" => {
+                if !check_arity(self, 2) {
+                    return Some(Type::Unknown);
+                }
+                let a = self.ctx.fresh();
+                let want = Type::List(Box::new(a));
+                let x = self.check_expr(args[0]);
+                self.unify_at(&want, &x, args[0].span, "concat input");
+                let y = self.check_expr(args[1]);
+                self.unify_at(&want, &y, args[1].span, "concat input");
+                want
+            }
+            "reverse" => {
+                if !check_arity(self, 1) {
+                    return Some(Type::Unknown);
+                }
+                let a = self.ctx.fresh();
+                let want = Type::List(Box::new(a));
+                let x = self.check_expr(args[0]);
+                self.unify_at(&want, &x, args[0].span, "reverse input");
+                want
+            }
+            "split" => {
+                if !check_arity(self, 2) {
+                    return Some(Type::List(Box::new(Type::Str)));
+                }
+                for arg in args {
+                    let t = self.check_expr(arg);
+                    self.unify_at(&Type::Str, &t, arg.span, "split argument");
+                }
+                Type::List(Box::new(Type::Str))
+            }
+            "slice" => {
+                if !check_arity(self, 3) {
+                    return Some(Type::Str);
+                }
+                let s = self.check_expr(args[0]);
+                self.unify_at(&Type::Str, &s, args[0].span, "slice input");
+                for arg in &args[1..] {
+                    let t = self.check_expr(arg);
+                    self.unify_at(&Type::Int, &t, arg.span, "slice bound");
+                }
+                Type::Str
+            }
+            "indexOf" => {
+                if !check_arity(self, 2) {
+                    return Some(Type::Int);
+                }
+                for arg in args {
+                    let t = self.check_expr(arg);
+                    self.unify_at(&Type::Str, &t, arg.span, "indexOf argument");
+                }
+                Type::Int
+            }
+            "trim" => {
+                if check_arity(self, 1) {
+                    let t = self.check_expr(args[0]);
+                    self.unify_at(&Type::Str, &t, args[0].span, "trim input");
+                }
+                Type::Str
+            }
+            "parseInt" => {
+                if check_arity(self, 1) {
+                    let t = self.check_expr(args[0]);
+                    self.unify_at(&Type::Str, &t, args[0].span, "parseInt input");
+                }
+                Type::Option(Box::new(Type::Int))
+            }
+            "toFloat" => {
+                if check_arity(self, 1) {
+                    let t = self.check_expr(args[0]);
+                    self.unify_at(&Type::Int, &t, args[0].span, "toFloat input");
+                }
+                Type::Float
+            }
+            "floor" => {
+                if check_arity(self, 1) {
+                    let t = self.check_expr(args[0]);
+                    self.unify_at(&Type::Float, &t, args[0].span, "floor input");
+                }
+                Type::Int
+            }
             "len" => {
                 if check_arity(self, 1) {
                     let ty = self.check_expr(args[0]);
@@ -2798,7 +2928,7 @@ pub fn builtin_doc(name: &str) -> Option<&'static str> {
     builtin_completions().into_iter().find(|(n, _)| *n == name).map(|(_, doc)| doc)
 }
 
-const BUILTIN_NAMES: [&str; 18] = [
+const BUILTIN_NAMES: [&str; 30] = [
     "println",
     "print",
     "show",
@@ -2811,6 +2941,18 @@ const BUILTIN_NAMES: [&str; 18] = [
     "ignoreFailure",
     "sleep",
     "len",
+    "filter",
+    "fold",
+    "at",
+    "concat",
+    "reverse",
+    "split",
+    "slice",
+    "indexOf",
+    "trim",
+    "parseInt",
+    "toFloat",
+    "floor",
     "MutMap",
     "Some",
     "nowMillis",
@@ -2835,6 +2977,18 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("ignoreFailure", "ignoreFailure(lazy action) -> Unit — swallow the error channel"),
         ("sleep", "sleep(duration) -> Unit"),
         ("len", "len(stringOrList) -> Int"),
+        ("filter", "filter(list, predicate) -> [a]"),
+        ("fold", "fold(list, init, f) -> b — f(acc, item) left to right"),
+        ("at", "at(list, index) -> a? — None when out of bounds"),
+        ("concat", "concat(xs, ys) -> [a]"),
+        ("reverse", "reverse(list) -> [a]"),
+        ("split", "split(s, separator) -> [String]"),
+        ("slice", "slice(s, start, end) -> String — by character index"),
+        ("indexOf", "indexOf(s, needle) -> Int — -1 when absent"),
+        ("trim", "trim(s) -> String"),
+        ("parseInt", "parseInt(s) -> Int?"),
+        ("toFloat", "toFloat(n) -> Float"),
+        ("floor", "floor(x) -> Int"),
         ("MutMap", "MutMap() -> MutMap<k, v> — built-in mutable map"),
         ("nowMillis", "nowMillis() -> Int — monotonic milliseconds since program start"),
         ("nowMicros", "nowMicros() -> Int — monotonic microseconds since program start"),

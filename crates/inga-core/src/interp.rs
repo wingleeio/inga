@@ -1091,6 +1091,150 @@ impl<'a> Interp<'a> {
                 Ok(_) => self.fatal(args[0].span, "`sleep` needs a Duration"),
                 Err(e) => Err(e),
             },
+            "filter" if args.len() == 2 => {
+                let list = match self.eval(args[0], scope) {
+                    Ok(Value::List(items)) => items,
+                    Ok(other) => {
+                        return Some(self.fatal(args[0].span, format!("`filter` works on lists, found {}", show(&other))))
+                    }
+                    Err(e) => return Some(Err(e)),
+                };
+                let f = match self.eval(args[1], scope) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+                let mut out = Vec::new();
+                for item in list.iter() {
+                    match self.apply(f.clone(), vec![item.clone()], span) {
+                        Ok(Value::Bool(true)) => out.push(item.clone()),
+                        Ok(_) => {}
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                Ok(Value::List(Rc::new(out)))
+            }
+            "fold" if args.len() == 3 => {
+                let list = match self.eval(args[0], scope) {
+                    Ok(Value::List(items)) => items,
+                    Ok(other) => {
+                        return Some(self.fatal(args[0].span, format!("`fold` works on lists, found {}", show(&other))))
+                    }
+                    Err(e) => return Some(Err(e)),
+                };
+                let mut acc = match self.eval(args[1], scope) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+                let f = match self.eval(args[2], scope) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+                for item in list.iter() {
+                    acc = match self.apply(f.clone(), vec![acc, item.clone()], span) {
+                        Ok(v) => v,
+                        Err(e) => return Some(Err(e)),
+                    };
+                }
+                Ok(acc)
+            }
+            "at" if args.len() == 2 => match (self.eval(args[0], scope), self.eval(args[1], scope)) {
+                (Ok(Value::List(items)), Ok(Value::Int(i))) => {
+                    Ok(match usize::try_from(i).ok().and_then(|i| items.get(i)) {
+                        Some(v) => Value::Option(Some(Rc::new(v.clone()))),
+                        None => Value::Option(None),
+                    })
+                }
+                (Err(e), _) | (_, Err(e)) => Err(e),
+                _ => self.fatal(span, "`at` takes (list, Int)"),
+            },
+            "concat" if args.len() == 2 => {
+                match (self.eval(args[0], scope), self.eval(args[1], scope)) {
+                    (Ok(Value::List(xs)), Ok(Value::List(ys))) => {
+                        let mut out = xs.as_ref().clone();
+                        out.extend(ys.iter().cloned());
+                        Ok(Value::List(Rc::new(out)))
+                    }
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                    _ => self.fatal(span, "`concat` takes two lists"),
+                }
+            }
+            "reverse" if args.len() == 1 => match self.eval(args[0], scope) {
+                Ok(Value::List(items)) => {
+                    let mut out = items.as_ref().clone();
+                    out.reverse();
+                    Ok(Value::List(Rc::new(out)))
+                }
+                Ok(other) => self.fatal(args[0].span, format!("`reverse` works on lists, found {}", show(&other))),
+                Err(e) => Err(e),
+            },
+            "split" if args.len() == 2 => {
+                match (self.eval(args[0], scope), self.eval(args[1], scope)) {
+                    (Ok(Value::Str(s)), Ok(Value::Str(sep))) => {
+                        let parts: Vec<Value> = if sep.is_empty() {
+                            s.chars().map(|c| Value::Str(Rc::new(c.to_string()))).collect()
+                        } else {
+                            s.split(sep.as_str())
+                                .map(|p| Value::Str(Rc::new(p.to_string())))
+                                .collect()
+                        };
+                        Ok(Value::List(Rc::new(parts)))
+                    }
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                    _ => self.fatal(span, "`split` takes (String, String)"),
+                }
+            }
+            "slice" if args.len() == 3 => {
+                let s = self.eval(args[0], scope);
+                let a = self.eval(args[1], scope);
+                let b = self.eval(args[2], scope);
+                match (s, a, b) {
+                    (Ok(Value::Str(s)), Ok(Value::Int(a)), Ok(Value::Int(b))) => {
+                        let chars: Vec<char> = s.chars().collect();
+                        let n = chars.len() as i64;
+                        let lo = a.clamp(0, n) as usize;
+                        let hi = b.clamp(0, n) as usize;
+                        let out: String = if lo < hi { chars[lo..hi].iter().collect() } else { String::new() };
+                        Ok(Value::Str(Rc::new(out)))
+                    }
+                    (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+                    _ => self.fatal(span, "`slice` takes (String, Int, Int)"),
+                }
+            }
+            "indexOf" if args.len() == 2 => {
+                match (self.eval(args[0], scope), self.eval(args[1], scope)) {
+                    (Ok(Value::Str(s)), Ok(Value::Str(needle))) => {
+                        Ok(Value::Int(match s.find(needle.as_str()) {
+                            Some(byte) => s[..byte].chars().count() as i64,
+                            None => -1,
+                        }))
+                    }
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                    _ => self.fatal(span, "`indexOf` takes (String, String)"),
+                }
+            }
+            "trim" if args.len() == 1 => match self.eval(args[0], scope) {
+                Ok(Value::Str(s)) => Ok(Value::Str(Rc::new(s.trim().to_string()))),
+                Ok(_) => self.fatal(args[0].span, "`trim` takes a String"),
+                Err(e) => Err(e),
+            },
+            "parseInt" if args.len() == 1 => match self.eval(args[0], scope) {
+                Ok(Value::Str(s)) => Ok(match s.trim().parse::<i64>() {
+                    Ok(n) => Value::Option(Some(Rc::new(Value::Int(n)))),
+                    Err(_) => Value::Option(None),
+                }),
+                Ok(_) => self.fatal(args[0].span, "`parseInt` takes a String"),
+                Err(e) => Err(e),
+            },
+            "toFloat" if args.len() == 1 => match self.eval(args[0], scope) {
+                Ok(Value::Int(n)) => Ok(Value::Float(n as f64)),
+                Ok(_) => self.fatal(args[0].span, "`toFloat` takes an Int"),
+                Err(e) => Err(e),
+            },
+            "floor" if args.len() == 1 => match self.eval(args[0], scope) {
+                Ok(Value::Float(x)) => Ok(Value::Int(x.floor() as i64)),
+                Ok(_) => self.fatal(args[0].span, "`floor` takes a Float"),
+                Err(e) => Err(e),
+            },
             "len" if args.len() == 1 => match self.eval(args[0], scope) {
                 Ok(Value::Str(s)) => Ok(Value::Int(s.chars().count() as i64)),
                 Ok(Value::List(items)) => Ok(Value::Int(items.len() as i64)),

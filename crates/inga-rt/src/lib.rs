@@ -216,6 +216,111 @@ pub extern "C" fn rt_free(v: i64) {
     }
 }
 
+// ---- strings / lists ------------------------------------------------------------
+
+fn make_str(bytes: &[u8]) -> i64 {
+    let p = rt_alloc(8 + bytes.len() as i64);
+    unsafe {
+        *(p as *mut i64) = bytes.len() as i64;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.add(8), bytes.len());
+    }
+    p as i64
+}
+
+fn make_list(items: &[i64]) -> i64 {
+    let p = rt_alloc(8 * (1 + items.len()) as i64) as *mut i64;
+    unsafe {
+        *p = items.len() as i64;
+        for (i, v) in items.iter().enumerate() {
+            *p.add(1 + i) = *v;
+        }
+    }
+    p as i64
+}
+
+#[no_mangle]
+pub extern "C" fn rt_str_split(s: i64, sep: i64) -> i64 {
+    let (s, sep) = unsafe {
+        (
+            std::str::from_utf8_unchecked(str_bytes(s)),
+            std::str::from_utf8_unchecked(str_bytes(sep)),
+        )
+    };
+    let parts: Vec<i64> = if sep.is_empty() {
+        s.chars().map(|c| make_str(c.to_string().as_bytes())).collect()
+    } else {
+        s.split(sep).map(|p| make_str(p.as_bytes())).collect()
+    };
+    make_list(&parts)
+}
+
+#[no_mangle]
+pub extern "C" fn rt_str_slice(s: i64, a: i64, b: i64) -> i64 {
+    let s = unsafe { std::str::from_utf8_unchecked(str_bytes(s)) };
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len() as i64;
+    let lo = a.clamp(0, n) as usize;
+    let hi = b.clamp(0, n) as usize;
+    let out: String = if lo < hi { chars[lo..hi].iter().collect() } else { String::new() };
+    make_str(out.as_bytes())
+}
+
+#[no_mangle]
+pub extern "C" fn rt_str_index_of(s: i64, needle: i64) -> i64 {
+    let (s, needle) = unsafe {
+        (
+            std::str::from_utf8_unchecked(str_bytes(s)),
+            std::str::from_utf8_unchecked(str_bytes(needle)),
+        )
+    };
+    match s.find(needle) {
+        Some(byte) => s[..byte].chars().count() as i64,
+        None => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_str_trim(s: i64) -> i64 {
+    let s = unsafe { std::str::from_utf8_unchecked(str_bytes(s)) };
+    make_str(s.trim().as_bytes())
+}
+
+#[no_mangle]
+pub extern "C" fn rt_parse_int(s: i64) -> i64 {
+    let s = unsafe { std::str::from_utf8_unchecked(str_bytes(s)) };
+    match s.trim().parse::<i64>() {
+        Ok(n) => {
+            let p = rt_alloc(8) as *mut i64;
+            unsafe { *p = n };
+            p as i64
+        }
+        Err(_) => 0,
+    }
+}
+
+unsafe fn list_items<'a>(l: i64) -> &'a [i64] {
+    let p = l as *const i64;
+    std::slice::from_raw_parts(p.add(1), *p as usize)
+}
+
+#[no_mangle]
+pub extern "C" fn rt_list_concat(xs: i64, ys: i64) -> i64 {
+    unsafe {
+        let mut out: Vec<i64> = list_items(xs).to_vec();
+        out.extend_from_slice(list_items(ys));
+        make_list(&out)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_list_reverse(xs: i64) -> i64 {
+    unsafe {
+        let mut out: Vec<i64> = list_items(xs).to_vec();
+        out.reverse();
+        make_list(&out)
+    }
+}
+
 // ---- strings -------------------------------------------------------------------
 
 unsafe fn str_bytes<'a>(s: i64) -> &'a [u8] {

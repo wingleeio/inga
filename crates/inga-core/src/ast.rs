@@ -318,6 +318,59 @@ pub enum UnOp {
     Not,
 }
 
+/// Spans of self-calls in tail position: the block's trailing expression,
+/// recursing through if/match/catch arms and nested blocks. Provide bodies
+/// are excluded (arena scopes run cleanup after their body). Both backends
+/// turn these calls into jumps (tail-call elimination).
+pub fn collect_tail_spans(
+    block: &Block,
+    name: &str,
+    out: &mut std::collections::HashSet<(u32, u32)>,
+) {
+    if let Some(Stmt::Expr(e)) = block.stmts.last() {
+        tail_expr(e, name, out);
+    }
+}
+
+fn tail_expr(expr: &Expr, name: &str, out: &mut std::collections::HashSet<(u32, u32)>) {
+    match &expr.kind {
+        ExprKind::Call { callee, .. } => {
+            if let ExprKind::Var(n) = &callee.kind {
+                if n == name {
+                    out.insert((expr.span.start, expr.span.end));
+                }
+            }
+        }
+        ExprKind::Pipe { target, .. } => match target {
+            PipeTarget::Call { callee, .. } => {
+                if let ExprKind::Var(n) = &callee.kind {
+                    if n == name {
+                        out.insert((expr.span.start, expr.span.end));
+                    }
+                }
+            }
+            PipeTarget::Catch { arms, .. } => {
+                for arm in arms {
+                    tail_expr(&arm.body, name, out);
+                }
+            }
+        },
+        ExprKind::If { then_block, else_branch, .. } => {
+            collect_tail_spans(then_block, name, out);
+            if let Some(e) = else_branch {
+                tail_expr(e, name, out);
+            }
+        }
+        ExprKind::Match { arms, .. } => {
+            for arm in arms {
+                tail_expr(&arm.body, name, out);
+            }
+        }
+        ExprKind::Block(block) => collect_tail_spans(block, name, out),
+        _ => {}
+    }
+}
+
 pub fn is_upper(name: &str) -> bool {
     name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
 }

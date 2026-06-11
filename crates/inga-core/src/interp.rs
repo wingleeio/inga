@@ -51,6 +51,9 @@ pub enum Value<'a> {
     Service(Rc<ServiceInstance<'a>>),
     /// Unevaluated `lazy` argument.
     Thunk(Rc<ThunkVal<'a>>),
+    /// Internal: a self-tail-call's arguments, unwound to `call_func`'s
+    /// trampoline (never observable by programs).
+    TailArgs(&'a FuncDecl, Vec<Value<'a>>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -142,6 +145,8 @@ pub struct Interp<'a> {
     impls: HashMap<&'a str, &'a ImplDecl>,
     /// Field order for struct constructors, by name.
     struct_fields: HashMap<&'a str, Vec<&'a str>>,
+    /// Self-tail-call spans (per function), turned into trampoline bounces.
+    tail_spans: std::collections::HashSet<(u32, u32)>,
     /// Variant name -> (owning enum, field order).
     variants: HashMap<&'a str, (&'a str, Vec<&'a str>)>,
     /// Dynamically scoped provided services.
@@ -203,10 +208,12 @@ impl<'a> Interp<'a> {
         let mut struct_fields: HashMap<&str, Vec<&str>> = HashMap::new();
         let mut variants: HashMap<&str, (&str, Vec<&str>)> = HashMap::new();
         struct_fields.insert(DECODE_ERROR, vec!["message"]);
+        let mut tail_spans = std::collections::HashSet::new();
         for decl in &program.decls {
             match decl {
                 Decl::Func(d) => {
                     funcs.insert(d.name.as_str(), d);
+                    collect_tail_spans(&d.body, &d.name, &mut tail_spans);
                 }
                 Decl::Impl(d) => {
                     impls.insert(d.name.as_str(), d);
@@ -233,6 +240,7 @@ impl<'a> Interp<'a> {
             impls,
             struct_fields,
             variants,
+            tail_spans,
             provided: RefCell::new(Vec::new()),
             output: RefCell::new(None),
             start: std::time::Instant::now(),
@@ -271,11 +279,19 @@ impl<'a> Interp<'a> {
                 ),
             );
         }
-        let scope = Scope::root();
-        for (param, arg) in decl.sig.params.iter().zip(args) {
-            scope.set(&param.name, arg);
+        let mut args = args;
+        loop {
+            let scope = Scope::root();
+            for (param, arg) in decl.sig.params.iter().zip(args) {
+                scope.set(&param.name, arg);
+            }
+            match self.eval_block(&decl.body, &scope)? {
+                Value::TailArgs(next, next_args) if std::ptr::eq(next, decl) => {
+                    args = next_args;
+                }
+                value => return Ok(value),
+            }
         }
-        self.eval_block(&decl.body, &scope)
     }
 
     fn eval_block(&self, block: &'a Block, parent: &Scope<'a>) -> EvalResult<'a> {
@@ -613,6 +629,29 @@ impl<'a> Interp<'a> {
                 if let Some((enum_name, fields)) = self.variants.get(name.as_str()) {
                     let (enum_name, fields) = (*enum_name, fields.clone());
                     return self.construct(name, &fields, args, Some(enum_name), span, scope);
+                }
+            }
+        }
+        // A self-call in tail position bounces back to call_func's
+        // trampoline instead of growing the Rust stack.
+        if self.tail_spans.contains(&(span.start, span.end)) {
+            if let ExprKind::Var(name) = &callee.kind {
+                if scope.get(name).is_none() {
+                    if let Some(decl) = self.funcs.get(name.as_str()).copied() {
+                        let mut tail_args = Vec::with_capacity(args.len());
+                        for (i, arg) in args.iter().enumerate() {
+                            let lazy = decl.sig.params.get(i).is_some_and(|p| p.lazy);
+                            if lazy {
+                                tail_args.push(Value::Thunk(Rc::new(ThunkVal {
+                                    expr: arg,
+                                    env: scope.clone(),
+                                })));
+                            } else {
+                                tail_args.push(self.eval(arg, scope)?);
+                            }
+                        }
+                        return Ok(Value::TailArgs(decl, tail_args));
+                    }
                 }
             }
         }
@@ -1562,6 +1601,7 @@ pub fn show(value: &Value) -> String {
         Value::Closure { .. } => "<lambda>".to_string(),
         Value::Service(instance) => format!("<service {}>", instance.service),
         Value::Thunk(_) => "<lazy>".to_string(),
+        Value::TailArgs(..) => "<tail-call>".to_string(),
     }
 }
 

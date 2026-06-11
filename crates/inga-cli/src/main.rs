@@ -70,7 +70,19 @@ fn cmd_run(args: &[String]) -> ExitCode {
     if print_diagnostics_modules(&mods, &checked.diagnostics) {
         return ExitCode::FAILURE;
     }
-    match interp::run(&checked.program, "main") {
+    // The tree-walker's depth is bounded by the host stack; run it on a
+    // thread with a large one so deep recursion behaves like the native
+    // backend (which eliminates self-tail calls outright).
+    let program = &checked.program;
+    let result = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(1 << 29)
+            .spawn_scoped(scope, move || interp::run(program, "main"))
+            .expect("spawn interpreter thread")
+            .join()
+            .expect("interpreter thread panicked")
+    });
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             match err.span {

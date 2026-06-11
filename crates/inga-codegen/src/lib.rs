@@ -315,16 +315,28 @@ impl<'a> Cg<'a> {
         }
         let param_ctys =
             self.info.facts.func_params.get(&decl.name).cloned().unwrap_or_default();
+        let mut param_slots = Vec::new();
         for (i, param) in decl.sig.params.iter().enumerate() {
             let reg = format!("%p.{}", param.name);
             params.push(format!("i64 {reg}"));
             let slot = f.alloca(self, &param.name);
             f.line(format!("store i64 {reg}, ptr {slot}"));
+            param_slots.push(slot.clone());
             let cty = param_ctys.get(i).cloned().unwrap_or(CType::Int);
             f.scopes
                 .last_mut()
                 .unwrap()
                 .insert(param.name.clone(), LocalVar { slot, lazy: param.lazy, cty });
+        }
+        // Self-tail calls become jumps (tail-call elimination).
+        let mut tails = std::collections::HashSet::new();
+        collect_tail_spans(&decl.body, &decl.name, &mut tails);
+        if !tails.is_empty() {
+            f.line("br label %tco.head".to_string());
+            f.start_block("tco.head");
+            let lazies: Vec<bool> = decl.sig.params.iter().map(|p| p.lazy).collect();
+            f.tco = Some((decl.name.clone(), param_slots, lazies));
+            f.tail_spans = tails;
         }
         let value = self.gen_block(&mut f, &decl.body);
         let ret_cty = self.info.facts.func_ret.get(&decl.name).cloned();
@@ -788,6 +800,25 @@ impl<'a> Cg<'a> {
         args: &[&Expr],
         span: Span,
     ) -> String {
+        if let Some((tco_name, slots, lazies)) = f.tco.clone() {
+            if tco_name == decl.name && f.tail_spans.contains(&(span.start, span.end)) {
+                // Evaluate every argument first (they may read the current
+                // parameters), then store and jump back to the loop head.
+                let mut vals = Vec::with_capacity(args.len());
+                for (i, arg) in args.iter().enumerate() {
+                    let lazy = lazies.get(i).copied().unwrap_or(false);
+                    let v = if lazy { self.gen_thunk(f, arg) } else { self.gen_expr(f, arg) };
+                    vals.push(v);
+                }
+                for (slot, v) in slots.iter().zip(vals.iter()) {
+                    f.line(format!("store i64 {v}, ptr {slot}"));
+                }
+                f.line("br label %tco.head".to_string());
+                let dead = self.label("tco.dead");
+                f.start_block(&dead);
+                return "0".to_string();
+            }
+        }
         let row = self.func_row(&decl.name);
         let fallible = self.func_fallible(decl);
         let mut call_args = Vec::new();
@@ -2518,6 +2549,11 @@ struct FnCtx {
     /// Slots are zeroed at entry (branches may skip the producing store)
     /// and drained — dropped — on every return path.
     pool: Vec<(String, String)>,
+    /// Self-tail-call elimination: (function name, param slots, lazies) and
+    /// the spans of calls in tail position. A flagged self-call compiles to
+    /// "store args into the param slots, jump back to the loop head".
+    tco: Option<(String, Vec<String>, Vec<bool>)>,
+    tail_spans: std::collections::HashSet<(u32, u32)>,
     fallible: bool,
     needs_propagate: bool,
     needs_panic: bool,
@@ -2533,6 +2569,8 @@ impl FnCtx {
             evidence: HashMap::new(),
             handlers: Vec::new(),
             pool: Vec::new(),
+            tco: None,
+            tail_spans: std::collections::HashSet::new(),
             fallible,
             needs_propagate: false,
             needs_panic: false,

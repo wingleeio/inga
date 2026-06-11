@@ -22,6 +22,8 @@ pub enum Type {
     Option(Box<Type>),
     /// `[T]`
     List(Box<Type>),
+    /// `(T, U)`
+    Tuple(Vec<Type>),
     /// A `struct` declaration (nominal record).
     Named(String),
     /// An `enum` declaration (nominal sum type).
@@ -76,6 +78,7 @@ impl TypeCtx {
         match ty {
             Type::Option(t) => Type::Option(Box::new(self.apply(&t))),
             Type::List(t) => Type::List(Box::new(self.apply(&t))),
+            Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| self.apply(t)).collect()),
             Type::MutMap(k, v) => {
                 Type::MutMap(Box::new(self.apply(&k)), Box::new(self.apply(&v)))
             }
@@ -93,6 +96,7 @@ impl TypeCtx {
         match self.resolve(ty) {
             Type::Var(v) => v == var,
             Type::Option(t) | Type::List(t) => self.occurs(var, &t),
+            Type::Tuple(ts) => ts.iter().any(|t| self.occurs(var, t)),
             Type::MutMap(k, v) => self.occurs(var, &k) || self.occurs(var, &v),
             Type::Func(f) => {
                 f.params.iter().any(|p| self.occurs(var, p)) || self.occurs(var, &f.ret)
@@ -122,6 +126,15 @@ impl TypeCtx {
             (_, Type::Var(_)) => self.unify(&b, &a),
             (Type::Option(x), Type::Option(y)) | (Type::List(x), Type::List(y)) => {
                 self.unify(x, y)
+            }
+            (Type::Tuple(xs), Type::Tuple(ys)) => {
+                if xs.len() != ys.len() {
+                    return Err((a.clone(), b.clone()));
+                }
+                for (x, y) in xs.iter().zip(ys.iter()) {
+                    self.unify(x, y)?;
+                }
+                Ok(())
             }
             (Type::MutMap(k1, v1), Type::MutMap(k2, v2)) => {
                 self.unify(k1, k2)?;
@@ -161,6 +174,10 @@ impl TypeCtx {
                 }
             }
             Type::List(t) => format!("[{}]", self.render(&t, names)),
+            Type::Tuple(ts) => {
+                let inner: Vec<String> = ts.iter().map(|t| self.render(t, names)).collect();
+                format!("({})", inner.join(", "))
+            }
             Type::Named(n) | Type::Enum(n) | Type::Service(n) => n,
             Type::Tag(n) => format!("Type<{n}>"),
             Type::MutMap(k, v) => {

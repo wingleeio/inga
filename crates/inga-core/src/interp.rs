@@ -36,6 +36,8 @@ pub enum Value<'a> {
     Struct { name: Rc<String>, fields: Rc<Vec<(String, Value<'a>)>> },
     /// An `enum` variant value.
     Enum { enum_name: Rc<String>, variant: Rc<String>, fields: Rc<Vec<(String, Value<'a>)>> },
+    /// A tuple value.
+    Tuple(Rc<Vec<Value<'a>>>),
     /// A type name used as a value (`decode(raw, User)`).
     Tag(Rc<String>),
     Schedule(ScheduleVal),
@@ -358,6 +360,40 @@ impl<'a> Interp<'a> {
                 Ok(Value::Str(Rc::new(out)))
             }
             ExprKind::Var(name) => self.eval_var(name, expr.span, scope),
+            ExprKind::Tuple(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.eval(item, scope)?);
+                }
+                Ok(Value::Tuple(Rc::new(values)))
+            }
+            ExprKind::TupleIndex { recv, index, index_span } => {
+                let value = self.eval(recv, scope)?;
+                match &value {
+                    Value::Tuple(items) => match usize::try_from(*index).ok().and_then(|i| items.get(i)) {
+                        Some(v) => Ok(v.clone()),
+                        None => self.fatal(*index_span, format!("tuple has no element {index}")),
+                    },
+                    other => self.fatal(*index_span, format!("{} is not a tuple", show(other))),
+                }
+            }
+            ExprKind::RecordUpdate { name, name_span, base, fields } => {
+                let base_value = self.eval(base, scope)?;
+                let Value::Struct { name: vname, fields: vfields } = &base_value else {
+                    return self.fatal(*name_span, "record update needs a struct value");
+                };
+                let mut updated = vfields.as_ref().clone();
+                for (fname, fspan, value) in fields {
+                    let v = self.eval(value, scope)?;
+                    match updated.iter_mut().find(|(f, _)| f == fname) {
+                        Some(slot) => slot.1 = v,
+                        None => {
+                            return self.fatal(*fspan, format!("`{name}` has no field `{fname}`"));
+                        }
+                    }
+                }
+                Ok(Value::Struct { name: vname.clone(), fields: Rc::new(updated) })
+            }
             ExprKind::List(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
@@ -1569,6 +1605,13 @@ impl<'a> Interp<'a> {
             (PatternKind::Int(p), Value::Int(n)) => p == n,
             (PatternKind::Str(p), Value::Str(s)) => p == s.as_str(),
             (PatternKind::Bool(p), Value::Bool(b)) => p == b,
+            (PatternKind::Tuple(pats), Value::Tuple(items)) => {
+                pats.len() == items.len()
+                    && pats
+                        .iter()
+                        .zip(items.iter())
+                        .all(|(p, v)| self.match_pattern(p, v, scope))
+            }
             (PatternKind::TypedBind { ty, name, .. }, v) => {
                 if type_matches(ty, v) {
                     scope.set(name, v.clone());
@@ -1663,6 +1706,9 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::List(xs), Value::List(ys)) => {
             xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| values_equal(x, y))
         }
+        (Value::Tuple(xs), Value::Tuple(ys)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| values_equal(x, y))
+        }
         (Value::Struct { name: n1, fields: f1 }, Value::Struct { name: n2, fields: f2 }) => {
             n1 == n2
                 && f1.len() == f2.len()
@@ -1710,6 +1756,10 @@ pub fn show(value: &Value) -> String {
         Value::List(items) => {
             let inner: Vec<String> = items.iter().map(show).collect();
             format!("[{}]", inner.join(", "))
+        }
+        Value::Tuple(items) => {
+            let inner: Vec<String> = items.iter().map(show).collect();
+            format!("({})", inner.join(", "))
         }
         Value::Struct { name, fields } => {
             let inner: Vec<String> =

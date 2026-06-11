@@ -105,6 +105,10 @@ struct Cg<'a> {
     str_consts: HashMap<Vec<u8>, String>,
     /// Memoized drop-glue symbols, keyed by a canonical type key.
     drop_syms: HashMap<String, String>,
+    /// Runtime type-descriptor registry (structs/enums by index); the
+    /// table is handed to rt_types_init at startup.
+    type_descs: Vec<String>,
+    type_desc_idx: HashMap<String, usize>,
     tmp: u32,
     label: u32,
     errors: Vec<Diagnostic>,
@@ -126,6 +130,8 @@ impl<'a> Cg<'a> {
             functions: String::new(),
             str_consts: HashMap::new(),
             drop_syms: HashMap::new(),
+            type_descs: Vec::new(),
+            type_desc_idx: HashMap::new(),
             tmp: 0,
             label: 0,
             errors: Vec::new(),
@@ -285,9 +291,13 @@ impl<'a> Cg<'a> {
             }
         }
         // C entry point. The checker guarantees `main` has empty rows, so it
-        // is infallible and takes no evidence.
-        self.functions.push_str(
-            "define i32 @main() {\nentry:\n  call i64 @ing.fn.main()\n  ret i32 0\n}\n\n",
+        // is infallible and takes no evidence. The type-descriptor table is
+        // registered first (show/==/encode/copy interpret it).
+        let table = self.type_descs.join("\n");
+        let table_const = self.str_const(&table);
+        let _ = write!(
+            self.functions,
+            "define i32 @main() {{\nentry:\n  call void @rt_types_init(i64 {table_const})\n  call i64 @ing.fn.main()\n  ret i32 0\n}}\n\n"
         );
     }
 
@@ -482,6 +492,63 @@ impl<'a> Cg<'a> {
             ExprKind::Bool(b) => if *b { "1" } else { "0" }.to_string(),
             ExprKind::Str(pieces) => self.gen_interp(f, pieces, expr.span),
             ExprKind::Var(name) => self.gen_var(f, name, expr.span),
+            ExprKind::Tuple(items) => {
+                let ptr = self.gen_alloc(f, items.len() as i64);
+                for (i, item) in items.iter().enumerate() {
+                    let v = self.gen_expr(f, item);
+                    let icty = self.ctype_of(item);
+                    self.dup_value(f, &v, &icty);
+                    self.store_slot(f, &ptr, i as i64, &v);
+                }
+                let out = self.ptr_to_int(f, &ptr);
+                let cty = self.ctype_of(expr);
+                self.pool_value(f, &out, &cty);
+                out
+            }
+            ExprKind::TupleIndex { recv, index, .. } => {
+                let v = self.gen_expr(f, recv);
+                self.load_slot_from_int(f, &v, *index)
+            }
+            ExprKind::RecordUpdate { name, base, fields, .. } => {
+                let decl_fields = self.struct_meta.get(name).cloned().unwrap_or_default();
+                let fctys = self
+                    .info
+                    .facts
+                    .struct_fields
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default();
+                let b = self.gen_expr(f, base);
+                let ptr = self.gen_alloc(f, decl_fields.len() as i64);
+                // Copy every field (taking a reference), then overwrite.
+                for i in 0..decl_fields.len() {
+                    let v = self.load_slot_from_int(f, &b, i as i64);
+                    if let Some(cty) = fctys.get(i) {
+                        self.dup_value(f, &v, &cty.clone());
+                    }
+                    self.store_slot(f, &ptr, i as i64, &v);
+                }
+                let out_int = self.ptr_to_int(f, &ptr);
+                for (fname, _, value) in fields {
+                    if let Some(i) = decl_fields.iter().position(|x| x == fname) {
+                        // Release the copied original before overwriting.
+                        let old = self.load_slot_from_int(f, &out_int, i as i64);
+                        if let Some(cty) = fctys.get(i) {
+                            if let Some(sym) = self.drop_fn(&cty.clone()) {
+                                f.line(format!("call void {sym}(i64 {old})"));
+                            }
+                        }
+                        let v = self.gen_expr(f, value);
+                        let vcty = self.ctype_of(value);
+                        self.dup_value(f, &v, &vcty);
+                        self.store_slot(f, &ptr, i as i64, &v);
+                    } else {
+                        let _ = self.gen_expr(f, value);
+                    }
+                }
+                self.pool_value(f, &out_int, &CType::Struct(name.clone()));
+                out_int
+            }
             ExprKind::List(items) => {
                 let ptr = self.gen_alloc(f, 1 + items.len() as i64);
                 self.store_slot(f, &ptr, 0, &items.len().to_string());
@@ -615,6 +682,7 @@ impl<'a> Cg<'a> {
     /// The `!` row tag for a static type, if values of it can be failed.
     fn tag_of_ctype(cty: &CType) -> Option<&str> {
         match cty {
+            CType::Tuple(_) => None,
             CType::Struct(n) | CType::Enum(n) => Some(n),
             CType::Int => Some("Int"),
             CType::Float => Some("Float"),
@@ -1087,6 +1155,30 @@ impl<'a> Cg<'a> {
         let l = self.gen_expr(f, lhs);
         let r = self.gen_expr(f, rhs);
 
+        // Structural equality for composite shapes (the interpreter's
+        // semantics) via the descriptor interpreter.
+        if matches!(op, BinOp::Eq | BinOp::Ne)
+            && matches!(
+                lty,
+                CType::Option(_)
+                    | CType::List(_)
+                    | CType::Tuple(_)
+                    | CType::Struct(_)
+                    | CType::Enum(_)
+                    | CType::Schedule
+            )
+        {
+            let desc = self.desc_const(&lty);
+            let eq = self.tmp();
+            f.line(format!("{eq} = call i64 @rt_eq_desc(i64 {l}, i64 {r}, i64 {desc})"));
+            if op == BinOp::Eq {
+                return eq;
+            }
+            let out = self.tmp();
+            f.line(format!("{out} = xor i64 {eq}, 1"));
+            return out;
+        }
+
         if lty == CType::Float {
             return self.gen_float_binary(f, op, &l, &r, span);
         }
@@ -1247,17 +1339,20 @@ impl<'a> Cg<'a> {
     }
 
     fn to_display_str(&mut self, f: &mut FnCtx, v: &str, cty: &CType, span: Span) -> String {
+        let _ = span;
         let call = match cty {
             CType::Str => return v.to_string(),
             CType::Int => "rt_int_to_str",
             CType::Bool => "rt_bool_to_str",
             CType::Duration => "rt_duration_to_str",
             CType::Float => "rt_float_to_str",
-            CType::List(inner) if **inner == CType::Int => "rt_show_list_int",
-            CType::List(inner) if **inner == CType::Str => "rt_show_list_str",
             _ => {
-                self.unsupported(span, "showing this value type");
-                return self.str_const("?");
+                // Everything else goes through the descriptor interpreter.
+                let desc = self.desc_const(cty);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_display_desc(i64 {v}, i64 {desc})"));
+                self.pool_value(f, &out, &CType::Str);
+                return out;
             }
         };
         let out = self.tmp();
@@ -1417,6 +1512,10 @@ impl<'a> Cg<'a> {
             }
             PatternKind::Wildcard => {
                 f.line(format!("br label %{ok}"));
+            }
+            PatternKind::Tuple(_) => {
+                // Tuples cannot be failed; the checker already rejected this.
+                f.line(format!("br label %{fail}"));
             }
         }
     }
@@ -1584,6 +1683,25 @@ impl<'a> Cg<'a> {
                 // Statically typed: always matches, binds the whole value.
                 self.bind_local(f, name, v);
                 f.line(format!("br label %{ok}"));
+            }
+            PatternKind::Tuple(pats) => {
+                let elem_ctys: Vec<CType> = match vty {
+                    CType::Tuple(ts) => ts.clone(),
+                    _ => vec![CType::Int; pats.len()],
+                };
+                let mut cursor = self.label("tup");
+                f.line(format!("br label %{cursor}"));
+                for (i, sub) in pats.iter().enumerate() {
+                    f.start_block(&cursor);
+                    cursor = self.label("tup");
+                    let elem = self.load_slot_from_int(f, v, i as i64);
+                    let ecty = elem_ctys.get(i).cloned().unwrap_or(CType::Int);
+                    let target = if i + 1 == pats.len() { ok } else { &cursor };
+                    self.gen_pattern_test(f, sub, &elem, &ecty, target, fail);
+                }
+                if pats.is_empty() {
+                    f.line(format!("br label %{ok}"));
+                }
             }
         }
     }
@@ -1949,6 +2067,16 @@ impl<'a> Cg<'a> {
             "show" if args.len() == 1 => {
                 let cty = self.ctype_of(args[0]);
                 let v = self.gen_expr(f, args[0]);
+                if !matches!(
+                    cty,
+                    CType::Str | CType::Int | CType::Bool | CType::Duration | CType::Float
+                ) {
+                    let desc = self.desc_const(&cty);
+                    let out = self.tmp();
+                    f.line(format!("{out} = call i64 @rt_show_desc(i64 {v}, i64 {desc})"));
+                    self.pool_value(f, &out, &CType::Str);
+                    return Some(out);
+                }
                 if cty == CType::Str {
                     // show quotes strings.
                     let q = self.str_const("\"");
@@ -2605,6 +2733,90 @@ impl<'a> Cg<'a> {
         self.info.expr_types.get(&(span.start, span.end)).cloned().unwrap_or(CType::Int)
     }
 
+    /// Serialize a value type for the runtime descriptor interpreter
+    /// (show / == / encode / decode / deep copy share it).
+    fn value_desc(&mut self, cty: &CType) -> String {
+        match cty {
+            CType::Int => "i".into(),
+            CType::Float => "f".into(),
+            CType::Bool => "b".into(),
+            CType::Str => "s".into(),
+            CType::Unit => "u".into(),
+            CType::Duration => "d".into(),
+            CType::Schedule => "h".into(),
+            CType::Func | CType::Tag(_) | CType::Service(_) => "F".into(),
+            CType::MutMap(..) => "M".into(),
+            CType::Option(t) => format!("O{}", self.value_desc(t)),
+            CType::List(t) => format!("L{}", self.value_desc(t)),
+            CType::Tuple(ts) => {
+                let inner: Vec<String> = ts.iter().map(|t| self.value_desc(t)).collect();
+                format!("T{}{}", ts.len(), inner.join(""))
+            }
+            CType::Struct(n) | CType::Enum(n) => {
+                format!("#{};", self.register_type(n))
+            }
+        }
+    }
+
+    fn register_type(&mut self, name: &str) -> usize {
+        if let Some(idx) = self.type_desc_idx.get(name) {
+            return *idx;
+        }
+        let idx = self.type_descs.len();
+        self.type_desc_idx.insert(name.to_string(), idx);
+        self.type_descs.push(String::new()); // reserve (recursive types)
+        let line = if let Some(fields) = self.struct_meta.get(name).cloned() {
+            let ctys = self
+                .info
+                .facts
+                .struct_fields
+                .get(name)
+                .cloned()
+                .unwrap_or_default();
+            let mut body = String::new();
+            for (i, fname) in fields.iter().enumerate() {
+                let desc = ctys
+                    .get(i)
+                    .map(|c| self.value_desc(&c.clone()))
+                    .unwrap_or_else(|| "?".into());
+                body.push_str(&format!("{fname}:{desc};"));
+            }
+            format!("S{name}{{{body}}}")
+        } else {
+            let variants = self
+                .info
+                .facts
+                .enum_variants
+                .get(name)
+                .cloned()
+                .unwrap_or_default();
+            let mut body = String::new();
+            for (i, (vname, fctys)) in variants.iter().enumerate() {
+                if i > 0 {
+                    body.push(';');
+                }
+                body.push_str(vname);
+                if !fctys.is_empty() {
+                    body.push('(');
+                    for (j, fcty) in fctys.iter().enumerate() {
+                        let desc = self.value_desc(&fcty.clone());
+                        body.push_str(&format!("f{j}:{desc};"));
+                    }
+                    body.push(')');
+                }
+            }
+            format!("E{name}{{{body}}}")
+        };
+        self.type_descs[idx] = line;
+        idx
+    }
+
+    /// A descriptor string constant for a type, as an i64 operand.
+    fn desc_const(&mut self, cty: &CType) -> String {
+        let desc = self.value_desc(cty);
+        self.str_const(&desc)
+    }
+
     /// Canonical key for memoizing drop glue per type shape.
     fn ckey(cty: &CType) -> String {
         match cty {
@@ -2616,6 +2828,10 @@ impl<'a> Cg<'a> {
             CType::Duration => "d".into(),
             CType::Schedule => "h".into(),
             CType::Option(t) => format!("o{}", Self::ckey(t)),
+            CType::Tuple(ts) => {
+                let inner: Vec<String> = ts.iter().map(Self::ckey).collect();
+                format!("t{}_{}", ts.len(), inner.join(""))
+            }
             CType::List(t) => format!("l{}", Self::ckey(t)),
             CType::Struct(n) => format!("S{n}"),
             CType::Enum(n) => format!("E{n}"),
@@ -2692,6 +2908,30 @@ impl<'a> Cg<'a> {
                     Some(child) => self.emit_list_drop_glue(&sym, &child),
                     None => self.emit_drop_glue(&sym, ""),
                 }
+                Some(sym)
+            }
+            CType::Tuple(ts) => {
+                let key = Self::ckey(cty);
+                if let Some(sym) = self.drop_syms.get(&key) {
+                    return Some(sym.clone());
+                }
+                let sym = format!("@ing.drop.{}", self.drop_syms.len());
+                self.drop_syms.insert(key, sym.clone());
+                let elems = ts.clone();
+                let mut body = String::new();
+                let mut loaded = false;
+                for (i, ecty) in elems.iter().enumerate() {
+                    if let Some(child) = self.drop_fn(ecty) {
+                        if !loaded {
+                            body.push_str("  %p = inttoptr i64 %v to ptr\n");
+                            loaded = true;
+                        }
+                        body.push_str(&format!(
+                            "  %f{i}.p = getelementptr i64, ptr %p, i64 {i}\n  %f{i} = load i64, ptr %f{i}.p\n  call void {child}(i64 %f{i})\n"
+                        ));
+                    }
+                }
+                self.emit_drop_glue(&sym, &body);
                 Some(sym)
             }
             CType::Struct(n) => {
@@ -2938,6 +3178,12 @@ fn is_pure_simple(expr: &Expr) -> bool {
 fn collect_vars(expr: &Expr, visit: &mut impl FnMut(&str)) {
     match &expr.kind {
         ExprKind::Var(name) => visit(name),
+        ExprKind::Tuple(items) => items.iter().for_each(|e| collect_vars(e, visit)),
+        ExprKind::TupleIndex { recv, .. } => collect_vars(recv, visit),
+        ExprKind::RecordUpdate { base, fields, .. } => {
+            collect_vars(base, visit);
+            fields.iter().for_each(|(_, _, e)| collect_vars(e, visit));
+        }
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => {}
         ExprKind::Str(pieces) => {
             for p in pieces {
@@ -3046,6 +3292,11 @@ declare i64 @rt_parse_int(i64)
 declare i64 @rt_list_concat(i64, i64)
 declare i64 @rt_list_reverse(i64)
 declare double @llvm.floor.f64(double)
+declare void @rt_types_init(i64)
+declare i64 @rt_show_desc(i64, i64)
+declare i64 @rt_display_desc(i64, i64)
+declare i64 @rt_eq_desc(i64, i64, i64)
+declare i64 @rt_copy_desc(i64, i64)
 declare i64 @rt_random(i64)
 declare void @rt_gfx_run(i64, i64, i64, i64)
 declare void @rt_gfx_clear(i64, i64, i64)

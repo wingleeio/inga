@@ -1096,3 +1096,63 @@ main :: () {
         "got: {errors:?}"
     );
 }
+
+// ---- tuples / record update / exhaustiveness -------------------------------------
+
+#[test]
+fn tuples_construct_index_match() {
+    let out = run(r#"
+minMax :: ([Int] xs) -> (Int, Int) {
+    fold(xs, (9999, -9999), (acc, x) -> {
+        lo = if x < acc.0 { x } else { acc.0 }
+        hi = if x > acc.1 { x } else { acc.1 }
+        (lo, hi)
+    })
+}
+
+main :: () {
+    pair = (1, "two")
+    println(pair.0, pair.1, pair)
+    bounds = minMax([5, 2, 9, 4])
+    match bounds {
+        (2, hi) -> println("lo two, hi ${hi}")
+        (lo, hi) -> println("${lo}..${hi}")
+    }
+    println((1, 2) == (1, 2), (1, 2) == (1, 3))
+}
+"#);
+    assert_eq!(out, "1 two (1, \"two\")\nlo two, hi 9\ntrue false\n");
+}
+
+#[test]
+fn record_update_copies_and_overrides() {
+    let out = run(r#"
+struct User = { Int id, String name, Int score }
+
+main :: () {
+    u = User(7, "Ada", 10)
+    promoted = User { ..u, score: u.score + 5, name: "Ada L" }
+    println(promoted, u.score)
+}
+"#);
+    assert_eq!(out, "User(id: 7, name: \"Ada L\", score: 15) 10\n");
+}
+
+#[test]
+fn match_must_be_exhaustive() {
+    let errors = check_errors(r#"
+enum Signal = Go | Stop { String why }
+
+main :: () {
+    s = Go
+    n = match s {
+        Go -> 1
+    }
+    println(n)
+}
+"#);
+    assert!(
+        errors.iter().any(|e| e.contains("not exhaustive") && e.contains("`Stop`")),
+        "got: {errors:?}"
+    );
+}

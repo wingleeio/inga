@@ -580,6 +580,8 @@ impl<'a> Parser<'a> {
                 } else if params.len() == 1 {
                     // `(T)` — grouping, e.g. `((Int) -> Int)?`.
                     params.pop().unwrap()
+                } else if params.len() >= 2 {
+                    TypeExpr::Tuple(params, start.to(self.prev_span()))
                 } else {
                     return None;
                 }
@@ -930,6 +932,16 @@ impl<'a> Parser<'a> {
         loop {
             if self.at(&TokenKind::Dot) || self.continue_past_newlines(|k| *k == TokenKind::Dot) {
                 self.bump();
+                if let TokenKind::Int(index) = self.peek().kind {
+                    let index_span = self.peek().span;
+                    self.bump();
+                    let span = expr.span.to(index_span);
+                    expr = Expr {
+                        kind: ExprKind::TupleIndex { recv: Box::new(expr), index, index_span },
+                        span,
+                    };
+                    continue;
+                }
                 let (name, name_span) = self.expect_ident("a field or method name");
                 if self.at(&TokenKind::LParen) {
                     let args = self.parse_args();
@@ -1009,6 +1021,45 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Ident(name) => {
                 self.bump();
+                // `User { ..base, field: value }` — record update (the `..`
+                // disambiguates from blocks and patterns).
+                if is_upper(&name)
+                    && self.at(&TokenKind::LBrace)
+                    && self.nth(1).kind == TokenKind::Dot
+                    && self.nth(2).kind == TokenKind::Dot
+                {
+                    self.bump(); // {
+                    self.bump(); // .
+                    self.bump(); // .
+                    let base = self.parse_expr();
+                    let mut fields = Vec::new();
+                    while self.at(&TokenKind::Comma) {
+                        self.bump();
+                        self.skip_newlines();
+                        if self.at(&TokenKind::RBrace) {
+                            break;
+                        }
+                        let (fname, fspan) = self.expect_ident("a field name");
+                        if fname == "<error>" {
+                            break;
+                        }
+                        self.expect(&TokenKind::Colon, "`:`");
+                        self.skip_newlines();
+                        let value = self.parse_expr();
+                        fields.push((fname, fspan, value));
+                        self.skip_newlines();
+                    }
+                    self.expect(&TokenKind::RBrace, "`}`");
+                    return Expr {
+                        kind: ExprKind::RecordUpdate {
+                            name,
+                            name_span: start,
+                            base: Box::new(base),
+                            fields,
+                        },
+                        span: start.to(self.prev_span()),
+                    };
+                }
                 Expr { kind: ExprKind::Var(name), span: start }
             }
             TokenKind::LBracket => {
@@ -1036,6 +1087,24 @@ impl<'a> Parser<'a> {
                 self.skip_newlines();
                 let expr = self.parse_expr();
                 self.skip_newlines();
+                if self.at(&TokenKind::Comma) {
+                    // `(a, b, ...)` — a tuple.
+                    let mut items = vec![expr];
+                    while self.at(&TokenKind::Comma) {
+                        self.bump();
+                        self.skip_newlines();
+                        if self.at(&TokenKind::RParen) {
+                            break;
+                        }
+                        items.push(self.parse_expr());
+                        self.skip_newlines();
+                    }
+                    self.expect(&TokenKind::RParen, "`)`");
+                    return Expr {
+                        kind: ExprKind::Tuple(items),
+                        span: start.to(self.prev_span()),
+                    };
+                }
                 self.expect(&TokenKind::RParen, "`)`");
                 Expr { kind: expr.kind, span: start.to(self.prev_span()) }
             }
@@ -1197,6 +1266,23 @@ impl<'a> Parser<'a> {
     fn parse_pattern(&mut self, what: &str) -> Pattern {
         let start = self.peek().span;
         match self.peek().kind.clone() {
+            TokenKind::LParen => {
+                self.bump();
+                self.skip_newlines();
+                let mut pats = Vec::new();
+                while !self.at(&TokenKind::RParen) && !self.at(&TokenKind::Eof) {
+                    pats.push(self.parse_pattern(what));
+                    self.skip_newlines();
+                    if self.at(&TokenKind::Comma) {
+                        self.bump();
+                        self.skip_newlines();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RParen, "`)`");
+                Pattern { kind: PatternKind::Tuple(pats), span: start.to(self.prev_span()) }
+            }
             TokenKind::Int(n) => {
                 self.bump();
                 Pattern { kind: PatternKind::Int(n), span: start }

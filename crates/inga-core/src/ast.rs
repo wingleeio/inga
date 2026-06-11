@@ -138,6 +138,8 @@ pub enum TypeExpr {
     Option(Box<TypeExpr>, Span),
     /// `[User]`
     List(Box<TypeExpr>, Span),
+    /// `(Int, String)` — a tuple type.
+    Tuple(Vec<TypeExpr>, Span),
     /// `(Int, String) -> Bool`, optionally with effect rows:
     /// `(Int) -> User ! DbError uses Logger`. A plain arrow type is a
     /// *pure* contract — no failures, no capabilities.
@@ -154,6 +156,7 @@ impl TypeExpr {
     pub fn span(&self) -> Span {
         match self {
             TypeExpr::Name(_, s) | TypeExpr::Option(_, s) | TypeExpr::List(_, s) => *s,
+            TypeExpr::Tuple(_, s) => *s,
             TypeExpr::Func { span, .. } => *span,
         }
     }
@@ -189,6 +192,12 @@ pub enum ExprKind {
     Str(Vec<StrPiece>),
     Var(String),
     List(Vec<Expr>),
+    /// `(1, "x")` — a tuple (two or more elements).
+    Tuple(Vec<Expr>),
+    /// `pair.0` — tuple element access.
+    TupleIndex { recv: Box<Expr>, index: i64, index_span: Span },
+    /// `User { ..base, name: expr }` — functional record update.
+    RecordUpdate { name: String, name_span: Span, base: Box<Expr>, fields: Vec<(String, Span, Expr)> },
     /// `f(a, b)`
     Call { callee: Box<Expr>, args: Vec<Expr> },
     /// `recv.name(a, b)`
@@ -262,6 +271,8 @@ pub enum PatternKind {
     /// `String msg`, `Shape s` — matches a value by its type and binds it
     /// (type-before-name, like parameters). Mainly for `catch` arms.
     TypedBind { ty: String, ty_span: Span, name: String },
+    /// `(a, b)` — destructures a tuple.
+    Tuple(Vec<Pattern>),
 }
 
 #[derive(Debug)]

@@ -75,6 +75,7 @@ pub enum CType {
     Schedule,
     Option(Box<CType>),
     List(Box<CType>),
+    Tuple(Vec<CType>),
     Struct(String),
     Enum(String),
     Service(String),
@@ -698,6 +699,9 @@ impl<'a> Checker<'a> {
             TypeExpr::List(inner, _) => {
                 Type::List(Box::new(self.resolve_type_expr(inner, tyvars)))
             }
+            TypeExpr::Tuple(items, _) => {
+                Type::Tuple(items.iter().map(|t| self.resolve_type_expr(t, tyvars)).collect())
+            }
             TypeExpr::Func { params, ret, errors, caps, .. } => {
                 let params: Vec<Type> =
                     params.iter().map(|t| self.resolve_type_expr(t, tyvars)).collect();
@@ -714,6 +718,46 @@ impl<'a> Checker<'a> {
                 Type::Func(Rc::new(FuncType { params, ret, errors, caps: cap_set }))
             }
         }
+    }
+
+    /// Check an argument against its expected type. Lambda arguments get
+    /// their parameters seeded from the expected function type, so tuple
+    /// and field access on them infers in one pass (bidirectional checking
+    /// for the common callback case).
+    fn check_arg_expecting(&mut self, arg: &Expr, expected: &Type) -> Type {
+        if let ExprKind::Lambda { params, body } = &arg.kind {
+            if let Type::Func(ef) = self.ctx.resolve(expected) {
+                if ef.params.len() == params.len() {
+                    let mut scope = HashMap::new();
+                    let mut tyvars = HashMap::new();
+                    let mut param_types = Vec::new();
+                    for (param, ety) in params.iter().zip(ef.params.iter()) {
+                        let ty = match &param.ty {
+                            Some(t) => self.resolve_type_expr(t, &mut tyvars),
+                            None => self.ctx.fresh(),
+                        };
+                        let _ = self.ctx.unify(&ty, ety);
+                        scope.insert(param.name.clone(), ty.clone());
+                        param_types.push(ty);
+                    }
+                    self.scopes.push(scope);
+                    let (ret, rows) = self.with_rows(|s| s.check_expr(body));
+                    self.scopes.pop();
+                    let ty = Type::Func(Rc::new(FuncType {
+                        params: param_types,
+                        ret,
+                        errors: rows.errors,
+                        caps: rows.caps,
+                    }));
+                    if self.record_info {
+                        self.raw_expr_types
+                            .insert((arg.span.start, arg.span.end), ty.clone());
+                    }
+                    return ty;
+                }
+            }
+        }
+        self.check_expr(arg)
     }
 
     /// The variable id a rigid (universal) parameter currently resolves to —
@@ -743,6 +787,9 @@ impl<'a> Checker<'a> {
             }
             Type::Option(t) => Type::Option(Box::new(self.instantiate(&t, rigid, map))),
             Type::List(t) => Type::List(Box::new(self.instantiate(&t, rigid, map))),
+            Type::Tuple(ts) => {
+                Type::Tuple(ts.iter().map(|t| self.instantiate(t, rigid, map)).collect())
+            }
             Type::MutMap(k, v) => Type::MutMap(
                 Box::new(self.instantiate(&k, rigid, map)),
                 Box::new(self.instantiate(&v, rigid, map)),
@@ -1054,6 +1101,7 @@ impl<'a> Checker<'a> {
             Type::Schedule => CType::Schedule,
             Type::Option(t) => CType::Option(Box::new(self.ctype(&t))),
             Type::List(t) => CType::List(Box::new(self.ctype(&t))),
+            Type::Tuple(ts) => CType::Tuple(ts.iter().map(|t| self.ctype(t)).collect()),
             Type::Named(n) => CType::Struct(n),
             Type::Enum(n) => CType::Enum(n),
             Type::Service(n) => CType::Service(n),
@@ -1147,6 +1195,64 @@ impl<'a> Checker<'a> {
                 Type::Str
             }
             ExprKind::Var(name) => self.check_var(name, expr.span),
+            ExprKind::Tuple(items) => {
+                Type::Tuple(items.iter().map(|e| self.check_expr(e)).collect())
+            }
+            ExprKind::TupleIndex { recv, index, index_span } => {
+                let recv_ty = self.check_expr(recv);
+                match self.ctx.resolve(&recv_ty) {
+                    Type::Tuple(ts) => match usize::try_from(*index).ok().and_then(|i| ts.get(i)) {
+                        Some(t) => t.clone(),
+                        None => {
+                            self.error(
+                                *index_span,
+                                format!("tuple has {} element(s), no `.{index}`", ts.len()),
+                            );
+                            Type::Unknown
+                        }
+                    },
+                    Type::Unknown => Type::Unknown,
+                    Type::Var(_) => {
+                        self.error(
+                            recv.span,
+                            "cannot infer the tuple's type here; add a type annotation",
+                        );
+                        Type::Unknown
+                    }
+                    other => {
+                        let rendered = self.render(&other);
+                        self.error(*index_span, format!("{rendered} is not a tuple"));
+                        Type::Unknown
+                    }
+                }
+            }
+            ExprKind::RecordUpdate { name, name_span, base, fields } => {
+                let result = if self.structs.contains_key(name) {
+                    let info = &self.structs[name];
+                    let (m, p) = (info.module, info.is_pub);
+                    self.gate(name, m, p, *name_span);
+                    Type::Named(name.clone())
+                } else {
+                    self.error(*name_span, format!("unknown struct `{name}` in record update"));
+                    Type::Unknown
+                };
+                let base_ty = self.check_expr(base);
+                self.unify_at(&result, &base_ty, base.span, "record update base");
+                let decl_fields =
+                    self.structs.get(name).map(|i| i.fields.clone()).unwrap_or_default();
+                for (fname, fspan, value) in fields {
+                    let value_ty = self.check_expr(value);
+                    match decl_fields.iter().find(|(f, _)| f == fname) {
+                        Some((_, fty)) => {
+                            self.unify_at(fty, &value_ty, value.span, "record update field");
+                        }
+                        None => {
+                            self.error(*fspan, format!("`{name}` has no field `{fname}`"));
+                        }
+                    }
+                }
+                result
+            }
             ExprKind::List(items) => {
                 let elem = self.ctx.fresh();
                 for item in items {
@@ -1463,7 +1569,7 @@ impl<'a> Checker<'a> {
                     // invoking it, so the conservative merge below would
                     // double-count (enforce_func_rows keeps it honest).
                     let contracted = matches!(self.ctx.resolve(param_ty), Type::Func(_));
-                    let arg_ty = self.check_expr(arg);
+                    let arg_ty = self.check_arg_expecting(arg, param_ty);
                     self.unify_at(param_ty, &arg_ty, arg.span, "argument");
                     self.enforce_func_rows(param_ty, &arg_ty, arg.span);
                     if !contracted {
@@ -1852,16 +1958,27 @@ impl<'a> Checker<'a> {
                     return Some(Type::Unknown);
                 }
                 let container_ty = self.check_expr(args[0]);
-                let func_ty = self.check_expr(args[1]);
-                self.add_func_arg_rows(&func_ty);
                 let a = self.ctx.fresh();
                 let b = self.ctx.fresh();
+                // Learn the element type from the container first, so the
+                // lambda's parameter is seeded.
+                match self.ctx.resolve(&container_ty) {
+                    Type::List(_) => {
+                        let _ = self.ctx.unify(&Type::List(Box::new(a.clone())), &container_ty);
+                    }
+                    Type::Option(_) => {
+                        let _ = self.ctx.unify(&Type::Option(Box::new(a.clone())), &container_ty);
+                    }
+                    _ => {}
+                }
                 let expected_f = Type::Func(Rc::new(FuncType {
                     params: vec![a.clone()],
                     ret: b.clone(),
                     errors: BTreeSet::new(),
                     caps: BTreeSet::new(),
                 }));
+                let func_ty = self.check_arg_expecting(args[1], &expected_f);
+                self.add_func_arg_rows(&func_ty);
                 self.unify_at(&expected_f, &func_ty, args[1].span, "map function");
                 match self.ctx.resolve(&container_ty) {
                     Type::List(elem) => {
@@ -1937,14 +2054,14 @@ impl<'a> Checker<'a> {
                 let list_ty = self.check_expr(args[0]);
                 let a = self.ctx.fresh();
                 self.unify_at(&Type::List(Box::new(a.clone())), &list_ty, args[0].span, "filter input");
-                let func_ty = self.check_expr(args[1]);
-                self.add_func_arg_rows(&func_ty);
                 let expected_f = Type::Func(Rc::new(FuncType {
                     params: vec![a.clone()],
                     ret: Type::Bool,
                     errors: BTreeSet::new(),
                     caps: BTreeSet::new(),
                 }));
+                let func_ty = self.check_arg_expecting(args[1], &expected_f);
+                self.add_func_arg_rows(&func_ty);
                 self.unify_at(&expected_f, &func_ty, args[1].span, "filter predicate");
                 Type::List(Box::new(a))
             }
@@ -1956,14 +2073,14 @@ impl<'a> Checker<'a> {
                 let a = self.ctx.fresh();
                 self.unify_at(&Type::List(Box::new(a.clone())), &list_ty, args[0].span, "fold input");
                 let acc = self.check_expr(args[1]);
-                let func_ty = self.check_expr(args[2]);
-                self.add_func_arg_rows(&func_ty);
                 let expected_f = Type::Func(Rc::new(FuncType {
                     params: vec![acc.clone(), a],
                     ret: acc.clone(),
                     errors: BTreeSet::new(),
                     caps: BTreeSet::new(),
                 }));
+                let func_ty = self.check_arg_expecting(args[2], &expected_f);
+                self.add_func_arg_rows(&func_ty);
                 self.unify_at(&expected_f, &func_ty, args[2].span, "fold function");
                 acc
             }
@@ -2420,6 +2537,12 @@ impl<'a> Checker<'a> {
                                 self.warn_unreachable_arm(arm.pattern.span, "Bool");
                             }
                         }
+                        PatternKind::Tuple(_) => {
+                            self.error(
+                                arm.pattern.span,
+                                "tuples cannot be failed, so a tuple pattern never matches in `catch`",
+                            );
+                        }
                         PatternKind::Bind(bind_name) => {
                             rows.errors.clear();
                             self.scopes
@@ -2509,7 +2632,104 @@ impl<'a> Checker<'a> {
         if arms.is_empty() {
             return Type::Unknown;
         }
+        self.check_exhaustive(scrutinee, arms, &scrut_ty);
         result
+    }
+
+    /// Matches must cover every value: enums by variant, Bool by both
+    /// literals, options by Some/None — or include an irrefutable arm.
+    fn check_exhaustive(&mut self, scrutinee: &Expr, arms: &[Arm], scrut_ty: &Type) {
+        if arms.iter().any(|a| self.pattern_irrefutable(&a.pattern)) {
+            return;
+        }
+        match self.ctx.resolve(scrut_ty) {
+            Type::Enum(name) => {
+                let variants: Vec<String> = self
+                    .enums
+                    .get(&name)
+                    .map(|e| e.variants.iter().map(|(v, _)| v.clone()).collect())
+                    .unwrap_or_default();
+                let mut missing = Vec::new();
+                for v in &variants {
+                    let covered = arms.iter().any(|a| match &a.pattern.kind {
+                        PatternKind::Ctor { name: pn, args, .. } if pn == v => match args {
+                            CtorPatArgs::None | CtorPatArgs::Fields(_) => true,
+                            CtorPatArgs::Positional(ps) => {
+                                ps.iter().all(|p| self.pattern_irrefutable(p))
+                            }
+                        },
+                        PatternKind::Ctor { name: pn, .. } => pn == &name,
+                        _ => false,
+                    });
+                    if !covered {
+                        missing.push(v.clone());
+                    }
+                }
+                if !missing.is_empty() {
+                    self.error(
+                        scrutinee.span,
+                        format!(
+                            "this `match` is not exhaustive: missing {} (or add a catch-all `_ ->` arm)",
+                            missing.iter().map(|v| format!("`{v}`")).collect::<Vec<_>>().join(", ")
+                        ),
+                    );
+                }
+            }
+            Type::Bool => {
+                let has = |b: bool| {
+                    arms.iter().any(|a| matches!(a.pattern.kind, PatternKind::Bool(x) if x == b))
+                };
+                if !(has(true) && has(false)) {
+                    self.error(
+                        scrutinee.span,
+                        "this `match` is not exhaustive: cover both `true` and `false` (or add `_ ->`)",
+                    );
+                }
+            }
+            Type::Option(_) => {
+                let has_none = arms.iter().any(|a| {
+                    matches!(&a.pattern.kind, PatternKind::Ctor { name, .. } if name == "None")
+                });
+                let has_some = arms.iter().any(|a| match &a.pattern.kind {
+                    PatternKind::Ctor { name, args, .. } if name == "Some" => match args {
+                        CtorPatArgs::None => true,
+                        CtorPatArgs::Positional(ps) => {
+                            ps.iter().all(|p| self.pattern_irrefutable(p))
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                });
+                if !(has_none && has_some) {
+                    self.error(
+                        scrutinee.span,
+                        "this `match` is not exhaustive: cover `Some(...)` and `None` (or add `_ ->`)",
+                    );
+                }
+            }
+            Type::Var(_) | Type::Unknown => {}
+            _ => {
+                self.error(
+                    scrutinee.span,
+                    "this `match` is not exhaustive: add a catch-all arm (`_ ->` or a binding)",
+                );
+            }
+        }
+    }
+
+    fn pattern_irrefutable(&self, pat: &Pattern) -> bool {
+        match &pat.kind {
+            PatternKind::Wildcard | PatternKind::Bind(_) | PatternKind::TypedBind { .. } => true,
+            PatternKind::Tuple(ps) => ps.iter().all(|p| self.pattern_irrefutable(p)),
+            PatternKind::Ctor { name, args, .. } if self.structs.contains_key(name) => match args {
+                CtorPatArgs::None | CtorPatArgs::Fields(_) => true,
+                CtorPatArgs::Positional(ps) => ps.iter().all(|p| self.pattern_irrefutable(p)),
+            },
+            PatternKind::Ctor { name, args, .. } if self.enums.contains_key(name) => {
+                matches!(args, CtorPatArgs::None)
+            }
+            _ => false,
+        }
     }
 
     fn check_pattern(&mut self, pat: &Pattern, expected: &Type) {
@@ -2574,6 +2794,13 @@ impl<'a> Checker<'a> {
                     self.error(*name_span, format!("unknown constructor `{name}` in pattern"));
                 }
             },
+            PatternKind::Tuple(pats) => {
+                let elems: Vec<Type> = pats.iter().map(|_| self.ctx.fresh()).collect();
+                self.unify_at(&Type::Tuple(elems.clone()), scrut_ty, pat.span, "pattern");
+                for (p, t) in pats.iter().zip(elems.iter()) {
+                    self.check_pattern_against(p, t);
+                }
+            }
             PatternKind::TypedBind { ty, ty_span, name } => match self.tag_type(ty) {
                 Some(bound) => {
                     self.unify_at(&bound, scrut_ty, pat.span, "pattern");

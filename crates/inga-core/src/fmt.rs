@@ -400,6 +400,21 @@ impl Printer {
             ExprKind::Bool(b) => b.to_string(),
             ExprKind::Str(pieces) => self.render_str(pieces, indent),
             ExprKind::Var(name) => name.clone(),
+            ExprKind::Tuple(items) => {
+                let inner: Vec<String> = items.iter().map(|e| self.render_expr(e, indent)).collect();
+                format!("({})", inner.join(", "))
+            }
+            ExprKind::TupleIndex { recv, index, .. } => {
+                format!("{}.{index}", self.render_expr(recv, indent))
+            }
+            ExprKind::RecordUpdate { name, base, fields, .. } => {
+                let base_str = self.render_expr(base, indent);
+                let mut parts = vec![format!("..{base_str}")];
+                for (fname, _, value) in fields {
+                    parts.push(format!("{fname}: {}", self.render_expr(value, indent)));
+                }
+                format!("{name} {{ {} }}", parts.join(", "))
+            }
             ExprKind::List(items) => {
                 let inner: Vec<String> = items.iter().map(|e| self.render_expr(e, indent)).collect();
                 format!("[{}]", inner.join(", "))
@@ -724,6 +739,10 @@ fn render_type(ty: &TypeExpr) -> String {
             }
         }
         TypeExpr::List(inner, _) => format!("[{}]", render_type(inner)),
+        TypeExpr::Tuple(items, _) => {
+            let inner: Vec<String> = items.iter().map(render_type).collect();
+            format!("({})", inner.join(", "))
+        }
         TypeExpr::Func { params, ret, errors, caps, .. } => {
             let inner: Vec<String> = params.iter().map(render_type).collect();
             let mut out = format!("({}) -> {}", inner.join(", "), render_type(ret));
@@ -748,6 +767,10 @@ fn render_pattern(pat: &Pattern) -> String {
         PatternKind::Str(s) => format!("{s:?}"),
         PatternKind::Bool(b) => b.to_string(),
         PatternKind::TypedBind { ty, name, .. } => format!("{ty} {name}"),
+        PatternKind::Tuple(pats) => {
+            let inner: Vec<String> = pats.iter().map(render_pattern).collect();
+            format!("({})", inner.join(", "))
+        }
         PatternKind::Ctor { name, args, .. } => match args {
             CtorPatArgs::None => name.clone(),
             CtorPatArgs::Positional(pats) => {

@@ -953,3 +953,505 @@ pub extern "C" fn rt_gfx_shader_use(handle: i64) {
 pub extern "C" fn rt_gfx_shader_off() {
     macroquad::material::gl_use_default_material();
 }
+
+// ---- type descriptors ---------------------------------------------------------
+//
+// The compiler serializes every value type into a compact descriptor; one
+// runtime interpreter implements show/display, structural equality, JSON
+// encode/decode, and deep copy over them. Grammar (prefix, self-delimiting):
+//   i f b s u d h F M ?         primitives / opaque
+//   O<desc>  L<desc>            option, list
+//   T<n><desc...>               tuple of n (single digit)
+//   #<idx>;                     named type, by registry index
+// Registry lines (set once at startup, before any task threads):
+//   S<name>{f:<desc>;...}       struct
+//   E<name>{Variant(f:<desc>;...);...}  enum (variant order = ids)
+
+static mut TYPES: Vec<String> = Vec::new();
+
+#[allow(static_mut_refs)]
+fn types() -> &'static Vec<String> {
+    unsafe { &TYPES }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_types_init(table: i64) {
+    let text = unsafe { std::str::from_utf8_unchecked(str_bytes(table)) };
+    unsafe {
+        #[allow(static_mut_refs)]
+        if TYPES.is_empty() {
+            TYPES = text.lines().map(|l| l.to_string()).collect();
+        }
+    }
+}
+
+struct Desc<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Desc<'a> {
+    fn new(s: &'a str) -> Desc<'a> {
+        Desc { bytes: s.as_bytes(), pos: 0 }
+    }
+
+    fn peek(&self) -> u8 {
+        self.bytes.get(self.pos).copied().unwrap_or(b'?')
+    }
+
+    fn bump(&mut self) -> u8 {
+        let b = self.peek();
+        self.pos += 1;
+        b
+    }
+
+    fn until(&mut self, stop: u8) -> &'a str {
+        let start = self.pos;
+        while self.pos < self.bytes.len() && self.bytes[self.pos] != stop {
+            self.pos += 1;
+        }
+        let s = unsafe { std::str::from_utf8_unchecked(&self.bytes[start..self.pos]) };
+        self.pos += 1; // consume the stop byte
+        s
+    }
+
+    /// Skip one complete descriptor.
+    fn skip(&mut self) {
+        match self.bump() {
+            b'O' | b'L' => self.skip(),
+            b'T' => {
+                let n = (self.bump() - b'0') as usize;
+                for _ in 0..n {
+                    self.skip();
+                }
+            }
+            b'#' => {
+                self.until(b';');
+            }
+            _ => {}
+        }
+    }
+}
+
+fn registry_line(idx: usize) -> &'static str {
+    types().get(idx).map(String::as_str).unwrap_or("S?{}")
+}
+
+fn show_desc(v: i64, d: &mut Desc, quote_str: bool) -> String {
+    match d.bump() {
+        b'i' => v.to_string(),
+        b'd' => {
+            let ms = v;
+            if ms % 3_600_000 == 0 && ms != 0 {
+                format!("{}.hours", ms / 3_600_000)
+            } else if ms % 60_000 == 0 && ms != 0 {
+                format!("{}.minutes", ms / 60_000)
+            } else if ms % 1000 == 0 && ms != 0 {
+                format!("{}.seconds", ms / 1000)
+            } else {
+                format!("{ms}.millis")
+            }
+        }
+        b'f' => {
+            let x = f64::from_bits(v as u64);
+            if x.fract() == 0.0 && x.is_finite() {
+                format!("{x:.1}")
+            } else {
+                x.to_string()
+            }
+        }
+        b'b' => (v != 0).to_string(),
+        b's' => {
+            let s = unsafe { std::str::from_utf8_unchecked(str_bytes(v)) };
+            if quote_str {
+                format!("{s:?}")
+            } else {
+                s.to_string()
+            }
+        }
+        b'u' => "()".to_string(),
+        b'h' => {
+            let p = v as *const i64;
+            let (kind, base, max) = unsafe { (*p, *p.add(1), *p.add(2)) };
+            let kind = if kind == 0 { "exponential" } else { "fixed" };
+            let base = show_desc(base, &mut Desc::new("d"), false);
+            if max >= 0 {
+                format!("schedule.{kind}({base}) |> schedule.upTo({max})")
+            } else {
+                format!("schedule.{kind}({base})")
+            }
+        }
+        b'F' => "<lambda>".to_string(),
+        b'M' => "MutMap".to_string(),
+        b'O' => {
+            if v == 0 {
+                d.skip();
+                "None".to_string()
+            } else {
+                let inner = unsafe { *(v as *const i64) };
+                format!("Some({})", show_desc(inner, d, true))
+            }
+        }
+        b'L' => {
+            let start = d.pos;
+            let items = unsafe { list_items(v) };
+            let mut parts = Vec::with_capacity(items.len());
+            for item in items {
+                d.pos = start;
+                parts.push(show_desc(*item, d, true));
+            }
+            if items.is_empty() {
+                d.pos = start;
+                d.skip();
+            }
+            format!("[{}]", parts.join(", "))
+        }
+        b'T' => {
+            let n = (d.bump() - b'0') as usize;
+            let p = v as *const i64;
+            let mut parts = Vec::with_capacity(n);
+            for i in 0..n {
+                let elem = unsafe { *p.add(i) };
+                parts.push(show_desc(elem, d, true));
+            }
+            format!("({})", parts.join(", "))
+        }
+        b'#' => {
+            let idx: usize = d.until(b';').parse().unwrap_or(0);
+            let line = registry_line(idx);
+            let mut rd = Desc::new(line);
+            match rd.bump() {
+                b'S' => {
+                    let name = rd.until(b'{');
+                    let p = v as *const i64;
+                    let mut parts = Vec::new();
+                    let mut i = 0;
+                    while rd.peek() != b'}' && rd.peek() != b'?' {
+                        let fname = rd.until(b':');
+                        let fv = unsafe { *p.add(i) };
+                        parts.push(format!("{fname}: {}", show_desc(fv, &mut rd, true)));
+                        rd.bump(); // ';'
+                        i += 1;
+                    }
+                    format!("{name}({})", parts.join(", "))
+                }
+                b'E' => {
+                    let _name = rd.until(b'{');
+                    // Collect variant sections.
+                    let body = unsafe {
+                        std::str::from_utf8_unchecked(&rd.bytes[rd.pos..rd.bytes.len() - 1])
+                    };
+                    let variants: Vec<&str> = split_variants(body);
+                    let simple = variants.iter().all(|v| !v.contains('('));
+                    let (vid, base) = if simple {
+                        (v as usize, std::ptr::null::<i64>())
+                    } else {
+                        let p = v as *const i64;
+                        (unsafe { *p } as usize, unsafe { p.add(1) })
+                    };
+                    let Some(var) = variants.get(vid) else { return "?".to_string() };
+                    match var.find('(') {
+                        None => var.to_string(),
+                        Some(paren) => {
+                            let vname = &var[..paren];
+                            let fields = &var[paren + 1..var.len() - 1];
+                            let mut fd = Desc::new(fields);
+                            let mut parts = Vec::new();
+                            let mut i = 0;
+                            while fd.pos < fd.bytes.len() {
+                                let fname = fd.until(b':');
+                                let fv = unsafe { *base.add(i) };
+                                parts.push(format!("{fname}: {}", show_desc(fv, &mut fd, true)));
+                                fd.bump(); // ';'
+                                i += 1;
+                            }
+                            if parts.is_empty() {
+                                vname.to_string()
+                            } else {
+                                format!("{vname}({})", parts.join(", "))
+                            }
+                        }
+                    }
+                }
+                _ => "?".to_string(),
+            }
+        }
+        _ => "?".to_string(),
+    }
+}
+
+/// Split an enum body "A;B(f:i;);C" into variant sections (parens nest).
+fn split_variants(body: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    for (i, b) in body.bytes().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b';' if depth == 0 => {
+                out.push(&body[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < body.len() {
+        out.push(&body[start..]);
+    }
+    out
+}
+
+#[no_mangle]
+pub extern "C" fn rt_show_desc(v: i64, desc: i64) -> i64 {
+    let d = unsafe { std::str::from_utf8_unchecked(str_bytes(desc)) };
+    make_str(show_desc(v, &mut Desc::new(d), true).as_bytes())
+}
+
+#[no_mangle]
+pub extern "C" fn rt_display_desc(v: i64, desc: i64) -> i64 {
+    let d = unsafe { std::str::from_utf8_unchecked(str_bytes(desc)) };
+    make_str(show_desc(v, &mut Desc::new(d), false).as_bytes())
+}
+
+fn eq_desc(a: i64, b: i64, d: &mut Desc) -> bool {
+    match d.bump() {
+        b'i' | b'b' | b'u' | b'd' | b'F' | b'M' | b'h' => a == b,
+        b'f' => f64::from_bits(a as u64) == f64::from_bits(b as u64),
+        b's' => unsafe { str_bytes(a) == str_bytes(b) },
+        b'O' => {
+            if a == 0 || b == 0 {
+                d.skip();
+                a == b
+            } else {
+                let (x, y) = unsafe { (*(a as *const i64), *(b as *const i64)) };
+                eq_desc(x, y, d)
+            }
+        }
+        b'L' => {
+            let (xs, ys) = unsafe { (list_items(a), list_items(b)) };
+            let start = d.pos;
+            if xs.len() != ys.len() {
+                d.skip();
+                return false;
+            }
+            for (x, y) in xs.iter().zip(ys.iter()) {
+                d.pos = start;
+                if !eq_desc(*x, *y, d) {
+                    return false;
+                }
+            }
+            if xs.is_empty() {
+                d.pos = start;
+                d.skip();
+            }
+            true
+        }
+        b'T' => {
+            let n = (d.bump() - b'0') as usize;
+            let (pa, pb) = (a as *const i64, b as *const i64);
+            for i in 0..n {
+                let (x, y) = unsafe { (*pa.add(i), *pb.add(i)) };
+                if !eq_desc(x, y, d) {
+                    // consume the remaining element descriptors
+                    for _ in i + 1..n {
+                        d.skip();
+                    }
+                    return false;
+                }
+            }
+            true
+        }
+        b'#' => {
+            let idx: usize = d.until(b';').parse().unwrap_or(0);
+            let line = registry_line(idx);
+            let mut rd = Desc::new(line);
+            match rd.bump() {
+                b'S' => {
+                    let _ = rd.until(b'{');
+                    let (pa, pb) = (a as *const i64, b as *const i64);
+                    let mut i = 0;
+                    while rd.peek() != b'}' && rd.peek() != b'?' {
+                        let _ = rd.until(b':');
+                        let (x, y) = unsafe { (*pa.add(i), *pb.add(i)) };
+                        if !eq_desc(x, y, &mut rd) {
+                            return false;
+                        }
+                        rd.bump();
+                        i += 1;
+                    }
+                    true
+                }
+                b'E' => {
+                    let _ = rd.until(b'{');
+                    let body = unsafe {
+                        std::str::from_utf8_unchecked(&rd.bytes[rd.pos..rd.bytes.len() - 1])
+                    };
+                    let variants = split_variants(body);
+                    let simple = variants.iter().all(|v| !v.contains('('));
+                    if simple {
+                        return a == b;
+                    }
+                    let (pa, pb) = (a as *const i64, b as *const i64);
+                    let (va, vb) = unsafe { (*pa, *pb) };
+                    if va != vb {
+                        return false;
+                    }
+                    let Some(var) = variants.get(va as usize) else { return false };
+                    let Some(paren) = var.find('(') else { return true };
+                    let fields = &var[paren + 1..var.len() - 1];
+                    let mut fd = Desc::new(fields);
+                    let mut i = 1;
+                    while fd.pos < fd.bytes.len() {
+                        let _ = fd.until(b':');
+                        let (x, y) = unsafe { (*pa.add(i), *pb.add(i)) };
+                        if !eq_desc(x, y, &mut fd) {
+                            return false;
+                        }
+                        fd.bump();
+                        i += 1;
+                    }
+                    true
+                }
+                _ => a == b,
+            }
+        }
+        _ => a == b,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_eq_desc(a: i64, b: i64, desc: i64) -> i64 {
+    let d = unsafe { std::str::from_utf8_unchecked(str_bytes(desc)) };
+    eq_desc(a, b, &mut Desc::new(d)) as i64
+}
+
+fn copy_desc(v: i64, d: &mut Desc) -> i64 {
+    match d.bump() {
+        b'i' | b'b' | b'u' | b'd' | b'f' | b'F' | b'M' => v, // scalars; F/M shared by reference
+        b's' => {
+            let bytes = unsafe { str_bytes(v) }.to_vec();
+            make_str(&bytes)
+        }
+        b'h' => {
+            let p = v as *const i64;
+            let q = rt_alloc(24) as *mut i64;
+            unsafe {
+                *q = *p;
+                *q.add(1) = *p.add(1);
+                *q.add(2) = *p.add(2);
+            }
+            q as i64
+        }
+        b'O' => {
+            if v == 0 {
+                d.skip();
+                0
+            } else {
+                let inner = unsafe { *(v as *const i64) };
+                let copied = copy_desc(inner, d);
+                let q = rt_alloc(8) as *mut i64;
+                unsafe { *q = copied };
+                q as i64
+            }
+        }
+        b'L' => {
+            let items: Vec<i64> = unsafe { list_items(v) }.to_vec();
+            let start = d.pos;
+            let mut copied = Vec::with_capacity(items.len());
+            for item in items {
+                d.pos = start;
+                copied.push(copy_desc(item, d));
+            }
+            if copied.is_empty() {
+                d.pos = start;
+                d.skip();
+            }
+            make_list(&copied)
+        }
+        b'T' => {
+            let n = (d.bump() - b'0') as usize;
+            let p = v as *const i64;
+            let q = rt_alloc(8 * n as i64) as *mut i64;
+            for i in 0..n {
+                let elem = unsafe { *p.add(i) };
+                let c = copy_desc(elem, d);
+                unsafe { *q.add(i) = c };
+            }
+            q as i64
+        }
+        b'#' => {
+            let idx: usize = d.until(b';').parse().unwrap_or(0);
+            let line = registry_line(idx).to_string();
+            let mut rd = Desc::new(&line);
+            match rd.bump() {
+                b'S' => {
+                    let _ = rd.until(b'{');
+                    let p = v as *const i64;
+                    let mut copied = Vec::new();
+                    let mut i = 0;
+                    while rd.peek() != b'}' && rd.peek() != b'?' {
+                        let _ = rd.until(b':');
+                        let fv = unsafe { *p.add(i) };
+                        copied.push(copy_desc(fv, &mut rd));
+                        rd.bump();
+                        i += 1;
+                    }
+                    let q = rt_alloc(8 * copied.len().max(1) as i64) as *mut i64;
+                    for (i, c) in copied.iter().enumerate() {
+                        unsafe { *q.add(i) = *c };
+                    }
+                    q as i64
+                }
+                b'E' => {
+                    let _ = rd.until(b'{');
+                    let body_owned;
+                    let body = {
+                        body_owned = unsafe {
+                            std::str::from_utf8_unchecked(&rd.bytes[rd.pos..rd.bytes.len() - 1])
+                        }
+                        .to_string();
+                        body_owned.as_str()
+                    };
+                    let variants = split_variants(body);
+                    let simple = variants.iter().all(|v| !v.contains('('));
+                    if simple {
+                        return v;
+                    }
+                    let p = v as *const i64;
+                    let vid = unsafe { *p } as usize;
+                    let mut copied = vec![vid as i64];
+                    if let Some(var) = variants.get(vid) {
+                        if let Some(paren) = var.find('(') {
+                            let fields = &var[paren + 1..var.len() - 1];
+                            let mut fd = Desc::new(fields);
+                            let mut i = 1;
+                            while fd.pos < fd.bytes.len() {
+                                let _ = fd.until(b':');
+                                let fv = unsafe { *p.add(i) };
+                                copied.push(copy_desc(fv, &mut fd));
+                                fd.bump();
+                                i += 1;
+                            }
+                        }
+                    }
+                    let q = rt_alloc(8 * copied.len() as i64) as *mut i64;
+                    for (i, c) in copied.iter().enumerate() {
+                        unsafe { *q.add(i) = *c };
+                    }
+                    q as i64
+                }
+                _ => v,
+            }
+        }
+        _ => v,
+    }
+}
+
+/// Deep-copy a value (into the current thread/arena allocator) — used by
+/// task results and arena copy-out.
+#[no_mangle]
+pub extern "C" fn rt_copy_desc(v: i64, desc: i64) -> i64 {
+    let d = unsafe { std::str::from_utf8_unchecked(str_bytes(desc)) }.to_string();
+    copy_desc(v, &mut Desc::new(&d))
+}

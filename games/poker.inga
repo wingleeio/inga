@@ -1,9 +1,9 @@
 // INGA-LATRO poker evaluation: hand types, base chips/mult, scoring
 // with joker effects.
 
-use util
-use cards
-use jokers
+use util { gn, gv }
+use cards { chipsOf }
+use jokers { hasJoker, jokerSlot }
 
 // ---- poker evaluation -----------------------------------------------------------
 //

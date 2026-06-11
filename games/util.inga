@@ -1,7 +1,7 @@
 // INGA-LATRO ui utilities: packed-rgb helpers, text/buttons, the
 // swirling background shader.
 
-use Gfx
+use std/graphics
 
 // ---- small helpers ----------------------------------------------------------
 
@@ -38,21 +38,21 @@ pub dim :: (Int packed, Int keep) -> Int {
 
 // Fake-rounded rectangle: two overlapping rects soften the corners.
 pub roundRect :: (Int x, Int y, Int w, Int h, Int r, Int g, Int b, Int a) {
-    Gfx.rect(x + 2, y, w - 4, h, r, g, b, a)
-    Gfx.rect(x, y + 2, w, h - 4, r, g, b, a)
+    graphics.rect(x + 2, y, w - 4, h, r, g, b, a)
+    graphics.rect(x, y + 2, w, h - 4, r, g, b, a)
 }
 
 pub textC :: (String s, Int x, Int y, Int size, Int packed) {
-    Gfx.text(s, x, y, size, packed / 65536, packed / 256 % 256, packed % 256)
+    graphics.text(s, x, y, size, packed / 65536, packed / 256 % 256, packed % 256)
 }
 
 pub centerText :: (String s, Int cx, Int y, Int size, Int packed) {
-    textC(s, cx - Gfx.textWidth(s, size) / 2, y, size, packed)
+    textC(s, cx - graphics.textWidth(s, size) / 2, y, size, packed)
 }
 
 pub hit :: (Int x, Int y, Int w, Int h) -> Bool {
-    mx = Gfx.mouseX()
-    my = Gfx.mouseY()
+    mx = graphics.mouseX()
+    my = graphics.mouseY()
     mx >= x && mx <= x + w && my >= y && my <= y + h
 }
 
@@ -73,24 +73,24 @@ pub button :: (String label, Int x, Int y, Int w, Int h, Bool enabled, Int packe
     } else {
         0
     }
-    Gfx.rect(x + 2, (y - lift) + 4, w, h, 8, 10, 14, 120) // drop shadow
+    graphics.rect(x + 2, (y - lift) + 4, w, h, 8, 10, 14, 120) // drop shadow
     roundRect(x, y - lift, w, h, bg / 65536, bg / 256 % 256, bg % 256, 245)
     edge = dim(bg, 130)
-    Gfx.rect(x + 2, (y - lift) + h - 4, w - 4, 4, edge / 65536, edge / 256 % 256, edge % 256, 245)
-    Gfx.rectLines(x, y - lift, w, h, 2, 15, 20, 25, 255)
+    graphics.rect(x + 2, (y - lift) + h - 4, w - 4, 4, edge / 65536, edge / 256 % 256, edge % 256, 245)
+    graphics.rectLines(x, y - lift, w, h, 2, 15, 20, 25, 255)
     fg = if enabled {
         rgb(245, 245, 245)
     } else {
         rgb(140, 145, 150)
     }
     centerText(label, x + w / 2, (y - lift) + h / 2 + 7, 22, fg)
-    enabled && Gfx.mousePressed() && hovered
+    enabled && graphics.mousePressed() && hovered
 }
 
 // ---- the background shader ----------------------------------------------------
 //
 // Balatro's signature is the swirling paint background. This is a GLSL ES
-// fragment shader, compiled at runtime; iTime/iRes are provided by Gfx.
+// fragment shader, compiled at runtime; iTime/iRes are provided by graphics.
 
 swirlSrc :: () -> String {
     "#version 100\n"
@@ -122,13 +122,13 @@ swirlSrc :: () -> String {
 pub drawBackground :: (g) {
     if gv(g, "shInit") == 0 {
         g.set("shInit", 1)
-        g.set("shH", Gfx.shaderNew(swirlSrc()))
+        g.set("shH", graphics.shaderNew(swirlSrc()))
     }
-    Gfx.clear(22, 30, 40)
+    graphics.clear(22, 30, 40)
     h = gv(g, "shH")
     if h >= 0 {
-        Gfx.shaderUse(h)
-        Gfx.rect(0, 0, 960, 540, 255, 255, 255, 255)
-        Gfx.shaderOff()
+        graphics.shaderUse(h)
+        graphics.rect(0, 0, 960, 540, 255, 255, 255, 255)
+        graphics.shaderOff()
     }
 }

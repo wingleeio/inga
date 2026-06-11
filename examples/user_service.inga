@@ -1,6 +1,8 @@
 // The user-service example: typed errors, inferred effect rows, capability
 // injection, retries — run it with `inga run examples/user_service.inga`.
 
+use std/schedule
+
 struct UserNotFound = { Int id }
 struct DbError      = { String cause }
 struct CacheMiss    = { String key }
@@ -52,7 +54,7 @@ fetchAndCache :: (id) {
     Logger logger
 
     user = db.findUser(id)
-        |> retry(Schedule.exponential(100.millis) |> upTo(3))
+        |> retry(schedule.exponential(100.millis) |> upTo(3))
         |> orFail(UserNotFound(id))
         |> catch {
             DbError(cause) -> {

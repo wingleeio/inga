@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::ast::*;
 use crate::diag::Diagnostic;
-use crate::modules::ModuleSrc;
+use crate::modules::{ImportInfo, ModuleSrc};
 use crate::span::Span;
 use crate::types::{FuncType, Type, TypeCtx};
 use std::rc::Rc;
@@ -291,7 +291,21 @@ impl<'a> Checker<'a> {
 
     /// Enforce cross-module visibility: a reference from another module
     /// needs the definition to be `pub` and its module to be imported.
+    /// Bare cross-module names resolve only when selectively imported:
+    /// `use cards { rankName }`. A plain `use cards` binds the qualified
+    /// alias only. `covered_by` lets an enum's name also grant its variants.
     fn gate(&mut self, name: &str, def_module: usize, is_pub: bool, ref_span: Span) {
+        self.gate_covered(name, None, def_module, is_pub, ref_span);
+    }
+
+    fn gate_covered(
+        &mut self,
+        name: &str,
+        covered_by: Option<&str>,
+        def_module: usize,
+        is_pub: bool,
+        ref_span: Span,
+    ) {
         if def_module == CORE_MODULE || self.modules.len() <= 1 {
             return;
         }
@@ -299,27 +313,55 @@ impl<'a> Checker<'a> {
         if ref_module == def_module {
             return;
         }
-        let def_name = match self.modules.get(def_module) {
-            Some(m) => m.name.clone(),
-            None => return,
-        };
-        if !self.modules[ref_module].imports.iter().any(|i| *i == def_name) {
+        let Some(def) = self.modules.get(def_module) else { return };
+        let (def_key, def_name) = (def.key.clone(), def.name.clone());
+        let granted = self.modules[ref_module].imports.iter().any(|i| {
+            i.target == def_key
+                && i.names.as_ref().is_some_and(|ns| {
+                    ns.iter().any(|n| n == name || Some(n.as_str()) == covered_by)
+                })
+        });
+        if granted {
+            if !is_pub {
+                self.error(
+                    ref_span,
+                    format!("`{name}` is private to module `{def_name}` (mark it `pub` to export it)"),
+                );
+            }
+            return;
+        }
+        let imported_plain =
+            self.modules[ref_module].imports.iter().any(|i| i.target == def_key);
+        if imported_plain {
             self.error(
                 ref_span,
-                format!("`{name}` is defined in module `{def_name}`; add `use {def_name}`"),
+                format!(
+                    "`{name}` is not imported here: call it as `{def_name}.{name}` or import it with `use {def_name} {{ {name} }}`"
+                ),
             );
-        } else if !is_pub {
+        } else {
             self.error(
                 ref_span,
-                format!("`{name}` is private to module `{def_name}` (mark it `pub` to export it)"),
+                format!("`{name}` is defined in module `{def_name}`; add `use {def_name} {{ {name} }}`"),
             );
         }
     }
 
-    fn gfx_enabled(&self, span: Span) -> bool {
+    /// The import a qualified `alias.member` reference resolves through
+    /// (plain imports only — selective imports do not bind the alias).
+    fn import_for_alias(&self, span: Span, alias: &str) -> Option<ImportInfo> {
+        self.modules
+            .get(self.module_of(span))?
+            .imports
+            .iter()
+            .find(|i| i.alias == alias && i.names.is_none())
+            .cloned()
+    }
+
+    fn std_imported(&self, span: Span, target: &str) -> bool {
         self.modules
             .get(self.module_of(span))
-            .is_some_and(|m| m.imports.iter().any(|i| i == "Gfx"))
+            .is_some_and(|m| m.imports.iter().any(|i| i.target == target))
     }
 
     // ---- declaration collection -----------------------------------------
@@ -1179,6 +1221,21 @@ impl<'a> Checker<'a> {
             );
             return Type::Unknown;
         }
+        if name == "graphics" || name == "schedule" {
+            self.error(
+                span,
+                format!("the `{name}` module is not imported here: add `use std/{name}`"),
+            );
+            return Type::Unknown;
+        }
+        if let Some(import) = self.import_for_alias(span, name) {
+            let what = import.target.clone();
+            self.error(
+                span,
+                format!("`{name}` is a module ({what}); call a member like `{name}.something(...)`"),
+            );
+            return Type::Unknown;
+        }
         if let Some(ty) = self.builtin_value_type(name) {
             if self.record_info {
                 if let Some(doc) = builtin_doc(name) {
@@ -1221,14 +1278,13 @@ impl<'a> Checker<'a> {
     // ---- calls -----------------------------------------------------------------
 
     fn check_call(&mut self, callee: &Expr, args: &[&Expr], span: Span) -> Type {
-        // Builtin modules: `Schedule.exponential(...)`, `Gfx.rect(...)`.
+        // Module-qualified calls: `graphics.rect(...)`, `cards.rankName(c)`.
         if let ExprKind::Field { recv, name, name_span } = &callee.kind {
-            if let ExprKind::Var(module) = &recv.kind {
-                if module == "Schedule" && !self.scope_has(module) {
-                    return self.check_schedule_call(name, *name_span, args, span);
-                }
-                if module == "Gfx" && !self.scope_has(module) {
-                    return self.check_gfx_call(name, *name_span, args, span);
+            if let ExprKind::Var(alias) = &recv.kind {
+                if !self.scope_has(alias) {
+                    if let Some(import) = self.import_for_alias(recv.span, alias) {
+                        return self.check_module_member_call(&import, name, *name_span, args, span);
+                    }
                 }
             }
         }
@@ -1333,6 +1389,98 @@ impl<'a> Checker<'a> {
             .unwrap_or_default()
     }
 
+    /// `alias.member(args)` — a std-module builtin or a `pub` member of a
+    /// file module.
+    fn check_module_member_call(
+        &mut self,
+        import: &ImportInfo,
+        member: &str,
+        member_span: Span,
+        args: &[&Expr],
+        span: Span,
+    ) -> Type {
+        match import.target.as_str() {
+            "std/graphics" => return self.check_gfx_call(member, member_span, args, span),
+            "std/schedule" => return self.check_schedule_call(member, member_span, args, span),
+            _ => {}
+        }
+        let Some(target) = self.modules.iter().position(|m| m.key == import.target) else {
+            for arg in args {
+                self.check_expr(arg);
+            }
+            return Type::Unknown;
+        };
+        let module_name = self.modules[target].name.clone();
+        if let Some(info) = self.funcs.get(member) {
+            if info.module != target {
+                self.error(
+                    member_span,
+                    format!("module `{module_name}` has no member `{member}`"),
+                );
+            } else if !info.is_pub {
+                self.error(
+                    member_span,
+                    format!("`{member}` is private to module `{module_name}` (mark it `pub` to export it)"),
+                );
+            }
+            let rows = self.func_effective_rows(member);
+            let info = &self.funcs[member];
+            let (params, ret, def_span) = (info.params.clone(), info.ret.clone(), info.name_span);
+            if params.len() != args.len() {
+                self.error(
+                    span,
+                    format!("`{member}` expects {} argument(s), found {}", params.len(), args.len()),
+                );
+            }
+            for (param_ty, arg) in params.iter().zip(args.iter()) {
+                let arg_ty = self.check_expr(arg);
+                self.unify_at(param_ty, &arg_ty, arg.span, "argument");
+                self.add_func_arg_rows(&arg_ty);
+            }
+            for arg in args.iter().skip(params.len()) {
+                self.check_expr(arg);
+            }
+            self.merge_rows(&rows);
+            if self.record_info {
+                self.info.refs.push((member_span, def_span));
+                let sig = self.render_func_signature(member);
+                self.info.hovers.push((member_span, sig));
+            }
+            return ret;
+        }
+        if let Some(info) = self.structs.get(member) {
+            let (m, p, fields) = (info.module, info.is_pub, info.fields.clone());
+            if m != target {
+                self.error(member_span, format!("module `{module_name}` has no member `{member}`"));
+            } else if !p {
+                self.error(
+                    member_span,
+                    format!("`{member}` is private to module `{module_name}` (mark it `pub` to export it)"),
+                );
+            }
+            return self.check_ctor(member, &fields, args, span, Type::Named(member.to_string()));
+        }
+        if let Some(owner) = self.variant_owner.get(member).cloned() {
+            let fields = self.variant_fields(&owner, member);
+            if let Some(info) = self.enums.get(&owner) {
+                if info.module != target {
+                    self.error(member_span, format!("module `{module_name}` has no member `{member}`"));
+                } else if !info.is_pub {
+                    self.error(
+                        member_span,
+                        format!("`{owner}` is private to module `{module_name}` (mark it `pub` to export it)"),
+                    );
+                }
+            }
+            return self.check_ctor(member, &fields, args, span, Type::Enum(owner));
+        }
+        self.error(member_span, format!("module `{module_name}` has no member `{member}`"));
+        for arg in args {
+            self.check_expr(arg);
+        }
+        Type::Unknown
+    }
+
     fn check_ctor(
         &mut self,
         name: &str,
@@ -1371,14 +1519,14 @@ impl<'a> Checker<'a> {
         match name {
             "exponential" | "fixed" => {
                 if args.len() != 1 {
-                    self.error(span, format!("`Schedule.{name}` takes one Duration argument"));
+                    self.error(span, format!("`schedule.{name}` takes one Duration argument"));
                 }
                 if let Some(arg) = args.first() {
                     let ty = self.check_expr(arg);
                     self.unify_at(&Type::Duration, &ty, arg.span, "schedule base");
                 }
                 if self.record_info {
-                    if let Some(doc) = builtin_doc(&format!("Schedule.{name}")) {
+                    if let Some(doc) = builtin_doc(&format!("schedule.{name}")) {
                         self.info.hovers.push((name_span, doc.to_string()));
                     }
                 }
@@ -1387,7 +1535,7 @@ impl<'a> Checker<'a> {
             _ => {
                 self.error(
                     name_span,
-                    format!("unknown schedule `Schedule.{name}` (try `exponential` or `fixed`)"),
+                    format!("unknown schedule `schedule.{name}` (try `exponential` or `fixed`)"),
                 );
                 for arg in args {
                     self.check_expr(arg);
@@ -1406,8 +1554,8 @@ impl<'a> Checker<'a> {
         args: &[&Expr],
         span: Span,
     ) -> Type {
-        if !self.gfx_enabled(name_span) {
-            self.error(name_span, "the graphics module is not imported here: add `use Gfx`");
+        if !self.std_imported(name_span, "std/graphics") {
+            self.error(name_span, "the graphics module is not imported here: add `use std/graphics`");
         }
         // (param types, return type); String = Str, closure handled separately.
         let sig: Option<(Vec<Type>, Type)> = match name {
@@ -1430,7 +1578,7 @@ impl<'a> Checker<'a> {
                 self.error(
                     name_span,
                     format!(
-                        "unknown graphics call `Gfx.{name}` (run, clear, rect, rectLines, circle, text, textWidth, mouseX, mouseY, mousePressed, shaderNew, shaderUse, shaderOff)"
+                        "unknown graphics call `graphics.{name}` (run, clear, rect, rectLines, circle, text, textWidth, mouseX, mouseY, mousePressed, shaderNew, shaderUse, shaderOff)"
                     ),
                 );
                 for arg in args {
@@ -1440,7 +1588,7 @@ impl<'a> Checker<'a> {
             }
         };
         if self.record_info {
-            if let Some(doc) = builtin_doc(&format!("Gfx.{name}")) {
+            if let Some(doc) = builtin_doc(&format!("graphics.{name}")) {
                 self.info.hovers.push((name_span, doc.to_string()));
             }
         }
@@ -1448,12 +1596,12 @@ impl<'a> Checker<'a> {
             // Gfx.run(Int width, Int height, String title, frame) — the
             // runtime owns the event loop and calls `frame` once per frame.
             if args.len() != 4 {
-                self.error(span, "`Gfx.run` takes (width, height, title, frame)");
+                self.error(span, "`graphics.run` takes (width, height, title, frame)");
             }
             for (i, expected) in [Type::Int, Type::Int, Type::Str].iter().enumerate() {
                 if let Some(arg) = args.get(i) {
                     let ty = self.check_expr(arg);
-                    self.unify_at(expected, &ty, arg.span, "Gfx.run argument");
+                    self.unify_at(expected, &ty, arg.span, "graphics.run argument");
                 }
             }
             if let Some(frame) = args.get(3) {
@@ -1464,7 +1612,7 @@ impl<'a> Checker<'a> {
                     errors: BTreeSet::new(),
                     caps: BTreeSet::new(),
                 }));
-                self.unify_at(&expected, &frame_ty, frame.span, "Gfx.run frame closure");
+                self.unify_at(&expected, &frame_ty, frame.span, "graphics.run frame closure");
                 // The closure's rows surface at this call site.
                 self.add_func_arg_rows(&frame_ty);
             }
@@ -1474,7 +1622,7 @@ impl<'a> Checker<'a> {
         if args.len() != params.len() {
             self.error(
                 span,
-                format!("`Gfx.{name}` expects {} argument(s), found {}", params.len(), args.len()),
+                format!("`graphics.{name}` expects {} argument(s), found {}", params.len(), args.len()),
             );
         }
         for (param, arg) in params.iter().zip(args.iter()) {
@@ -1698,13 +1846,12 @@ impl<'a> Checker<'a> {
         args: &[&Expr],
         span: Span,
     ) -> Type {
-        // `Schedule.x(...)` / `Gfx.x(...)` arrive as Method when called directly.
-        if let ExprKind::Var(module) = &recv.kind {
-            if module == "Schedule" && !self.scope_has(module) {
-                return self.check_schedule_call(name, name_span, args, span);
-            }
-            if module == "Gfx" && !self.scope_has(module) {
-                return self.check_gfx_call(name, name_span, args, span);
+        // `graphics.rect(...)` / `cards.rankName(c)` arrive as Method calls.
+        if let ExprKind::Var(alias) = &recv.kind {
+            if !self.scope_has(alias) {
+                if let Some(import) = self.import_for_alias(recv.span, alias) {
+                    return self.check_module_member_call(&import, name, name_span, args, span);
+                }
             }
         }
         let recv_ty = self.check_expr(recv);
@@ -2528,22 +2675,22 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("nowMicros", "nowMicros() -> Int — monotonic microseconds since program start"),
         ("range", "range(n) -> [Int] — the list [0, 1, ..., n-1]"),
         ("random", "random(n) -> Int — uniform in 0..n-1"),
-        ("Gfx.run", "Gfx.run(width, height, title, frame) — open a window, call frame each frame"),
-        ("Gfx.clear", "Gfx.clear(r, g, b)"),
-        ("Gfx.rect", "Gfx.rect(x, y, w, h, r, g, b, a)"),
-        ("Gfx.rectLines", "Gfx.rectLines(x, y, w, h, thickness, r, g, b, a)"),
-        ("Gfx.circle", "Gfx.circle(x, y, radius, r, g, b, a)"),
-        ("Gfx.text", "Gfx.text(s, x, y, size, r, g, b)"),
-        ("Gfx.textWidth", "Gfx.textWidth(s, size) -> Int"),
-        ("Gfx.mouseX", "Gfx.mouseX() -> Int"),
-        ("Gfx.mouseY", "Gfx.mouseY() -> Int"),
-        ("Gfx.mousePressed", "Gfx.mousePressed() -> Bool — left click this frame"),
-        ("Gfx.shaderNew", "Gfx.shaderNew(fragmentGlsl) -> Int — compile a fragment shader (uniforms: iTime, iRes)"),
-        ("Gfx.shaderUse", "Gfx.shaderUse(handle) — draw subsequent shapes through the shader"),
-        ("Gfx.shaderOff", "Gfx.shaderOff() — back to the default pipeline"),
+        ("graphics.run", "graphics.run(width, height, title, frame) — open a window, call frame each frame"),
+        ("graphics.clear", "graphics.clear(r, g, b)"),
+        ("graphics.rect", "graphics.rect(x, y, w, h, r, g, b, a)"),
+        ("graphics.rectLines", "graphics.rectLines(x, y, w, h, thickness, r, g, b, a)"),
+        ("graphics.circle", "graphics.circle(x, y, radius, r, g, b, a)"),
+        ("graphics.text", "graphics.text(s, x, y, size, r, g, b)"),
+        ("graphics.textWidth", "graphics.textWidth(s, size) -> Int"),
+        ("graphics.mouseX", "graphics.mouseX() -> Int"),
+        ("graphics.mouseY", "graphics.mouseY() -> Int"),
+        ("graphics.mousePressed", "graphics.mousePressed() -> Bool — left click this frame"),
+        ("graphics.shaderNew", "graphics.shaderNew(fragmentGlsl) -> Int — compile a fragment shader (uniforms: iTime, iRes)"),
+        ("graphics.shaderUse", "graphics.shaderUse(handle) — draw subsequent shapes through the shader"),
+        ("graphics.shaderOff", "graphics.shaderOff() — back to the default pipeline"),
         ("Some", "Some(value) -> value?"),
         ("None", "None : a?"),
-        ("Schedule.exponential", "Schedule.exponential(base) -> Schedule"),
-        ("Schedule.fixed", "Schedule.fixed(interval) -> Schedule"),
+        ("schedule.exponential", "schedule.exponential(base) -> Schedule"),
+        ("schedule.fixed", "schedule.fixed(interval) -> Schedule"),
     ]
 }

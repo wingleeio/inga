@@ -703,11 +703,16 @@ impl<'a> Cg<'a> {
             &callee.kind
         {
             if let ExprKind::Var(module) = &recv.kind {
-                if module == "Schedule" && f.lookup(module).is_none() {
-                    return self.gen_schedule(f, name, args, span);
-                }
-                if module == "Gfx" && f.lookup(module).is_none() {
-                    return self.gen_gfx(f, name, args, span);
+                if f.lookup(module).is_none() {
+                    if module == "schedule" {
+                        return self.gen_schedule(f, name, args, span);
+                    }
+                    if module == "graphics" {
+                        return self.gen_gfx(f, name, args, span);
+                    }
+                    if let Some(v) = self.gen_qualified(f, module, name, args, span) {
+                        return v;
+                    }
                 }
             }
         }
@@ -739,6 +744,41 @@ impl<'a> Cg<'a> {
         let arg_vals: Vec<String> = args.iter().map(|a| self.gen_expr(f, a)).collect();
         let result_cty = self.ctype_of_span(span);
         self.gen_closure_call(f, &callee_v, &arg_vals, &result_cty)
+    }
+
+    /// `alias.member(args)` — module-qualified call; the checker verified
+    /// everything, and top-level names are program-unique.
+    fn gen_qualified(
+        &mut self,
+        f: &mut FnCtx,
+        module: &str,
+        member: &str,
+        args: &[&Expr],
+        span: Span,
+    ) -> Option<String> {
+        if self.funcs.contains_key(module)
+            || self.struct_meta.contains_key(module)
+            || self.variant_meta.contains_key(module)
+        {
+            return None;
+        }
+        if let Some(decl) = self.funcs.get(member).copied() {
+            return Some(self.gen_user_call(f, decl, args, span));
+        }
+        if let Some(fields) = self.struct_meta.get(member).cloned() {
+            let out = self.gen_construct(f, args, None, fields.len());
+            self.pool_value(f, &out.clone(), &CType::Struct(member.to_string()));
+            return Some(out);
+        }
+        if let Some(vmeta) = self.variant_meta.get(member).cloned() {
+            if vmeta.simple {
+                return Some(vmeta.id.to_string());
+            }
+            let out = self.gen_construct(f, args, Some(vmeta.id), vmeta.fields.len());
+            self.pool_value(f, &out.clone(), &CType::Enum(vmeta.enum_name.clone()));
+            return Some(out);
+        }
+        None
     }
 
     fn gen_user_call(
@@ -816,11 +856,16 @@ impl<'a> Cg<'a> {
         span: Span,
     ) -> String {
         if let ExprKind::Var(module) = &recv.kind {
-            if module == "Schedule" && f.lookup(module).is_none() {
-                return self.gen_schedule(f, name, args, span);
-            }
-            if module == "Gfx" && f.lookup(module).is_none() {
-                return self.gen_gfx(f, name, args, span);
+            if f.lookup(module).is_none() {
+                if module == "schedule" {
+                    return self.gen_schedule(f, name, args, span);
+                }
+                if module == "graphics" {
+                    return self.gen_gfx(f, name, args, span);
+                }
+                if let Some(v) = self.gen_qualified(f, module, name, args, span) {
+                    return v;
+                }
             }
         }
         let recv_ty = self.ctype_of(recv);

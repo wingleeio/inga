@@ -1,12 +1,16 @@
-//! Module loading: `use name` imports the sibling file `name.inga`; `use
-//! Gfx` enables a std module (compiler-implemented, nothing to load). All
-//! modules are merged into one program in a single global span space — each
-//! module's tokens are lexed at a disjoint base offset, so diagnostics and
-//! hover info can be mapped back to (file, local offset) via [`ModuleSrc`].
+//! Module loading. `use cards` imports the sibling file `cards.inga`;
+//! paths are folder-aware (`use lib/colors` is `lib/colors.inga` relative
+//! to the importing file) and the standard library lives under `std/`
+//! (`use std/graphics`, `use std/schedule` — compiler-implemented, nothing
+//! to load). A plain `use` binds the path's last segment as a qualified
+//! alias (`graphics.rect(...)`, `cards.rankName(c)`); `use m { a, b }`
+//! imports only the listed `pub` names, unqualified. Importing an enum
+//! name also grants its variants.
 //!
-//! Exports: `pub` declarations are visible to importing modules; everything
-//! else is module-private. Top-level names are program-unique (a duplicate
-//! across modules is a duplicate-declaration error).
+//! All modules merge into one program in a single global span space — each
+//! module's tokens are lexed at a disjoint base offset, so diagnostics and
+//! hover info map back to (file, local offset) via [`ModuleSrc`]. Top-level
+//! names are program-unique (whole-program compilation, v0.x).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,21 +20,42 @@ use crate::diag::Diagnostic;
 use crate::span::Span;
 use crate::{lexer, parser};
 
-/// Std modules implemented by the compiler/runtime; `use` enables them.
-pub const STD_MODULES: [&str; 1] = ["Gfx"];
+/// Std modules, by full path. Imported like file modules but implemented
+/// by the compiler/runtime.
+pub const STD_MODULES: [&str; 2] = ["std/graphics", "std/schedule"];
+
+/// One `use` in a module, resolved.
+#[derive(Debug, Clone)]
+pub struct ImportInfo {
+    /// Qualified alias — the path's last segment (`graphics`, `cards`).
+    pub alias: String,
+    /// Target module key: `std/...` for std modules, else the imported
+    /// file's canonical path.
+    pub target: String,
+    /// `use m { a, b }`: only these names, unqualified (no alias binding).
+    pub names: Option<Vec<String>>,
+    pub span: Span,
+}
+
+impl ImportInfo {
+    pub fn is_std(&self) -> bool {
+        self.target.starts_with("std/")
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ModuleSrc {
-    /// Module name (file stem; the entry file is also its stem).
+    /// Module name (file stem), used in diagnostics.
     pub name: String,
+    /// Identity: the canonical path (or the raw path if it can't resolve).
+    pub key: String,
     pub path: PathBuf,
     pub src: String,
     /// Global offset of this module's first byte.
     pub base: u32,
     /// Global offset one past this module's last byte.
     pub end: u32,
-    /// Module names this module imports (file and std modules).
-    pub imports: Vec<String>,
+    pub imports: Vec<ImportInfo>,
 }
 
 impl ModuleSrc {
@@ -43,6 +68,10 @@ pub struct Loaded {
     pub program: Program,
     pub modules: Vec<ModuleSrc>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+fn canonical_key(path: &Path) -> String {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf()).display().to_string()
 }
 
 /// Load the entry file and, transitively, every file module it imports.
@@ -62,18 +91,16 @@ pub fn load_program_with(
     let mut diagnostics = Vec::new();
     let mut modules: Vec<ModuleSrc> = Vec::new();
     let mut decls = Vec::new();
-    let mut loaded: HashMap<String, usize> = HashMap::new();
+    let mut loaded: HashMap<String, ()> = HashMap::new();
     let mut base = 0u32;
 
-    // Work queue of (module name, path, source). Imports found while
-    // parsing are appended; diamonds/cycles load once.
-    let entry_name = module_name(entry);
+    let entry_key = canonical_key(entry);
     let mut queue: Vec<(String, PathBuf, String)> =
-        vec![(entry_name.clone(), entry.to_path_buf(), entry_src)];
-    loaded.insert(entry_name, 0);
+        vec![(entry_key.clone(), entry.to_path_buf(), entry_src)];
+    loaded.insert(entry_key, ());
 
     while !queue.is_empty() {
-        let (name, path, src) = queue.remove(0);
+        let (key, path, src) = queue.remove(0);
         let tokens = lexer::lex_from(&src, base, &mut diagnostics);
         let module_program = parser::parse(tokens, &mut diagnostics);
         let end = base + src.len() as u32;
@@ -81,28 +108,57 @@ pub fn load_program_with(
         let mut imports = Vec::new();
         for decl in &module_program.decls {
             if let Decl::Use(u) = decl {
-                imports.push(u.name.clone());
-                if STD_MODULES.contains(&u.name.as_str()) {
-                    continue;
-                }
-                if loaded.contains_key(&u.name) {
+                let alias = u.path.last().cloned().unwrap_or_default();
+                let joined = u.path.join("/");
+                let names =
+                    u.names.as_ref().map(|ns| ns.iter().map(|(n, _)| n.clone()).collect());
+                if u.path.first().map(String::as_str) == Some("std") {
+                    if !STD_MODULES.contains(&joined.as_str()) {
+                        diagnostics.push(Diagnostic::error(
+                            u.path_span,
+                            format!(
+                                "unknown std module `{joined}` (available: {})",
+                                STD_MODULES.join(", ")
+                            ),
+                        ));
+                        continue;
+                    }
+                    if u.names.is_some() {
+                        diagnostics.push(Diagnostic::error(
+                            u.path_span,
+                            format!("std modules are imported whole: `use {joined}` (then `{alias}.…`)"),
+                        ));
+                    }
+                    imports.push(ImportInfo {
+                        alias,
+                        target: joined,
+                        names: None,
+                        span: u.path_span,
+                    });
                     continue;
                 }
                 let import_path = path
                     .parent()
                     .unwrap_or_else(|| Path::new("."))
-                    .join(format!("{}.inga", u.name));
+                    .join(format!("{joined}.inga"));
                 match read(&import_path) {
                     Some(text) => {
-                        loaded.insert(u.name.clone(), loaded.len());
-                        queue.push((u.name.clone(), import_path, text));
+                        let target_key = canonical_key(&import_path);
+                        if loaded.insert(target_key.clone(), ()).is_none() {
+                            queue.push((target_key.clone(), import_path, text));
+                        }
+                        imports.push(ImportInfo {
+                            alias,
+                            target: target_key,
+                            names,
+                            span: u.path_span,
+                        });
                     }
                     None => {
                         diagnostics.push(Diagnostic::error(
-                            u.name_span,
+                            u.path_span,
                             format!(
-                                "cannot find module `{}` (looked for {})",
-                                u.name,
+                                "cannot find module `{joined}` (looked for {})",
                                 import_path.display()
                             ),
                         ));
@@ -112,7 +168,15 @@ pub fn load_program_with(
         }
 
         decls.extend(module_program.decls);
-        modules.push(ModuleSrc { name, path, src, base, end, imports });
+        modules.push(ModuleSrc {
+            name: module_name(&path),
+            key,
+            path,
+            src,
+            base,
+            end,
+            imports,
+        });
         base = end + 1; // keep module ranges disjoint
     }
 
@@ -137,7 +201,7 @@ pub fn resolve_entry_for(path: &Path, src: &str) -> Option<PathBuf> {
     if defines_main(src) {
         return None;
     }
-    let target = module_name(path);
+    let target = canonical_key(path);
     let dir = path.parent()?;
     let mut candidates: Vec<(bool, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(dir).ok()? {
@@ -146,21 +210,22 @@ pub fn resolve_entry_for(path: &Path, src: &str) -> Option<PathBuf> {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(&sibling) else { continue };
-        // BFS over `use` names from the sibling, reading files in `dir`.
-        let mut seen = vec![module_name(&sibling)];
-        let mut queue: Vec<String> = use_names(&text);
+        // BFS over `use` paths from the sibling.
+        let mut seen: Vec<String> = vec![canonical_key(&sibling)];
+        let mut queue: Vec<PathBuf> = use_paths(&text, dir);
         let mut imports_target = false;
-        while let Some(name) = queue.pop() {
-            if seen.contains(&name) {
+        while let Some(p) = queue.pop() {
+            let key = canonical_key(&p);
+            if seen.contains(&key) {
                 continue;
             }
-            seen.push(name.clone());
-            if name == target {
+            seen.push(key.clone());
+            if key == target {
                 imports_target = true;
                 break;
             }
-            if let Ok(t) = std::fs::read_to_string(dir.join(format!("{name}.inga"))) {
-                queue.extend(use_names(&t));
+            if let (Some(parent), Ok(t)) = (p.parent(), std::fs::read_to_string(&p)) {
+                queue.extend(use_paths(&t, parent));
             }
         }
         if imports_target {
@@ -171,10 +236,18 @@ pub fn resolve_entry_for(path: &Path, src: &str) -> Option<PathBuf> {
     candidates.into_iter().next().map(|(_, p)| p)
 }
 
-fn use_names(text: &str) -> Vec<String> {
+/// File paths a module's `use` lines refer to (std imports excluded).
+fn use_paths(text: &str, dir: &Path) -> Vec<PathBuf> {
     text.lines()
         .filter_map(|l| l.trim_start().strip_prefix("use "))
-        .map(|n| n.trim().to_string())
-        .filter(|n| !STD_MODULES.contains(&n.as_str()))
+        .map(|rest| {
+            rest.split(|c: char| c == '{' || c.is_whitespace())
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        })
+        .filter(|p| !p.is_empty() && !p.starts_with("std/") && *p != "std")
+        .map(|p| dir.join(format!("{p}.inga")))
         .collect()
 }

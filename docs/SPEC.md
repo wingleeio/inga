@@ -107,7 +107,8 @@ the expression cannot fail with is an *unreachable-arm warning*. Helpers:
 `orFail(option, err)` unwraps or fails;
 `ignoreFailure(action)` swallows the error channel and returns `Unit`;
 `retry(action, schedule)` re-runs the action per a `Schedule`
-(`Schedule.exponential(100.millis) |> upTo(3)`, `Schedule.fixed(...)`).
+(`schedule.exponential(100.millis) |> upTo(3)`, `schedule.fixed(...)` — from
+`use std/schedule`).
 `retry` deliberately does **not** clear the row — a retried action can still
 fail.
 
@@ -241,30 +242,37 @@ first-class values precisely so that evidence passing stays sufficient.
 
 ## 7. Modules
 
-Modules are files. `use geometry` imports the sibling file
-`geometry.inga`; its `pub` declarations become visible to the importer,
-everything else is module-private:
+Modules are files; paths are folder-aware and relative to the importing
+file. A plain `use` binds the path's last segment as a **qualified
+alias**; `use m { a, b }` imports only the listed `pub` names,
+unqualified — imports never dump a module's whole namespace into yours:
 
 ```inga
 // geometry.inga
 pub enum Shape = Circle { Float radius } | Dot
 pub area :: (Shape s) -> Float { ... }
-tau :: () -> Float { 6.28318 }        // private
+tau :: () -> Float { 6.28318 }            // private
 
 // main.inga
-use geometry
+use std/graphics                          // std library: graphics.rect(...)
+use geometry                              // qualified: geometry.area(...)
+use geometry { Shape, area }              // or unqualified, these names only
 main :: () { println(area(Circle(2.0))) }
 ```
 
 - `pub` may prefix any top-level declaration (struct, enum, service,
-  implementation, function). Referencing another module's private name is
-  an error; referencing a loaded-but-unimported module's name suggests the
-  missing `use`.
+  implementation, function). Private cross-module references are errors;
+  a bare name reachable only qualified gets a hint
+  (``call it as `geometry.area` or import it with `use geometry { area }` ``).
+- Importing an enum name also grants its variants (`Shape` brings
+  `Circle`/`Dot`).
 - Imports are not re-exported; diamonds and cycles load once. Top-level
-  names are program-unique (whole-program compilation, monomorphic v0.1).
-- **Std modules** are compiler-implemented and imported the same way:
-  `use Gfx` enables the graphics module (it is no longer ambient).
-  `Schedule` stays in the core language because `retry` depends on it.
+  names are program-unique (whole-program compilation, monomorphic v0.x).
+- **The standard library lives under `std/`** and is imported like any
+  module, but qualified-only: `use std/graphics` (GL bindings, §8) and
+  `use std/schedule` (retry schedules). Module names are lowercase —
+  uppercase identifiers are types; `graphics.rect(...)` can never be
+  mistaken for a constructor or a service.
 - Internally, every module lexes at a disjoint base offset into one global
   span space, so inference, the interpreter, the LLVM backend, and
   diagnostics (mapped back to file + line) all operate on one merged
@@ -277,23 +285,23 @@ honest — a package that needs the network *says so in its types*
 
 ## 8. Graphics bindings
 
-The `Gfx` std module (imported with `use Gfx`) provides
+The `std/graphics` module (imported with `use std/graphics`) provides
 GL-backed 2D graphics, implemented on OpenGL through miniquad/macroquad in
 both the interpreter (cargo feature `gfx`, enabled by the CLI) and the
 native runtime:
 
 ```
-Gfx.run(width, height, title, frame)   // runtime-owned loop; frame: () -> a, once per frame
-Gfx.clear(r, g, b)                     // 0–255 channels everywhere
-Gfx.rect(x, y, w, h, r, g, b, a)       Gfx.rectLines(x, y, w, h, thick, r, g, b, a)
-Gfx.circle(x, y, radius, r, g, b, a)   Gfx.text(s, x, y, size, r, g, b)
-Gfx.textWidth(s, size) -> Int          Gfx.mouseX() / Gfx.mouseY() -> Int
-Gfx.mousePressed() -> Bool
-Gfx.shaderNew(fragGlsl) -> Int         // compile GLSL ES; uniforms iTime, iRes
-Gfx.shaderUse(handle)                  Gfx.shaderOff()
+graphics.run(width, height, title, frame)   // runtime-owned loop; frame: () -> a, once per frame
+graphics.clear(r, g, b)                     // 0–255 channels everywhere
+graphics.rect(x, y, w, h, r, g, b, a)       graphics.rectLines(x, y, w, h, thick, r, g, b, a)
+graphics.circle(x, y, radius, r, g, b, a)   graphics.text(s, x, y, size, r, g, b)
+graphics.textWidth(s, size) -> Int          graphics.mouseX() / graphics.mouseY() -> Int
+graphics.mousePressed() -> Bool
+graphics.shaderNew(fragGlsl) -> Int         // compile GLSL ES; uniforms iTime, iRes
+graphics.shaderUse(handle)             graphics.shaderOff()
 ```
 
-Inverting the loop (`Gfx.run` calls the closure, rather than the program
+Inverting the loop (`graphics.run` calls the closure, rather than the program
 recursing) keeps stacks bounded, and the frame closure captures capability
 evidence like any closure — services work normally inside frames. Helpers:
 `range(n) -> [Int]` and `random(n) -> Int`. Setting `INGA_GFX_SHOT=<path>`
@@ -314,7 +322,7 @@ tests). See `games/balatro.inga` for a complete game.
 
 ```
 program   := decl*
-decl      := 'use' name
+decl      := 'use' name ('/' name)* ('{' name,* '}')?
            | 'pub'? 'struct' Upper '=' '{' field,* '}'
            | 'pub'? 'enum' Upper '=' variant ('|' variant)*
            | 'pub'? 'service' Upper '{' (name '::' sig)* '}'

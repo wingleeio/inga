@@ -34,6 +34,7 @@ pub fn check_source(src: &str) -> Checked {
     let program = parser::parse(tokens, &mut diagnostics);
     let single = modules::ModuleSrc {
         name: "main".to_string(),
+        key: "main.inga".to_string(),
         path: std::path::PathBuf::from("main.inga"),
         src: src.to_string(),
         base: 0,
@@ -42,7 +43,15 @@ pub fn check_source(src: &str) -> Checked {
             .decls
             .iter()
             .filter_map(|d| match d {
-                ast::Decl::Use(u) => Some(u.name.clone()),
+                ast::Decl::Use(u) => Some(modules::ImportInfo {
+                    alias: u.path.last().cloned().unwrap_or_default(),
+                    target: u.path.join("/"),
+                    names: u
+                        .names
+                        .as_ref()
+                        .map(|ns| ns.iter().map(|(n, _)| n.clone()).collect()),
+                    span: u.path_span,
+                }),
                 _ => None,
             })
             .collect(),

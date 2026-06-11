@@ -1,9 +1,9 @@
 // INGA-LATRO game state: blinds, dealing, shop, sorting.
 
-use util
+use util { gn, gv }
 use cards
 use jokers
-use poker
+use poker { buildSteps }
 
 // ---- game state ------------------------------------------------------------------
 

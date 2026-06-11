@@ -452,6 +452,50 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// `alias.member(args)` — a module-qualified call. Top-level names are
+    /// program-unique, so the member resolves directly; the checker already
+    /// verified the alias, module, and visibility.
+    fn eval_qualified(
+        &self,
+        module: &str,
+        member: &str,
+        args: &[&'a Expr],
+        span: Span,
+        scope: &Scope<'a>,
+    ) -> Option<EvalResult<'a>> {
+        if self.funcs.contains_key(module)
+            || self.struct_fields.contains_key(module)
+            || self.variants.contains_key(module)
+        {
+            return None; // a real value/ctor name, not a module alias
+        }
+        if let Some(decl) = self.funcs.get(member).copied() {
+            let mut arg_values = Vec::with_capacity(args.len());
+            for (i, arg) in args.iter().enumerate() {
+                let lazy = decl.sig.params.get(i).is_some_and(|p| p.lazy);
+                let value = if lazy {
+                    Value::Thunk(Rc::new(ThunkVal { expr: arg, env: scope.clone() }))
+                } else {
+                    match self.eval(arg, scope) {
+                        Ok(v) => v,
+                        Err(e) => return Some(Err(e)),
+                    }
+                };
+                arg_values.push(value);
+            }
+            return Some(self.call_func(decl, arg_values, span));
+        }
+        if let Some(fields) = self.struct_fields.get(member) {
+            let fields = fields.clone();
+            return Some(self.construct(member, &fields, args, None, span, scope));
+        }
+        if let Some((enum_name, fields)) = self.variants.get(member) {
+            let (enum_name, fields) = (*enum_name, fields.clone());
+            return Some(self.construct(member, &fields, args, Some(enum_name), span, scope));
+        }
+        None
+    }
+
     fn instantiate_impl(&self, decl: &'a ImplDecl) -> Result<ServiceInstance<'a>, Failure<'a>> {
         let scope = Scope::root();
         let mut fields = Vec::new();
@@ -542,11 +586,16 @@ impl<'a> Interp<'a> {
         // Builtin modules: `Schedule.*`, `Gfx.*`.
         if let ExprKind::Field { recv, name, .. } = &callee.kind {
             if let ExprKind::Var(module) = &recv.kind {
-                if module == "Schedule" && scope.get(module).is_none() {
-                    return self.eval_schedule_call(name, args, span, scope);
-                }
-                if module == "Gfx" && scope.get(module).is_none() {
-                    return self.eval_gfx_call(name, args, span, scope);
+                if scope.get(module).is_none() {
+                    if module == "schedule" {
+                        return self.eval_schedule_call(name, args, span, scope);
+                    }
+                    if module == "graphics" {
+                        return self.eval_gfx_call(name, args, span, scope);
+                    }
+                    if let Some(result) = self.eval_qualified(module, name, args, span, scope) {
+                        return result;
+                    }
                 }
             }
         }
@@ -699,10 +748,10 @@ impl<'a> Interp<'a> {
         let kind = match name {
             "exponential" => ScheduleKind::Exponential,
             "fixed" => ScheduleKind::Fixed,
-            _ => return self.fatal(span, format!("unknown schedule `Schedule.{name}`")),
+            _ => return self.fatal(span, format!("unknown schedule `schedule.{name}`")),
         };
         let Some(arg) = args.first() else {
-            return self.fatal(span, format!("`Schedule.{name}` takes one Duration argument"));
+            return self.fatal(span, format!("`schedule.{name}` takes one Duration argument"));
         };
         let base = self.eval(arg, scope)?;
         let Value::Duration(base_ms) = base else {
@@ -1164,11 +1213,16 @@ impl<'a> Interp<'a> {
         scope: &Scope<'a>,
     ) -> EvalResult<'a> {
         if let ExprKind::Var(module) = &recv.kind {
-            if module == "Schedule" && scope.get(module).is_none() {
-                return self.eval_schedule_call(name, args, span, scope);
-            }
-            if module == "Gfx" && scope.get(module).is_none() {
-                return self.eval_gfx_call(name, args, span, scope);
+            if scope.get(module).is_none() {
+                if module == "schedule" {
+                    return self.eval_schedule_call(name, args, span, scope);
+                }
+                if module == "graphics" {
+                    return self.eval_gfx_call(name, args, span, scope);
+                }
+                if let Some(result) = self.eval_qualified(module, name, args, span, scope) {
+                    return result;
+                }
             }
         }
         let recv_value = self.eval(recv, scope)?;
@@ -1499,9 +1553,9 @@ pub fn show(value: &Value) -> String {
             };
             match s.max_retries {
                 Some(n) => {
-                    format!("Schedule.{kind}({}) |> upTo({n})", format_duration(s.base_ms))
+                    format!("schedule.{kind}({}) |> upTo({n})", format_duration(s.base_ms))
                 }
-                None => format!("Schedule.{kind}({})", format_duration(s.base_ms)),
+                None => format!("schedule.{kind}({})", format_duration(s.base_ms)),
             }
         }
         Value::MutMap(map) => format!("MutMap(size: {})", map.borrow().len()),

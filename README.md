@@ -8,6 +8,8 @@ structs and enums; `fail` raises *any* value, and the `!` row names the
 types of the values a function can fail with.
 
 ```inga
+use std/schedule
+
 struct UserNotFound = { Int id }
 struct DbError      = { String cause }
 struct CacheMiss    = { String key }
@@ -26,7 +28,7 @@ fetchAndCache :: (id) {
     Logger logger
 
     user = db.findUser(id)
-        |> retry(Schedule.exponential(100.millis) |> upTo(3))
+        |> retry(schedule.exponential(100.millis) |> upTo(3))
         |> orFail(UserNotFound(id))
         |> catch {
             DbError(cause) -> {
@@ -100,10 +102,10 @@ Editor support lives in [`editors/vscode`](editors/vscode) (TextMate grammar
 
 ## Graphics, and a game
 
-Inga has GL-backed graphics bindings — the `Gfx` module (window, rects,
+Inga has GL-backed graphics bindings — the `std/graphics` module (window, rects,
 circles, text, mouse, **GLSL fragment shaders**), implemented on OpenGL via
 miniquad/macroquad in the native runtime and available in both backends. The
-frame loop is owned by the runtime (`Gfx.run(w, h, title, frame)` calls your
+frame loop is owned by the runtime (`graphics.run(w, h, title, frame)` calls your
 closure once per frame), so games don't need unbounded recursion — and the
 frame closure captures capability evidence like any other Inga closure.
 
@@ -113,7 +115,7 @@ across five modules (`use util`, `cards`, `jokers`, `poker`, `state`) — poker-
 scoring, escalating blinds and antes, fifteen jokers and a rerollable shop,
 animated card deals/hovers/score popups, and the signature swirling paint
 background written as a GLSL shader *inside the Inga source* and compiled at
-runtime via `Gfx.shaderNew`:
+runtime via `graphics.shaderNew`:
 
 ```sh
 inga build games/balatro.inga -o ingalatro && ./ingalatro

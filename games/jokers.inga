@@ -1,6 +1,6 @@
 // INGA-LATRO jokers: names, descriptions, prices.
 
-use util
+use util { gn, gv }
 
 // ---- jokers -------------------------------------------------------------------
 

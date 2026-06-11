@@ -1,7 +1,7 @@
 // Modules: `use geometry` loads ./geometry.inga and brings its `pub`
 // declarations into scope. Run with: inga run examples/modules.inga
 
-use geometry
+use geometry { Circle, Rect, TooBig, area, checked }
 
 main :: () {
     println("circle area: ${area(Circle(2.0))}")

@@ -1,5 +1,7 @@
 // Effects in miniature: a flaky service, typed errors, retry schedules.
 
+use std/schedule
+
 struct Flaky = { Int attempt }
 
 service Counter {
@@ -32,14 +34,14 @@ flaky :: () {
 main :: () {
     provide memoryCounter {
         value = flaky()
-            |> retry(Schedule.fixed(1.millis) |> upTo(5))
+            |> retry(schedule.fixed(1.millis) |> upTo(5))
             |> catch { Flaky(attempt) -> -attempt }
         println("settled on ${value} after retries")
 
         // Exhaust the retry budget: 2 retries cannot survive 3 failures.
         provide memoryCounter {
             failed = flaky()
-                |> retry(Schedule.fixed(1.millis) |> upTo(2))
+                |> retry(schedule.fixed(1.millis) |> upTo(2))
                 |> catch { Flaky(attempt) -> -attempt }
             println("gave up with ${failed}")
         }

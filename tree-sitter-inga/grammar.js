@@ -56,9 +56,18 @@ module.exports = grammar({
         $.implementation
       ),
 
-    // `use Gfx` (std module) or `use geometry` (sibling file).
+    // `use std/graphics`, `use cards`, `use cards { rankName, suitCol }`.
     use_declaration: $ =>
-      seq('use', field('module', choice($.identifier, $.type_identifier))),
+      prec.right(
+        seq(
+          'use',
+          field('module', $.module_path),
+          optional(seq('{', sepBy1(',', choice($.identifier, $.type_identifier)), '}'))
+        )
+      ),
+
+    module_path: $ =>
+      prec.right(sepBy1('/', choice($.identifier, $.type_identifier))),
 
     struct_declaration: $ =>
       seq(optional('pub'), 'struct', field('name', $.type_identifier), '=', $.fields),

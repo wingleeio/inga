@@ -229,20 +229,28 @@ fn cmd_check(args: &[String]) -> ExitCode {
             }
         };
         let (checked, mods) = check_loaded(loaded);
-        let this = std::fs::canonicalize(path).unwrap_or_else(|_| Path::new(path).to_path_buf());
-        let diags: Vec<Diagnostic> = checked
-            .diagnostics
-            .iter()
-            .filter(|d| {
-                mods.iter()
-                    .find(|m| m.contains(d.span))
-                    .map(|m| {
-                        std::fs::canonicalize(&m.path).unwrap_or_else(|_| m.path.clone()) == this
-                    })
-                    .unwrap_or(true)
-            })
-            .cloned()
-            .collect();
+        // Checking a whole program reports everything; checking a library
+        // module (redirected to its entry) reports only that file.
+        let diags: Vec<Diagnostic> = if entry.is_some() {
+            let this =
+                std::fs::canonicalize(path).unwrap_or_else(|_| Path::new(path).to_path_buf());
+            checked
+                .diagnostics
+                .iter()
+                .filter(|d| {
+                    mods.iter()
+                        .find(|m| m.contains(d.span))
+                        .map(|m| {
+                            std::fs::canonicalize(&m.path).unwrap_or_else(|_| m.path.clone())
+                                == this
+                        })
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect()
+        } else {
+            checked.diagnostics.clone()
+        };
         if print_diagnostics_modules(&mods, &diags) {
             failed = true;
         } else if checked.diagnostics.is_empty() {

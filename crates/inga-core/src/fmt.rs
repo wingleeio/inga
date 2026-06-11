@@ -141,7 +141,12 @@ impl Printer {
                 Decl::Use(d) => {
                     self.flush_comments_before(d.span.start, 0);
                     self.blank_line_if_gap(self.lines.line(d.span.start));
-                    self.out.push_str(&format!("use {}", d.name));
+                    self.out.push_str(&format!("use {}", d.path.join("/")));
+                    if let Some(names) = &d.names {
+                        let inner: Vec<String> =
+                            names.iter().map(|(n, _)| n.clone()).collect();
+                        self.out.push_str(&format!(" {{ {} }}", inner.join(", ")));
+                    }
                     self.attach_trailing_comment(d.span.end);
                     self.out.push('\n');
                     self.prev_end_line = Some(self.lines.line(d.span.end));

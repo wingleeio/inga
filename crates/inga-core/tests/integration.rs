@@ -104,13 +104,15 @@ main :: () {
 #[test]
 fn durations_and_schedules() {
     let out = run(r#"
+use std/schedule
+
 main :: () {
     d = 2.minutes + 30.seconds
     println(d)
-    println(Schedule.exponential(100.millis) |> upTo(3))
+    println(schedule.exponential(100.millis) |> upTo(3))
 }
 "#);
-    assert_eq!(out, "150.seconds\nSchedule.exponential(100.millis) |> upTo(3)\n");
+    assert_eq!(out, "150.seconds\nschedule.exponential(100.millis) |> upTo(3)\n");
 }
 
 // ---- errors as effects ---------------------------------------------------------
@@ -482,6 +484,8 @@ main :: () {
 #[test]
 fn retry_reevaluates_until_success() {
     let out = run(r#"
+use std/schedule
+
 struct Flaky = { Int n }
 
 service Counter {
@@ -512,7 +516,7 @@ main :: () {
         // retry does not clear the error row — a retried action can still
         // fail — so main still has to catch.
         n = attempt()
-            |> retry(Schedule.fixed(1.millis) |> upTo(5))
+            |> retry(schedule.fixed(1.millis) |> upTo(5))
             |> catch { Flaky -> -1 }
         println(n)
     }
@@ -730,12 +734,12 @@ fn builtins_hover_with_their_signature() {
     let src = std::fs::read_to_string(path).unwrap();
     let checked = check_source(&src);
     let has = |prefix: &str| checked.info.hovers.iter().any(|(_, t)| t.starts_with(prefix));
-    // The example calls retry/orFail/decode/Schedule.exponential; hovering
+    // The example calls retry/orFail/decode/schedule.exponential; hovering
     // them shows the builtin's signature + doc, not just "(builtin)".
     assert!(has("retry(lazy action, schedule) -> a"), "retry hover missing");
     assert!(has("orFail(option, error) -> a"), "orFail hover missing");
     assert!(has("decode(raw, StructName) -> a ! DecodeError"), "decode hover missing");
-    assert!(has("Schedule.exponential(base) -> Schedule"), "schedule hover missing");
+    assert!(has("schedule.exponential(base) -> Schedule"), "schedule hover missing");
     assert!(
         !checked.info.hovers.iter().any(|(_, t)| t.ends_with("(builtin)")),
         "no builtin should fall back to the bare `(builtin)` hover"
@@ -819,10 +823,10 @@ main :: () {
 fn gfx_requires_use() {
     let errors = check_errors(r#"
 main :: () {
-    Gfx.mouseX()
+    graphics.mouseX()
 }
 "#);
-    assert!(errors.iter().any(|e| e.contains("add `use Gfx`")), "got: {errors:?}");
+    assert!(errors.iter().any(|e| e.contains("add `use std/graphics`")), "got: {errors:?}");
 }
 
 #[test]
@@ -838,7 +842,7 @@ bang :: () -> String {
 }
 "#;
     let main_src = r#"
-use lib
+use lib { yell }
 
 main :: () {
     println(yell("hey"))
@@ -860,8 +864,43 @@ main :: () {
     let out = interp::run_captured(&checked.program, "main").unwrap();
     assert_eq!(out, "hey!\n");
 
+    // A plain `use lib` binds the qualified alias instead.
+    let qualified = "\nuse lib\n\nmain :: () {\n    println(lib.yell(\"yo\"))\n}\n";
+    let loaded = inga_core::modules::load_program_with(
+        Path::new("/virtual/main.inga"),
+        qualified.to_string(),
+        &mut |p| (p == Path::new("/virtual/lib.inga")).then(|| lib.to_string()),
+    );
+    let (checked, _mods) = inga_core::check_loaded(loaded);
+    let errors: Vec<&str> = checked
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .map(|d| d.message.as_str())
+        .collect();
+    assert!(errors.is_empty(), "qualified call failed: {errors:?}");
+    let out = interp::run_captured(&checked.program, "main").unwrap();
+    assert_eq!(out, "yo!\n");
+
+    // ...and a bare name through a plain import is rejected with a hint.
+    let bare = main_src.replace("use lib { yell }", "use lib");
+    let loaded = inga_core::modules::load_program_with(
+        Path::new("/virtual/main.inga"),
+        bare,
+        &mut |p| (p == Path::new("/virtual/lib.inga")).then(|| lib.to_string()),
+    );
+    let (checked, _mods) = inga_core::check_loaded(loaded);
+    assert!(
+        checked
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("call it as `lib.yell`")),
+        "got: {:?}",
+        checked.diagnostics
+    );
+
     // Private names do not cross the module boundary.
-    let bad = main_src.replace("yell(\"hey\")", "bang()");
+    let bad = main_src.replace("use lib { yell }", "use lib { bang }").replace("yell(\"hey\")", "bang()");
     let loaded = inga_core::modules::load_program_with(
         Path::new("/virtual/main.inga"),
         bad,

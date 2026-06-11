@@ -148,8 +148,45 @@ impl<'a> Parser<'a> {
         if self.at(&TokenKind::KwUse) {
             let start = self.peek().span;
             self.bump();
-            let (name, name_span) = self.expect_ident("a module name");
-            return Some(Decl::Use(UseDecl { name, name_span, span: start.to(self.prev_span()) }));
+            let (first, first_span) = self.expect_ident("a module path");
+            let mut path = vec![first];
+            let mut path_span = first_span;
+            while self.at(&TokenKind::Slash) {
+                self.bump();
+                let (seg, seg_span) = self.expect_ident("a module path segment");
+                if seg == "<error>" {
+                    break;
+                }
+                path.push(seg);
+                path_span = path_span.to(seg_span);
+            }
+            let names = if self.at(&TokenKind::LBrace) {
+                self.bump();
+                self.skip_newlines();
+                let mut names = Vec::new();
+                while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
+                    let (n, n_span) = self.expect_ident("an imported name");
+                    if n == "<error>" {
+                        break;
+                    }
+                    names.push((n, n_span));
+                    self.skip_newlines();
+                    if self.at(&TokenKind::Comma) {
+                        self.bump();
+                        self.skip_newlines();
+                    }
+                }
+                self.expect(&TokenKind::RBrace, "`}`");
+                Some(names)
+            } else {
+                None
+            };
+            return Some(Decl::Use(UseDecl {
+                path,
+                path_span,
+                names,
+                span: start.to(self.prev_span()),
+            }));
         }
         let is_pub = if self.at(&TokenKind::KwPub) {
             self.bump();

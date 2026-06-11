@@ -11,7 +11,8 @@ pub struct Program {
 
 #[derive(Debug)]
 pub enum Decl {
-    /// `use shapes` (a sibling file module) or `use Gfx` (a std module).
+    /// `use cards` / `use std/graphics` (qualified: `graphics.rect(...)`)
+    /// or `use cards { rankName, suitCol }` (unqualified, listed names only).
     Use(UseDecl),
     /// `struct User = { Int id, String name }`
     Struct(StructDecl),
@@ -27,8 +28,12 @@ pub enum Decl {
 
 #[derive(Debug)]
 pub struct UseDecl {
-    pub name: String,
-    pub name_span: Span,
+    /// Path segments: `std/graphics` -> ["std", "graphics"]. The last
+    /// segment is the qualified alias.
+    pub path: Vec<String>,
+    pub path_span: Span,
+    /// `use m { a, b }` imports only these names, unqualified.
+    pub names: Option<Vec<(String, Span)>>,
     pub span: Span,
 }
 

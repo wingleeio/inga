@@ -1,3 +1,4 @@
+(use_declaration module: (_) @name) @item
 (struct_declaration name: (type_identifier) @name) @item
 (enum_declaration name: (type_identifier) @name) @item
 (enum_variant name: (type_identifier) @name) @item

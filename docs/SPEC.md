@@ -124,11 +124,26 @@ cached :: (id) {
 }
 ```
 
-`provide impl1, impl2 { body }` instantiates the implementations (running
-their field initializers — each `provide` gets fresh instances) and satisfies
-those services for the dynamic extent of the body, *subtracting* them from
-the body's `uses` row. Capabilities compose transitively: callers of `cached`
-inherit `uses Cache, Logger` without writing anything.
+`provide` instantiates implementations (running their field initializers —
+each `provide` gets fresh instances) and satisfies those services for a
+dynamic extent, *subtracting* them from that extent's `uses` row. It has
+two forms:
+
+```inga
+main :: () {
+    provide prettyLogger, db        // braceless: the rest of this block
+    Db handle
+    ...
+    provide fakeDb { runTests() }   // braced: just this body
+}
+```
+
+Items provide **left to right**: a later implementation's field
+initializers run with the earlier services already available, so an impl
+whose setup logs can be written `provide prettyLogger, db`. An item may
+also be a configured builtin resource — `provide Arena(256.kb)` switches
+the scope's allocator (see §6). Capabilities compose transitively: callers
+of `cached` inherit `uses Cache, Logger` without writing anything.
 
 This is Effect.ts `Layer`/`Context` reduced to two keywords. There are no
 globals and no implicit singletons; tests provide fakes the same way `main`
@@ -194,29 +209,75 @@ Measured result (bench/README.md): the compiled benchmarks beat Node/V8 on
 all five workloads — about 2× on calls, dispatch, and strings, ~860× on
 typed-error control flow — and run ~300× faster than the interpreter.
 
+**Memory.** Compiled Inga uses Perceus-style ARC plus optional region
+arenas:
+
+- Every heap object carries one header word: a **non-atomic refcount**
+  (compiled Inga is single-threaded), or a marker for string constants and
+  arena objects (dup/release are no-ops on those). The compiler emits
+  type-directed drop glue per struct/enum/list/option, inserts a `dup`
+  where a value is stored into something longer-lived, and registers every
+  fresh heap value in a per-function pool that is released on every return
+  path — allocation-heavy code reclaims memory at function granularity,
+  and small dead objects recycle through segregated free lists at bump
+  speed.
+- `provide Arena(256.kb)` pushes a **region**: allocations in its dynamic
+  extent are bump-allocated from the region (overflow chains chunks) and
+  freed wholesale when the scope ends, failures included. The checker
+  rejects an arena scope whose result is heap-shaped (it would escape the
+  freed region); error boxes are allocated from the RC heap so a `fail`
+  can cross an arena boundary.
+- Known leaks, by design (all bounded by program shape, not input size):
+  closures and service instances free their record but not their captures;
+  MutMap contents; error boxes. Values stored into an arena keep their
+  region alive only as long as the scope — don't stash arena values in
+  longer-lived structures.
+
 **Current limits of the backend:** `encode`/`decode` (runtime JSON) and
-showing structs still require the interpreter, and compiled programs use a
-bump allocator that never frees (no GC yet — acceptable for short-lived
-processes, on the roadmap). Full delimited-continuation effects (resumable
-handlers, generators, async) remain out of scope; handlers are syntax
-(`catch`, `provide`) rather than first-class values precisely so that
-evidence passing stays sufficient.
+showing structs still require the interpreter. Full
+delimited-continuation effects (resumable handlers, generators, async)
+remain out of scope; handlers are syntax (`catch`, `provide`) rather than
+first-class values precisely so that evidence passing stays sufficient.
 
-## 7. Packages (future)
+## 7. Modules
 
-Out of scope for v0.1 (programs are single files), but the design intent,
-so syntax doesn't paint us into a corner:
+Modules are files. `use geometry` imports the sibling file
+`geometry.inga`; its `pub` declarations become visible to the importer,
+everything else is module-private:
 
-- A manifest (`inga.toml`) with content-addressed, lockfile-pinned deps.
-- Modules are files; `use http/client` style imports; capabilities make
-  library APIs honest — a package that needs the network *says so in its
-  types* (`uses Http`), and the application root decides what to provide.
-  Dependency injection and package dependencies are the same idea at two
-  scales.
+```inga
+// geometry.inga
+pub enum Shape = Circle { Float radius } | Dot
+pub area :: (Shape s) -> Float { ... }
+tau :: () -> Float { 6.28318 }        // private
+
+// main.inga
+use geometry
+main :: () { println(area(Circle(2.0))) }
+```
+
+- `pub` may prefix any top-level declaration (struct, enum, service,
+  implementation, function). Referencing another module's private name is
+  an error; referencing a loaded-but-unimported module's name suggests the
+  missing `use`.
+- Imports are not re-exported; diamonds and cycles load once. Top-level
+  names are program-unique (whole-program compilation, monomorphic v0.1).
+- **Std modules** are compiler-implemented and imported the same way:
+  `use Gfx` enables the graphics module (it is no longer ambient).
+  `Schedule` stays in the core language because `retry` depends on it.
+- Internally, every module lexes at a disjoint base offset into one global
+  span space, so inference, the interpreter, the LLVM backend, and
+  diagnostics (mapped back to file + line) all operate on one merged
+  program.
+
+Future packages keep this shape: a manifest (`inga.toml`) with
+content-addressed, lockfile-pinned deps; capabilities make library APIs
+honest — a package that needs the network *says so in its types*
+(`uses Http`), and the application root decides what to provide.
 
 ## 8. Graphics bindings
 
-The `Gfx` builtin module (like `Schedule`, resolved by name) provides
+The `Gfx` std module (imported with `use Gfx`) provides
 GL-backed 2D graphics, implemented on OpenGL through miniquad/macroquad in
 both the interpreter (cargo feature `gfx`, enabled by the CLI) and the
 native runtime:
@@ -253,9 +314,10 @@ tests). See `games/balatro.inga` for a complete game.
 
 ```
 program   := decl*
-decl      := 'struct' Upper '=' '{' field,* '}'
-           | 'enum' Upper '=' variant ('|' variant)*
-           | 'service' Upper '{' (name '::' sig)* '}'
+decl      := 'use' name
+           | 'pub'? 'struct' Upper '=' '{' field,* '}'
+           | 'pub'? 'enum' Upper '=' variant ('|' variant)*
+           | 'pub'? 'service' Upper '{' (name '::' sig)* '}'
            | name '::' Upper '{' (name '=' expr | name '::' sig block)* '}'   -- impl
            | name '::' sig block                                              -- func
 variant   := Upper ('{' field,* '}')?
@@ -266,7 +328,9 @@ field     := type? name
 block     := '{' stmt* '}'
 stmt      := Upper name                      -- capability bind
            | type? name '=' expr             -- binding
+           | 'provide' item,*                -- braceless: scopes over the rest of the block
            | expr
+item      := name ('(' expr,* ')')?          -- impl, or a resource like Arena(256.kb)
 expr      := pipe; pipe := or ('|>' (call | 'catch' arms))*
            | match | if | fail | provide | lambda | literals…
 arms      := '{' (pattern '->' expr)+ '}'

@@ -30,6 +30,7 @@ module.exports = grammar({
     [$._type, $.acquire, $._expression],
     [$._type, $._expression],
     [$.parameter, $._expression],
+    [$.provide_item],
   ],
 
   rules: {
@@ -47,6 +48,7 @@ module.exports = grammar({
 
     _declaration: $ =>
       choice(
+        $.use_declaration,
         $.struct_declaration,
         $.enum_declaration,
         $.service_declaration,
@@ -54,14 +56,19 @@ module.exports = grammar({
         $.implementation
       ),
 
+    // `use Gfx` (std module) or `use geometry` (sibling file).
+    use_declaration: $ =>
+      seq('use', field('module', choice($.identifier, $.type_identifier))),
+
     struct_declaration: $ =>
-      seq('struct', field('name', $.type_identifier), '=', $.fields),
+      seq(optional('pub'), 'struct', field('name', $.type_identifier), '=', $.fields),
 
     // `enum Shape = Circle { Float radius } | Rect { Float w, Float h } | Dot`
     // A newline may precede each `|`, which works out because newlines are
     // treated as whitespace.
     enum_declaration: $ =>
       seq(
+        optional('pub'),
         'enum',
         field('name', $.type_identifier),
         '=',
@@ -77,15 +84,16 @@ module.exports = grammar({
     field: $ => seq(optional($._type), field('name', $.identifier)),
 
     service_declaration: $ =>
-      seq('service', field('name', $.type_identifier), '{', repeat($.method_signature), '}'),
+      seq(optional('pub'), 'service', field('name', $.type_identifier), '{', repeat($.method_signature), '}'),
 
     method_signature: $ => seq(field('name', $.identifier), '::', $.signature),
 
     function_declaration: $ =>
-      seq(field('name', $.identifier), '::', $.signature, field('body', $.block)),
+      seq(optional('pub'), field('name', $.identifier), '::', $.signature, field('body', $.block)),
 
     implementation: $ =>
       seq(
+        optional('pub'),
         field('name', $.identifier),
         '::',
         field('service', $.type_identifier),
@@ -230,8 +238,19 @@ module.exports = grammar({
 
     fail_expression: $ => prec.right(seq('fail', $._expression)),
 
+    // `provide a, b { ... }` (braced: scopes over the block) or
+    // `provide Arena(256.kb), logger` (braceless: scopes over the rest of the
+    // enclosing block). Items may be plain bindings or calls with arguments.
     provide_expression: $ =>
-      seq('provide', sepBy1(',', $.identifier), field('body', $.block)),
+      prec.right(
+        seq('provide', sepBy1(',', $.provide_item), optional(field('body', $.block)))
+      ),
+
+    provide_item: $ =>
+      seq(
+        choice($.identifier, $.type_identifier),
+        optional(field('arguments', $.arguments))
+      ),
 
     lambda: $ =>
       prec.right(seq($.parameters, '->', field('body', $._expression))),

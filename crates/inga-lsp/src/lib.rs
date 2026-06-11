@@ -320,7 +320,7 @@ impl Server {
             });
         }
         for keyword in
-            ["struct", "enum", "service", "match", "catch", "fail", "provide", "uses", "lazy", "if", "else"]
+            ["use", "pub", "struct", "enum", "service", "match", "catch", "fail", "provide", "uses", "lazy", "if", "else"]
         {
             items.push(CompletionItem {
                 label: keyword.to_string(),

@@ -131,7 +131,7 @@ crates/inga-lsp       language server (lsp-server / lsp-types)
 editors/vscode        VS Code extension + TextMate grammar
 editors/zed           Zed extension (tree-sitter highlighting + LSP)
 tree-sitter-inga      tree-sitter grammar (used by the Zed extension)
-examples/             hello.inga, retry.inga, shapes.inga, user_service.inga
+examples/             hello.inga, retry.inga, shapes.inga, modules.inga (+ geometry.inga), user_service.inga
 games/                balatro.inga — a Balatro-style deckbuilder on the Gfx module
 bench/                the same workloads in Inga, JavaScript, and Rust (see bench/README.md)
 docs/SPEC.md          language design: semantics, effect rows, execution strategy
@@ -148,12 +148,16 @@ semantics, full language). `inga build` compiles to native code through LLVM
 — and because Inga's effects are static, **the effect system compiles
 away**: error rows become Rust-style `{value, err}` two-register returns,
 capability rows become Koka-style evidence parameters, and a capability
-method call is the same machine code as a Rust `dyn` call. Details in
+method call is the same machine code as a Rust `dyn` call. Memory is
+**Perceus-style ARC** (non-atomic refcounts + compiler-emitted drop glue,
+small objects recycled through free lists) with opt-in region arenas:
+`provide Arena(256.kb)` makes a scope allocate from a region freed
+wholesale at scope end. Details in
 [docs/SPEC.md §6](docs/SPEC.md#6-execution-how-inga-runs).
 
 The result ([benchmarks](bench/README.md)): **compiled Inga beats Node/V8 on
-all five benchmark workloads** — ~2× on raw calls, DI dispatch, and string
-interpolation, ~860× on typed-error control flow — and beats idiomatic Rust
+all five benchmark workloads** — 2–3× on raw calls, DI dispatch, and string
+interpolation, ~380× on typed-error control flow — and beats idiomatic Rust
 on two of them.
 
 ## Status

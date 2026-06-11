@@ -1891,7 +1891,7 @@
     "fields": {
       "body": {
         "multiple": false,
-        "required": true,
+        "required": false,
         "types": [
           {
             "type": "block",
@@ -1905,7 +1905,37 @@
       "required": true,
       "types": [
         {
+          "type": "provide_item",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "provide_item",
+    "named": true,
+    "fields": {
+      "arguments": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "arguments",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
           "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "type_identifier",
           "named": true
         }
       ]
@@ -1999,6 +2029,10 @@
         },
         {
           "type": "struct_declaration",
+          "named": true
+        },
+        {
+          "type": "use_declaration",
           "named": true
         }
       ]
@@ -2156,6 +2190,26 @@
           "named": true
         }
       ]
+    }
+  },
+  {
+    "type": "use_declaration",
+    "named": true,
+    "fields": {
+      "module": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "type_identifier",
+            "named": true
+          }
+        ]
+      }
     }
   },
   {
@@ -2330,6 +2384,10 @@
     "named": false
   },
   {
+    "type": "pub",
+    "named": false
+  },
+  {
     "type": "service",
     "named": false
   },
@@ -2344,6 +2402,10 @@
   {
     "type": "type_identifier",
     "named": true
+  },
+  {
+    "type": "use",
+    "named": false
   },
   {
     "type": "uses",

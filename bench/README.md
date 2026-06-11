@@ -26,15 +26,19 @@ Reproduce with `bench/run.sh`.
 
 | Workload | **Inga native** | JavaScript | Rust | Inga interp | native vs V8 |
 |---|---:|---:|---:|---:|---:|
-| `fib(27)` | **437 µs** | 981 µs | 380 µs | 142,872 µs | **2.2× faster** |
-| `fib_service(24)` | **148 µs** | 276 µs | 89 µs | 58,920 µs | **1.9× faster** |
-| `strings(24)` | **181 µs** | 451 µs | 2,826 µs | 41,852 µs | **2.5× faster** |
-| `errors(24)` | **239 µs** | 205,356 µs | 90 µs | 65,081 µs | **859× faster** |
-| `store(24)` | **692 µs** | 945 µs | 1,305 µs | 113,661 µs | **1.4× faster** |
+| `fib(27)` | **353 µs** | 1,018 µs | 531 µs | 147,487 µs | **2.9× faster** |
+| `fib_service(24)` | **140 µs** | 275 µs | 124 µs | 57,532 µs | **2.0× faster** |
+| `strings(24)` | **180 µs** | 459 µs | 3,730 µs | 41,254 µs | **2.6× faster** |
+| `errors(24)` | **544 µs** | 207,173 µs | 124 µs | 63,107 µs | **380× faster** |
+| `store(24)` | **631 µs** | 935 µs | 1,690 µs | 114,472 µs | **1.5× faster** |
 
 **Compiled Inga beats V8 on all five workloads** — and beats the idiomatic
 Rust version on two (`strings`, where `format!` allocates per node, and
-`store`, where std's `HashMap` pays for SipHash).
+`store`, where std's `HashMap` pays for SipHash). These numbers include
+Inga's Perceus-style ARC: unlike the earlier never-freeing bump allocator,
+every workload now reclaims memory (`errors` pays ~2× for boxing failed
+values and refcounts and is still ~380× ahead of V8; `fib` and `store` got
+*faster* because dead objects recycle through warm free lists).
 
 ## Why it's fast — and where that's earned vs. situational
 

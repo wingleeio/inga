@@ -14,6 +14,8 @@
 (boolean) @boolean
 
 [
+  "use"
+  "pub"
   "struct"
   "enum"
   "service"

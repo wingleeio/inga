@@ -2,10 +2,12 @@
 //
 //   inga test games/logic_test.inga
 //
-// Each zero-parameter `test*` function is one test; `assert`/`assertEq`
-// failures are reported with the failing line.
+// Each zero-parameter `test*` function is one test. State lives in the
+// `Game` service, so every test provides its own `freshGame` — the same
+// way `main` provides the real one — and gets pristine tables.
 
-use util { gn }
+use game { Game, freshGame }
+use util { gn, gv }
 use cards { chipsOf, rankName, suitName }
 use poker { baseChips, baseMult, evalSelected, handTypeName }
 use state { blindName, selCount, sortKey, targetFor }
@@ -15,12 +17,15 @@ card :: (Int rank, Int suit) -> Int {
     rank * 4 + suit
 }
 
-pick :: (hand, sel, Int slot, Int c) {
-    hand.set(slot, c)
-    sel.set(slot, 1)
+pick :: (Int slot, Int c) uses Game {
+    Game game
+    game.hand().set(slot, c)
+    game.sel().set(slot, 1)
 }
 
-emptyFrom :: (hand, Int start) {
+emptyFrom :: (Int start) uses Game {
+    Game game
+    hand = game.hand()
     map(range(8), (i) -> {
         if i >= start {
             hand.set(i, -1)
@@ -47,11 +52,12 @@ testBlindsAndTargets :: () {
 }
 
 testSelCount :: () {
-    sel = MutMap()
-    assertEq(selCount(sel), 0)
-    sel.set(0, 1)
-    sel.set(4, 1)
-    assertEq(selCount(sel), 2)
+    provide freshGame
+    Game game
+    assertEq(selCount(), 0)
+    game.sel().set(0, 1)
+    game.sel().set(4, 1)
+    assertEq(selCount(), 2)
 }
 
 testSortKeyOrdersByRankThenSuit :: () {
@@ -61,48 +67,48 @@ testSortKeyOrdersByRankThenSuit :: () {
 }
 
 testFlushBeatsNothing :: () {
-    hand = MutMap()
-    sel = MutMap()
-    out = MutMap()
+    provide freshGame
+    Game game
     // Five hearts with a rank gap: a flush (type 5), not a straight flush.
-    pick(hand, sel, 0, card(0, 1))
-    pick(hand, sel, 1, card(2, 1))
-    pick(hand, sel, 2, card(4, 1))
-    pick(hand, sel, 3, card(6, 1))
-    pick(hand, sel, 4, card(9, 1))
-    emptyFrom(hand, 5)
-    evalSelected(hand, sel, out)
+    pick(0, card(0, 1))
+    pick(1, card(2, 1))
+    pick(2, card(4, 1))
+    pick(3, card(6, 1))
+    pick(4, card(9, 1))
+    emptyFrom(5)
+    evalSelected()
+    out = game.out()
     assertEq(gn(out, 0), 5)
     assertEq(handTypeName(gn(out, 0)), "Flush")
     assertEq(gn(out, 6), 5) // all five count as hearts for joker effects
 }
 
 testPairAndChips :: () {
-    hand = MutMap()
-    sel = MutMap()
-    out = MutMap()
-    pick(hand, sel, 0, card(12, 0)) // A
-    pick(hand, sel, 1, card(12, 1)) // A
-    pick(hand, sel, 2, card(3, 2)) // 5
-    emptyFrom(hand, 3)
-    evalSelected(hand, sel, out)
+    provide freshGame
+    Game game
+    pick(0, card(12, 0)) // A
+    pick(1, card(12, 1)) // A
+    pick(2, card(3, 2)) // 5
+    emptyFrom(3)
+    evalSelected()
+    out = game.out()
     assertEq(handTypeName(gn(out, 0)), "Pair")
     assertEq(gn(out, 3), 11 + 11 + 5) // summed card chips
     assertEq(gn(out, 14), 1) // pair flag for Sly Joker
 }
 
 testStraightAndWheel :: () {
-    hand = MutMap()
-    sel = MutMap()
-    out = MutMap()
+    provide freshGame
+    Game game
     // A-2-3-4-5 "wheel" straight, mixed suits.
-    pick(hand, sel, 0, card(12, 0))
-    pick(hand, sel, 1, card(0, 1))
-    pick(hand, sel, 2, card(1, 2))
-    pick(hand, sel, 3, card(2, 3))
-    pick(hand, sel, 4, card(3, 0))
-    emptyFrom(hand, 5)
-    evalSelected(hand, sel, out)
+    pick(0, card(12, 0))
+    pick(1, card(0, 1))
+    pick(2, card(1, 2))
+    pick(3, card(2, 3))
+    pick(4, card(3, 0))
+    emptyFrom(5)
+    evalSelected()
+    out = game.out()
     assertEq(handTypeName(gn(out, 0)), "Straight")
     assertEq(gn(out, 16), 1) // straight flag for Mystic Summit
 }
@@ -111,4 +117,14 @@ testScoreScalesWithHandType :: () {
     assert(baseChips(8) > baseChips(1))
     assert(baseMult(8) > baseMult(1))
     assertEq(baseChips(1) * baseMult(1), 20) // a bare pair scores 10 x 2
+}
+
+testFreshGamesAreIndependent :: () {
+    // Each provide constructs new instances — no state bleeds between runs.
+    provide freshGame {
+        Game game
+        game.vals().set("money", 99)
+    }
+    provide freshGame
+    assertEq(gv("money"), 0)
 }

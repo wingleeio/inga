@@ -699,6 +699,30 @@ impl<'a> Checker<'a> {
                     Type::Unknown
                 }
             },
+            TypeExpr::Apply { name, name_span, args, .. } => {
+                match (name.as_str(), args.len()) {
+                    ("MutMap", 2) => Type::MutMap(
+                        Box::new(self.resolve_type_expr(&args[0], tyvars)),
+                        Box::new(self.resolve_type_expr(&args[1], tyvars)),
+                    ),
+                    ("Task", 1) => Type::Task(
+                        Box::new(self.resolve_type_expr(&args[0], tyvars)),
+                        Rc::new(RefCell::new(BTreeSet::new())),
+                    ),
+                    _ => {
+                        for arg in args {
+                            self.resolve_type_expr(arg, tyvars);
+                        }
+                        self.error(
+                            *name_span,
+                            format!(
+                                "`{name}` does not take type arguments (only `MutMap<K, V>` and `Task<T>` do)"
+                            ),
+                        );
+                        Type::Unknown
+                    }
+                }
+            }
             TypeExpr::Option(inner, _) => {
                 Type::Option(Box::new(self.resolve_type_expr(inner, tyvars)))
             }

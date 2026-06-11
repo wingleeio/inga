@@ -2,17 +2,24 @@
 // swirling background shader.
 
 use std/graphics
+use game { Game }
 
 // ---- small helpers ----------------------------------------------------------
 
-// Int-keyed and string-keyed map reads (two helpers because user functions
-// are monomorphic in v0.2).
-pub gn :: (m, Int k) -> Int {
+// Read a slot of any of the game's int-keyed tables.
+pub gn :: (MutMap<Int, Int> m, Int k) -> Int {
     m.get(k) |> getOrElse(0)
 }
 
-pub gv :: (m, String k) -> Int {
-    m.get(k) |> getOrElse(0)
+// Read / write the named game scalars (score, money, phase, ...).
+pub gv :: (String k) -> Int uses Game {
+    Game game
+    game.vals().get(k) |> getOrElse(0)
+}
+
+pub sv :: (String k, Int v) uses Game {
+    Game game
+    game.vals().set(k, v)
 }
 
 pub rgb :: (Int r, Int g, Int b) -> Int {
@@ -119,13 +126,13 @@ swirlSrc :: () -> String {
         + "}\n"
 }
 
-pub drawBackground :: (g) {
-    if gv(g, "shInit") == 0 {
-        g.set("shInit", 1)
-        g.set("shH", graphics.shaderNew(swirlSrc()))
+pub drawBackground :: () uses Game {
+    if gv("shInit") == 0 {
+        sv("shInit", 1)
+        sv("shH", graphics.shaderNew(swirlSrc()))
     }
     graphics.clear(22, 30, 40)
-    h = gv(g, "shH")
+    h = gv("shH")
     if h >= 0 {
         graphics.shaderUse(h)
         graphics.rect(0, 0, 960, 540, 255, 255, 255, 255)

@@ -1,6 +1,6 @@
 // INGA-LATRO cards: ranks, suits, chip values.
 
-use util { gv, rgb }
+use util { rgb }
 
 // ---- cards -------------------------------------------------------------------
 

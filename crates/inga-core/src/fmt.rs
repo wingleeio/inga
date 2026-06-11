@@ -739,6 +739,10 @@ fn render_type(ty: &TypeExpr) -> String {
             }
         }
         TypeExpr::List(inner, _) => format!("[{}]", render_type(inner)),
+        TypeExpr::Apply { name, args, .. } => {
+            let args: Vec<String> = args.iter().map(render_type).collect();
+            format!("{name}<{}>", args.join(", "))
+        }
         TypeExpr::Tuple(items, _) => {
             let inner: Vec<String> = items.iter().map(render_type).collect();
             format!("({})", inner.join(", "))

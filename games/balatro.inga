@@ -9,10 +9,15 @@
 //
 // Everything below is plain Inga — including the swirling background, which
 // is a GLSL fragment shader compiled at runtime through graphics.shaderNew.
+// All game state lives in the `Game` service (game.inga), provided once in
+// `main`; every function that needs it says `uses Game` (inferred), so
+// nothing threads state through arguments.
 
 use std/graphics
+use game { Game, freshGame }
 use util {
-    brighten, button, cap255, centerText, dim, drawBackground, gn, gv, hit, rgb, roundRect, textC,
+    brighten, button, cap255, centerText, dim, drawBackground, gn, gv, hit, rgb, roundRect, sv,
+    textC,
 }
 use cards { chipsOf, rankName, suitCol, suitName }
 use jokers { jokerDesc, jokerName, jokerPrice }
@@ -74,19 +79,19 @@ drawCard :: (Int card, Int x, Int y, Bool hovered, Bool selected, Int flash) {
     textC("+${chipsOf(card)}", cx + cw - 33, cy + 20, 13, rgb(180, 205, 255))
 }
 
-drawSidebar :: (g, hand, sel, jok, out) {
-    shx = gv(g, "shx")
-    shy = gv(g, "shy")
+drawSidebar :: () uses Game {
+    shx = gv("shx")
+    shy = gv("shy")
     graphics.rect(shx, shy, 230, 540, 14, 19, 26, 235)
     graphics.rect(shx + 228, shy, 2, 540, 60, 70, 90, 235)
     textC("INGA-LATRO", 20 + shx, 40 + shy, 30, rgb(255, 90, 90))
-    target = gv(g, "target")
-    score = gv(g, "score")
-    hands = gv(g, "hands")
-    discards = gv(g, "discards")
-    money = gv(g, "money")
-    ante = gv(g, "ante")
-    blind = gv(g, "blind")
+    target = gv("target")
+    score = gv("score")
+    hands = gv("hands")
+    discards = gv("discards")
+    money = gv("money")
+    ante = gv("ante")
+    blind = gv("blind")
     // Blind badge.
     badge = match blind {
         0 -> rgb(70, 130, 220)
@@ -98,31 +103,31 @@ drawSidebar :: (g, hand, sel, jok, out) {
     textC(blindName(blind), 54 + shx, 93 + shy, 24, rgb(120, 170, 255))
     textC("Target: ${target}", 20 + shx, 124 + shy, 22, rgb(230, 230, 230))
     // Eased score count-up.
-    disp = gv(g, "dispScore")
+    disp = gv("dispScore")
     disp = disp + (score - disp) / 5 + (score - disp) % 5 / 4
-    g.set("dispScore", disp)
+    sv("dispScore", disp)
     textC("Score", 20 + shx, 166 + shy, 20, rgb(150, 155, 160))
-    pop = gv(g, "popT")
+    pop = gv("popT")
     scoreSize = 38 + pop / 4
     textC("${disp}", 20 + shx, 202 + shy + pop / 8, scoreSize, rgb(250, 250, 250))
     textC("Hands: ${hands}", 20 + shx, 248 + shy, 22, rgb(120, 190, 255))
     textC("Discards: ${discards}", 20 + shx, 276 + shy, 22, rgb(255, 130, 130))
     textC("Money: \$${money}", 20 + shx, 318 + shy, 26, rgb(255, 210, 80))
     textC("Ante: ${ante}/8", 20 + shx, 356 + shy, 22, rgb(200, 200, 200))
-    deckLeft = 52 - gv(g, "deckPos")
+    deckLeft = 52 - gv("deckPos")
     textC("Deck: ${deckLeft}/52", 20 + shx, 388 + shy, 18, rgb(150, 155, 160))
-    if gv(g, "lastType") >= 0 {
-        gained = gv(g, "lastGain")
+    if gv("lastType") >= 0 {
+        gained = gv("lastGain")
         textC("Last hand:", 20 + shx, 434 + shy, 18, rgb(150, 155, 160))
-        textC(handTypeName(gv(g, "lastType")), 20 + shx, 456 + shy, 18, rgb(230, 230, 230))
+        textC(handTypeName(gv("lastType")), 20 + shx, 456 + shy, 18, rgb(230, 230, 230))
         textC("+${gained}", 20 + shx, 478 + shy, 18, rgb(255, 210, 80))
     }
 }
 
 // The deck stack, tucked into the sidebar.
-drawDeck :: (g) {
-    shx = gv(g, "shx")
-    shy = gv(g, "shy")
+drawDeck :: () uses Game {
+    shx = gv("shx")
+    shy = gv("shy")
     map(range(3), (k) -> {
         x = 158 + shx - k * 2
         y = 420 + shy - k * 2
@@ -132,14 +137,17 @@ drawDeck :: (g) {
         graphics.circle(x + 26, y + 35, 13, 56, 74, 140, 255)
         0
     })
-    deckLeft = 52 - gv(g, "deckPos")
+    deckLeft = 52 - gv("deckPos")
     centerText("${deckLeft}", 180 + shx, 512 + shy, 18, rgb(235, 235, 245))
 }
 
-drawJokers :: (g, jok, av) {
-    shx = gv(g, "shx")
-    shy = gv(g, "shy")
-    owned = gv(g, "jokers")
+drawJokers :: () uses Game {
+    Game game
+    jok = game.jok()
+    av = game.av()
+    shx = gv("shx")
+    shy = gv("shy")
+    owned = gv("jokers")
     textC("Jokers (${owned}/5)", 250 + shx, 40 + shy, 18, rgb(170, 175, 180))
     map(range(owned), (s) -> {
         flash = gn(av, 50 + s)
@@ -198,9 +206,9 @@ drawJokers :: (g, jok, av) {
 }
 
 // The chips x mult readout, Balatro-style.
-drawScorePanel :: (g, String name, Int chips, Int mult) {
-    shx = gv(g, "shx")
-    shy = gv(g, "shy")
+drawScorePanel :: (String name, Int chips, Int mult) uses Game {
+    shx = gv("shx")
+    shy = gv("shy")
     textC(name, 250 + shx, 320 + shy, 22, rgb(255, 240, 180))
     bx = 250 + shx
     by = 330 + shy
@@ -216,16 +224,22 @@ drawScorePanel :: (g, String name, Int chips, Int mult) {
 }
 
 // One animation step toward `target` (fixed-point x1000 easing).
-ease :: (av, Int key, Int target) {
+ease :: (Int key, Int target) uses Game {
+    Game game
+    av = game.av()
     cur = gn(av, key)
     av.set(key, cur + (target - cur) / 4)
 }
 
 // Advance the scoring choreography one frame: stage the played cards,
 // trigger each step (flash + shake + popup), land the total.
-tickScoring :: (g, deck, hand, sel, steps, av) {
-    t = gv(g, "animT")
-    nSteps = gv(g, "nSteps")
+tickScoring :: () uses Game {
+    Game game
+    sel = game.sel()
+    steps = game.steps()
+    av = game.av()
+    t = gv("animT")
+    nSteps = gv("nSteps")
     // Stage progress for the played cards.
     map(range(8), (i) -> {
         if gn(sel, i) == 1 {
@@ -241,18 +255,18 @@ tickScoring :: (g, deck, hand, sel, steps, av) {
         value = gn(steps, k * 8 + 1)
         slot = gn(steps, k * 8 + 2)
         if kind == 0 {
-            g.set("shake", 3)
+            sv("shake", 3)
         }
         if kind == 1 {
             av.set(30 + slot, 1000)
             av.set(40 + slot, value)
-            g.set("shake", 4)
+            sv("shake", 4)
         }
         if kind >= 2 && slot >= 0 {
             av.set(50 + slot, 1000)
             av.set(60 + slot, value)
             av.set(70 + slot, kind)
-            g.set("shake", if kind == 4 {
+            sv("shake", if kind == 4 {
                 11
             } else {
                 7
@@ -260,19 +274,25 @@ tickScoring :: (g, deck, hand, sel, steps, av) {
         }
         0
     }
-    g.set("animT", t + 1)
+    sv("animT", t + 1)
     if t >= nSteps * 13 + 22 {
-        finishPlay(g, deck, hand, sel, av)
+        finishPlay()
     }
     0
 }
 
-framePlay :: (g, deck, hand, sel, jok, out, steps, av) {
+framePlay :: () uses Game {
+    Game game
+    hand = game.hand()
+    sel = game.sel()
+    out = game.out()
+    steps = game.steps()
+    av = game.av()
     // Screen shake: magnitude decays, offset re-rolls every frame.
-    mag = gv(g, "shake")
-    g.set("shake", mag * 7 / 10)
-    g.set("shx", random(mag + 1) - mag / 2)
-    g.set("shy", random(mag + 1) - mag / 2)
+    mag = gv("shake")
+    sv("shake", mag * 7 / 10)
+    sv("shx", random(mag + 1) - mag / 2)
+    sv("shy", random(mag + 1) - mag / 2)
     // Flash decay runs every frame so popups fade out after the run lands.
     map(range(8), (i) -> {
         av.set(30 + i, gn(av, 30 + i) * 5 / 6)
@@ -282,7 +302,7 @@ framePlay :: (g, deck, hand, sel, jok, out, steps, av) {
         av.set(50 + s, gn(av, 50 + s) * 11 / 12)
         0
     })
-    anim = gv(g, "anim")
+    anim = gv("anim")
 
     // Card input (disabled while a hand is scoring).
     if anim == 0 {
@@ -301,11 +321,11 @@ framePlay :: (g, deck, hand, sel, jok, out, steps, av) {
                 } else {
                     0
                 }
-                ease(av, i, target)
+                ease(i, target)
                 if hovered && graphics.mousePressed() {
                     if gn(sel, i) == 1 {
                         sel.set(i, 0)
-                    } else if selCount(sel) < 5 {
+                    } else if selCount() < 5 {
                         sel.set(i, 1)
                     }
                 }
@@ -314,56 +334,55 @@ framePlay :: (g, deck, hand, sel, jok, out, steps, av) {
         })
         0
     } else {
-        tickScoring(g, deck, hand, sel, steps, av)
+        tickScoring()
     }
 
-    drawSidebar(g, hand, sel, jok, out)
-    drawJokers(g, jok, av)
-    drawDeck(g)
+    drawSidebar()
+    drawJokers()
+    drawDeck()
 
-    n = selCount(sel)
+    n = selCount()
     if anim == 0 {
         if n > 0 {
-            scoreSelected(hand, sel, jok, g, out)
-            drawScorePanel(g, handTypeName(gn(out, 0)), gn(out, 7), gn(out, 8))
+            scoreSelected()
+            drawScorePanel(handTypeName(gn(out, 0)), gn(out, 7), gn(out, 8))
         } else {
-            textC("Select up to 5 cards", 250 + gv(g, "shx"), 346 + gv(g, "shy"), 24, rgb(140, 145, 155))
+            textC("Select up to 5 cards", 250 + gv("shx"), 346 + gv("shy"), 24, rgb(140, 145, 155))
         }
     } else {
         // Readout counts up as the steps land.
-        k = gv(g, "animT") / 13
-        k = if k >= gv(g, "nSteps") {
-            gv(g, "nSteps") - 1
+        k = gv("animT") / 13
+        k = if k >= gv("nSteps") {
+            gv("nSteps") - 1
         } else {
             k
         }
-        drawScorePanel(g, handTypeName(gv(g, "pendType")), gn(steps, k * 8 + 3), gn(steps, k * 8 + 4))
+        drawScorePanel(handTypeName(gv("pendType")), gn(steps, k * 8 + 3), gn(steps, k * 8 + 4))
     }
 
     idle = anim == 0
-    if button("Play Hand", 480, 372, 140, 42, idle && n > 0 && gv(g, "hands") > 0, rgb(60, 130, 246)) {
-        playHand(g, hand, sel, jok, out, steps, av)
+    if button("Play Hand", 480, 372, 140, 42, idle && n > 0 && gv("hands") > 0, rgb(60, 130, 246)) {
+        playHand()
     }
-    if button("Discard", 640, 372, 140, 42, idle && n > 0 && gv(g, "discards") > 0, rgb(220, 70, 80)) {
-        discardSelected(g, deck, hand, sel, av)
+    if button("Discard", 640, 372, 140, 42, idle && n > 0 && gv("discards") > 0, rgb(220, 70, 80)) {
+        discardSelected()
     }
     if button("Rank", 800, 372, 70, 42, idle, rgb(90, 100, 120)) {
-        sortHand(hand, sel, av, false)
+        sortHand(false)
     }
     if button("Suit", 880, 372, 70, 42, idle, rgb(90, 100, 120)) {
-        sortHand(hand, sel, av, true)
+        sortHand(true)
     }
 
     // The hand row (during scoring, the played cards render on the stage).
-    shx = gv(g, "shx")
-    shy = gv(g, "shy")
-    stageN = MutMap()
+    shx = gv("shx")
+    shy = gv("shy")
     map(range(8), (i) -> {
         if gn(hand, i) >= 0 {
             played = anim == 1 && gn(sel, i) == 1
             if played {
-                j = gn(stageN, 0)
-                stageN.set(0, j + 1)
+                // Position on the stage = how many played cards sit left of i.
+                j = fold(range(i), 0, (acc, k) -> acc + gn(sel, k))
                 p = gn(av, 20 + i)
                 sx = (480 - n * 46) + j * 92
                 hx = handX(i)
@@ -387,10 +406,10 @@ framePlay :: (g, deck, hand, sel, jok, out, steps, av) {
     })
 
     // Floating score popup after the hand lands.
-    pop = gv(g, "popT")
+    pop = gv("popT")
     if pop > 0 {
-        g.set("popT", pop - 1)
-        val = gv(g, "popVal")
+        sv("popT", pop - 1)
+        val = gv("popVal")
         y = 300 - (60 - pop)
         size = 34 + pop / 3
         centerText("+${val}", 600 + shx, y + shy, size, dim(rgb(255, 215, 90), 55 + pop * 200 / 60))
@@ -398,17 +417,18 @@ framePlay :: (g, deck, hand, sel, jok, out, steps, av) {
     0
 }
 
-shopOffer :: (g, jok, Int slot) {
+shopOffer :: (Int slot) uses Game {
+    Game game
     x = 300 + slot * 200
     j = match slot {
-        0 -> gv(g, "shop0")
-        1 -> gv(g, "shop1")
-        _ -> gv(g, "shop2")
+        0 -> gv("shop0")
+        1 -> gv("shop1")
+        _ -> gv("shop2")
     }
     bought = match slot {
-        0 -> gv(g, "bought0")
-        1 -> gv(g, "bought1")
-        _ -> gv(g, "bought2")
+        0 -> gv("bought0")
+        1 -> gv("bought1")
+        _ -> gv("bought2")
     }
     hovered = bought == 0 && hit(x, 170, 170, 180)
     lift = if hovered {
@@ -430,43 +450,43 @@ shopOffer :: (g, jok, Int slot) {
     if bought == 1 {
         centerText("SOLD", x + 85, 300, 26, rgb(150, 150, 150))
     } else {
-        affordable = gv(g, "money") >= jokerPrice(j) && gv(g, "jokers") < 5
+        affordable = gv("money") >= jokerPrice(j) && gv("jokers") < 5
         if button("Buy  \$${jokerPrice(j)}", x + 25, 280 - lift, 120, 40, affordable, rgb(60, 130, 246)) {
-            g.set("money", gv(g, "money") - jokerPrice(j))
-            jok.set(gv(g, "jokers"), j)
-            g.set("jokers", gv(g, "jokers") + 1)
+            sv("money", gv("money") - jokerPrice(j))
+            game.jok().set(gv("jokers"), j)
+            sv("jokers", gv("jokers") + 1)
             match slot {
-                0 -> g.set("bought0", 1)
-                1 -> g.set("bought1", 1)
-                _ -> g.set("bought2", 1)
+                0 -> sv("bought0", 1)
+                1 -> sv("bought1", 1)
+                _ -> sv("bought2", 1)
             }
         }
     }
 }
 
-frameShop :: (g, deck, hand, sel, jok, out, av) {
-    g.set("shx", 0)
-    g.set("shy", 0)
-    drawSidebar(g, hand, sel, jok, out)
-    drawJokers(g, jok, av)
+frameShop :: () uses Game {
+    sv("shx", 0)
+    sv("shy", 0)
+    drawSidebar()
+    drawJokers()
     graphics.rect(254, 96, 690, 400, 8, 10, 14, 130)
     roundRect(250, 90, 690, 400, 24, 18, 36, 240)
     graphics.rectLines(250, 90, 690, 400, 3, 130, 90, 180, 255)
     centerText("SHOP", 595, 140, 36, rgb(255, 210, 80))
-    shopOffer(g, jok, 0)
-    shopOffer(g, jok, 1)
-    shopOffer(g, jok, 2)
-    if button("Reroll  \$2", 360, 410, 150, 46, gv(g, "money") >= 2, rgb(220, 140, 60)) {
-        g.set("money", gv(g, "money") - 2)
-        rollShop(g)
+    shopOffer(0)
+    shopOffer(1)
+    shopOffer(2)
+    if button("Reroll  \$2", 360, 410, 150, 46, gv("money") >= 2, rgb(220, 140, 60)) {
+        sv("money", gv("money") - 2)
+        rollShop()
     }
     if button("Next Blind", 590, 410, 160, 46, true, rgb(60, 170, 110)) {
-        nextBlind(g, deck, hand, sel, av)
+        nextBlind()
     }
     0
 }
 
-frameEnd :: (g, deck, hand, sel, av, Bool won) {
+frameEnd :: (Bool won) uses Game {
     title = if won {
         "YOU WIN"
     } else {
@@ -478,41 +498,34 @@ frameEnd :: (g, deck, hand, sel, av, Bool won) {
         rgb(235, 80, 80)
     }
     centerText(title, 480, 240, 64, col)
-    ante = gv(g, "ante")
-    blind = blindName(gv(g, "blind"))
+    ante = gv("ante")
+    blind = blindName(gv("blind"))
     centerText("Ante ${ante} - ${blind}", 480, 290, 24, rgb(220, 220, 220))
     if button("New Run", 390, 330, 180, 50, true, rgb(60, 130, 246)) {
-        restart(g, deck, hand, sel, av)
+        restart()
     }
     0
 }
 
-frame :: (g, deck, hand, sel, jok, out, steps, av) {
+frame :: () uses Game {
     // Per-frame arena: every string and list built while drawing lives in
     // this region and is freed wholesale when the frame ends, so the render
-    // path does no refcount work at all. Game state lives in the MutMaps
-    // (their storage is the runtime's own, untouched by the region).
+    // path does no refcount work at all. Game state lives in the Game
+    // service's MutMaps (runtime-owned storage, untouched by the region).
     provide Arena(256.kb)
-    drawBackground(g)
-    phase = gv(g, "phase")
+    drawBackground()
+    phase = gv("phase")
     if phase == 0 {
-        framePlay(g, deck, hand, sel, jok, out, steps, av)
+        framePlay()
     } else if phase == 1 {
-        frameShop(g, deck, hand, sel, jok, out, av)
+        frameShop()
     } else {
-        frameEnd(g, deck, hand, sel, av, phase == 3)
+        frameEnd(phase == 3)
     }
 }
 
 main :: () {
-    g = MutMap()
-    deck = MutMap()
-    hand = MutMap()
-    sel = MutMap()
-    jok = MutMap()
-    out = MutMap()
-    steps = MutMap()
-    av = MutMap()
-    restart(g, deck, hand, sel, av)
-    graphics.run(960, 540, "INGA-LATRO", () -> frame(g, deck, hand, sel, jok, out, steps, av))
+    provide freshGame
+    restart()
+    graphics.run(960, 540, "INGA-LATRO", () -> frame())
 }

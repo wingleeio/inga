@@ -28,6 +28,7 @@ module.exports = grammar({
 
   conflicts: $ => [
     [$._expression, $.record_update],
+    [$._expression, $.generic_type],
     [$._type, $.acquire, $._expression],
     [$._type, $._expression],
     [$.parameter, $._expression],
@@ -137,7 +138,18 @@ module.exports = grammar({
     // ---- types -------------------------------------------------------------
 
     _type: $ =>
-      choice($.type_identifier, $.list_type, $.option_type, $.function_type, $.paren_type),
+      choice(
+        $.type_identifier,
+        $.generic_type,
+        $.list_type,
+        $.option_type,
+        $.function_type,
+        $.paren_type
+      ),
+
+    // `MutMap<Int, String>`, `Task<Int>` — the builtin generic types.
+    generic_type: $ =>
+      seq(field('name', $.type_identifier), '<', sepBy1(',', $._type), '>'),
 
     // `(Int, String) -> Bool`, optionally `! Errors uses Services`.
     function_type: $ =>

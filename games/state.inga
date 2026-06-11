@@ -1,8 +1,9 @@
-// INGA-LATRO game state: blinds, dealing, shop, sorting.
+// INGA-LATRO game state transitions: blinds, dealing, shop, sorting.
+// Every function reads and writes through the `Game` service (see
+// game.inga) — `uses Game` is inferred, so callers never thread state.
 
-use util { gn, gv }
-use cards
-use jokers
+use game { Game }
+use util { gn, gv, sv }
 use poker { buildSteps }
 
 // ---- game state ------------------------------------------------------------------
@@ -29,11 +30,15 @@ pub blindName :: (Int blind) -> String {
     }
 }
 
-pub selCount :: (sel) -> Int {
+pub selCount :: () -> Int uses Game {
+    Game game
+    sel = game.sel()
     fold(range(8), 0, (acc, i) -> acc + gn(sel, i))
 }
 
-pub shuffle :: (deck) {
+pub shuffle :: () uses Game {
+    Game game
+    deck = game.deck()
     map(range(52), (i) -> {
         deck.set(i, i)
         0
@@ -48,13 +53,17 @@ pub shuffle :: (deck) {
     })
 }
 
-// Animation slots in `av`: 0..7 card lift (x1000), 10..17 deal slide (x1000).
-pub deal :: (g, deck, hand, av) {
+// Animation slots in `av`: 0..7 card lift (x1000), 10..17 deal slide.
+pub deal :: () uses Game {
+    Game game
+    deck = game.deck()
+    hand = game.hand()
+    av = game.av()
     map(range(8), (i) -> {
-        pos = gv(g, "deckPos")
+        pos = gv("deckPos")
         if gn(hand, i) < 0 && pos < 52 {
             hand.set(i, gn(deck, pos))
-            g.set("deckPos", pos + 1)
+            sv("deckPos", pos + 1)
             av.set(10 + i, 480000 + i * 45000) // slide in from the right
             av.set(i, 0)
         }
@@ -62,7 +71,10 @@ pub deal :: (g, deck, hand, av) {
     })
 }
 
-pub removeSelected :: (hand, sel) {
+pub removeSelected :: () uses Game {
+    Game game
+    hand = game.hand()
+    sel = game.sel()
     map(range(8), (i) -> {
         if gn(sel, i) == 1 {
             hand.set(i, -1)
@@ -72,36 +84,39 @@ pub removeSelected :: (hand, sel) {
     })
 }
 
-pub setupBlind :: (g, deck, hand, sel, av) {
-    g.set("score", 0)
-    g.set("dispScore", 0)
-    g.set("anim", 0)
-    g.set("shake", 0)
-    g.set("hands", 4)
-    g.set("discards", 3)
-    g.set("target", targetFor(gv(g, "ante"), gv(g, "blind")))
-    g.set("deckPos", 0)
-    g.set("lastType", -1)
-    shuffle(deck)
+pub setupBlind :: () uses Game {
+    Game game
+    sv("score", 0)
+    sv("dispScore", 0)
+    sv("anim", 0)
+    sv("shake", 0)
+    sv("hands", 4)
+    sv("discards", 3)
+    sv("target", targetFor(gv("ante"), gv("blind")))
+    sv("deckPos", 0)
+    sv("lastType", -1)
+    shuffle()
+    hand = game.hand()
+    sel = game.sel()
     map(range(8), (i) -> {
         hand.set(i, -1)
         sel.set(i, 0)
         0
     })
-    deal(g, deck, hand, av)
+    deal()
 }
 
-pub restart :: (g, deck, hand, sel, av) {
-    g.set("phase", 0)
-    g.set("ante", 1)
-    g.set("blind", 0)
-    g.set("money", 4)
-    g.set("jokers", 0)
-    g.set("popT", 0)
-    setupBlind(g, deck, hand, sel, av)
+pub restart :: () uses Game {
+    sv("phase", 0)
+    sv("ante", 1)
+    sv("blind", 0)
+    sv("money", 4)
+    sv("jokers", 0)
+    sv("popT", 0)
+    setupBlind()
 }
 
-pub rollShop :: (g) {
+pub rollShop :: () uses Game {
     first = random(15)
     second = (first + 1 + random(14)) % 15
     third = (second + 1 + random(13)) % 15
@@ -115,43 +130,46 @@ pub rollShop :: (g) {
     } else {
         third
     }
-    g.set("shop0", first)
-    g.set("shop1", second)
-    g.set("shop2", third)
-    g.set("bought0", 0)
-    g.set("bought1", 0)
-    g.set("bought2", 0)
+    sv("shop0", first)
+    sv("shop1", second)
+    sv("shop2", third)
+    sv("bought0", 0)
+    sv("bought1", 0)
+    sv("bought2", 0)
 }
 
-pub openShop :: (g) {
-    g.set("phase", 1)
-    rollShop(g)
+pub openShop :: () uses Game {
+    sv("phase", 1)
+    rollShop()
 }
 
 // Advance to the next blind (after the shop) and set it up.
-pub nextBlind :: (g, deck, hand, sel, av) {
-    blind = gv(g, "blind") + 1
+pub nextBlind :: () uses Game {
+    blind = gv("blind") + 1
     if blind > 2 {
-        g.set("blind", 0)
-        g.set("ante", gv(g, "ante") + 1)
+        sv("blind", 0)
+        sv("ante", gv("ante") + 1)
     } else {
-        g.set("blind", blind)
+        sv("blind", blind)
     }
-    g.set("phase", 0)
-    setupBlind(g, deck, hand, sel, av)
+    sv("phase", 0)
+    setupBlind()
 }
 
 // Playing a hand kicks off the scoring choreography: the selected cards
 // move to the stage and each step (cards, then jokers) triggers in order.
 // `finishPlay` applies the result once the animation lands.
-pub playHand :: (g, hand, sel, jok, out, steps, av) {
-    nSteps = buildSteps(hand, sel, jok, g, out, steps)
-    if nSteps > 0 && gv(g, "hands") > 0 {
-        g.set("anim", 1)
-        g.set("animT", 0)
-        g.set("nSteps", nSteps)
-        g.set("pendType", gn(out, 0))
-        g.set("pendGain", gn(out, 7) * gn(out, 8))
+pub playHand :: () uses Game {
+    Game game
+    out = game.out()
+    av = game.av()
+    nSteps = buildSteps()
+    if nSteps > 0 && gv("hands") > 0 {
+        sv("anim", 1)
+        sv("animT", 0)
+        sv("nSteps", nSteps)
+        sv("pendType", gn(out, 0))
+        sv("pendGain", gn(out, 7) * gn(out, 8))
         map(range(8), (i) -> {
             av.set(20 + i, 0)
             0
@@ -159,35 +177,35 @@ pub playHand :: (g, hand, sel, jok, out, steps, av) {
     }
 }
 
-pub finishPlay :: (g, deck, hand, sel, av) {
-    gained = gv(g, "pendGain")
-    g.set("anim", 0)
-    g.set("score", gv(g, "score") + gained)
-    g.set("lastType", gv(g, "pendType"))
-    g.set("lastGain", gained)
-    g.set("popT", 60)
-    g.set("popVal", gained)
-    g.set("hands", gv(g, "hands") - 1)
-    g.set("shake", 14)
-    removeSelected(hand, sel)
-    deal(g, deck, hand, av)
-    if gv(g, "score") >= gv(g, "target") {
-        g.set("money", gv(g, "money") + 3 + gv(g, "blind") + gv(g, "hands"))
-        if gv(g, "blind") == 2 && gv(g, "ante") == 8 {
-            g.set("phase", 3) // won the run
+pub finishPlay :: () uses Game {
+    gained = gv("pendGain")
+    sv("anim", 0)
+    sv("score", gv("score") + gained)
+    sv("lastType", gv("pendType"))
+    sv("lastGain", gained)
+    sv("popT", 60)
+    sv("popVal", gained)
+    sv("hands", gv("hands") - 1)
+    sv("shake", 14)
+    removeSelected()
+    deal()
+    if gv("score") >= gv("target") {
+        sv("money", gv("money") + 3 + gv("blind") + gv("hands"))
+        if gv("blind") == 2 && gv("ante") == 8 {
+            sv("phase", 3) // won the run
         } else {
-            openShop(g)
+            openShop()
         }
-    } else if gv(g, "hands") == 0 {
-        g.set("phase", 2) // out of hands
+    } else if gv("hands") == 0 {
+        sv("phase", 2) // out of hands
     }
 }
 
-pub discardSelected :: (g, deck, hand, sel, av) {
-    if gv(g, "discards") > 0 && selCount(sel) > 0 {
-        g.set("discards", gv(g, "discards") - 1)
-        removeSelected(hand, sel)
-        deal(g, deck, hand, av)
+pub discardSelected :: () uses Game {
+    if gv("discards") > 0 && selCount() > 0 {
+        sv("discards", gv("discards") - 1)
+        removeSelected()
+        deal()
     }
 }
 
@@ -203,27 +221,29 @@ pub sortKey :: (Int card, Bool bySuit) -> Int {
     }
 }
 
-pub sortHand :: (hand, sel, av, Bool bySuit) {
+pub sortHand :: (Bool bySuit) uses Game {
+    Game game
+    hand = game.hand()
+    sel = game.sel()
+    av = game.av()
     map(range(8), (i) -> {
-        best = MutMap()
-        best.set(0, i)
-        map(range(8), (j) -> {
-            if j > i && sortKey(gn(hand, j), bySuit) > sortKey(gn(hand, gn(best, 0)), bySuit) {
-                best.set(0, j)
+        best = fold(range(8), i, (acc, j) -> {
+            if j > i && sortKey(gn(hand, j), bySuit) > sortKey(gn(hand, acc), bySuit) {
+                j
+            } else {
+                acc
             }
-            0
         })
-        b = gn(best, 0)
-        if b != i {
+        if best != i {
             c = gn(hand, i)
-            hand.set(i, gn(hand, b))
-            hand.set(b, c)
+            hand.set(i, gn(hand, best))
+            hand.set(best, c)
             s = gn(sel, i)
-            sel.set(i, gn(sel, b))
-            sel.set(b, s)
+            sel.set(i, gn(sel, best))
+            sel.set(best, s)
             l = gn(av, i)
-            av.set(i, gn(av, b))
-            av.set(b, l)
+            av.set(i, gn(av, best))
+            av.set(best, l)
         }
         0
     })

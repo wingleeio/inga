@@ -1262,3 +1262,21 @@ fn asserts_count_toward_the_error_row() {
         "got: {errs:?}"
     );
 }
+
+#[test]
+fn mutmap_and_task_have_surface_types() {
+    // The forms hover renders are writable: MutMap<K, V> and Task<T>.
+    let out = run(
+        "service Stats {\n    counts :: () -> MutMap<String, Int>\n}\n\nmemStats :: Stats {\n    m = MutMap()\n\n    counts :: () {\n        m\n    }\n}\n\nbump :: (String k) -> Int uses Stats {\n    Stats stats\n    n = stats.counts().get(k) |> getOrElse(0)\n    stats.counts().set(k, n + 1)\n    n + 1\n}\n\nslowDouble :: (Int n) -> Int {\n    n * 2\n}\n\nstartDouble :: (Int n) -> Task<Int> {\n    slowDouble(n) |> spawn\n}\n\nmain :: () {\n    provide memStats\n    bump(\"a\")\n    println(bump(\"a\"), await(startDouble(21)))\n}\n",
+    );
+    assert_eq!(out, "2 42\n");
+
+    // Other names take no type arguments.
+    let errs = check_errors(
+        "struct User = { Int id }\n\nf :: (User<Int> u) -> Int {\n    1\n}\n\nmain :: () {\n    println(f(User(1)))\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("does not take type arguments")),
+        "got: {errs:?}"
+    );
+}

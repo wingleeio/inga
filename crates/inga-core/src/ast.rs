@@ -140,6 +140,9 @@ pub enum TypeExpr {
     List(Box<TypeExpr>, Span),
     /// `(Int, String)` — a tuple type.
     Tuple(Vec<TypeExpr>, Span),
+    /// `MutMap<Int, String>`, `Task<Int>` — the builtin generic types,
+    /// written the way hover renders them.
+    Apply { name: String, name_span: Span, args: Vec<TypeExpr>, span: Span },
     /// `(Int, String) -> Bool`, optionally with effect rows:
     /// `(Int) -> User ! DbError uses Logger`. A plain arrow type is a
     /// *pure* contract — no failures, no capabilities.
@@ -157,7 +160,7 @@ impl TypeExpr {
         match self {
             TypeExpr::Name(_, s) | TypeExpr::Option(_, s) | TypeExpr::List(_, s) => *s,
             TypeExpr::Tuple(_, s) => *s,
-            TypeExpr::Func { span, .. } => *span,
+            TypeExpr::Apply { span, .. } | TypeExpr::Func { span, .. } => *span,
         }
     }
 }

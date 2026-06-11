@@ -146,14 +146,18 @@ frame closure captures capability evidence like any other Inga closure.
 
 The proof is [`games/balatro.inga`](games/balatro.inga): **INGA-LATRO**, a
 Balatro-style roguelike deckbuilder in ~1,000 lines of pure Inga, split
-across five modules (`use util`, `cards`, `jokers`, `poker`, `state`) — poker-hand
-scoring, escalating blinds and antes, fifteen jokers and a rerollable shop,
-animated card deals/hovers/score popups, and the signature swirling paint
-background written as a GLSL shader *inside the Inga source* and compiled at
-runtime via `graphics.shaderNew`. The frame closure opens with
-`provide Arena(256.kb)`, so everything built while drawing is freed
-wholesale at frame end — the render path does no refcount work — and the
-game logic ships with [`inga test` tests](games/logic_test.inga):
+across six modules (`use game`, `util`, `cards`, `jokers`, `poker`, `state`) —
+poker-hand scoring, escalating blinds and antes, fifteen jokers and a
+rerollable shop, animated card deals/hovers/score popups, and the signature
+swirling paint background written as a GLSL shader *inside the Inga source*
+and compiled at runtime via `graphics.shaderNew`. All game state lives in
+one `Game` service ([`games/game.inga`](games/game.inga)) provided once in
+`main` — every function just says `uses Game` (inferred), so nothing
+threads state through arguments, and the
+[`inga test` tests](games/logic_test.inga) provide their own fresh instance
+per test. The frame closure opens with `provide Arena(256.kb)`, so
+everything built while drawing is freed wholesale at frame end — the render
+path does no refcount work:
 
 ```sh
 inga build games/balatro.inga -o ingalatro && ./ingalatro
@@ -173,7 +177,7 @@ editors/vscode        VS Code extension + TextMate grammar
 editors/zed           Zed extension (tree-sitter highlighting + LSP)
 tree-sitter-inga      tree-sitter grammar (used by the Zed extension)
 examples/             hello.inga, retry.inga, shapes.inga, arena.inga, tasks.inga, modules.inga (+ geometry.inga), user_service.inga
-games/                balatro.inga (+ util, cards, jokers, poker, state, logic_test) — a Balatro-style deckbuilder
+games/                balatro.inga (+ game, util, cards, jokers, poker, state, logic_test) — a Balatro-style deckbuilder
 bench/                the same workloads in Inga, JavaScript, and Rust (see bench/README.md)
 docs/SPEC.md          language design: semantics, effect rows, execution strategy
 ```

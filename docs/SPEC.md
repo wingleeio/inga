@@ -76,7 +76,9 @@ fetchAndCache :: (id) { ... }                // a function
   fields, `Cache cache` for capability bindings, `String msg` in patterns.
   Omitted types are inferred.
 - `Name?` is an option type, `[Name]` a list type, `(Int, String)` a
-  tuple type, `(Int) -> Bool` a function type (for callbacks). A plain
+  tuple type, `(Int) -> Bool` a function type (for callbacks), and the two
+  builtin generic types are written the way hover renders them:
+  `MutMap<String, Int>` and `Task<Int>`. A plain
   arrow type is a *pure* contract;
   `(Int) -> User ! DbError uses Logger` accepts effectful callbacks, and a
   function with effects the annotation doesn't declare is rejected. An
@@ -411,6 +413,7 @@ variant   := Upper ('{' field,* '}')?
 sig       := '(' param,* ')' ('->' type)? ('!' Upper,+)? ('uses' Upper,+)?
 param     := 'lazy'? type? name
 type      := Upper | lower | '[' type ']' | type '?' | '(' type,+ ')'   -- paren / tuple
+           | Upper '<' type,+ '>'                  -- MutMap<K, V> / Task<T>
            | '(' type,* ')' '->' type ('!' Upper,+)? ('uses' Upper,+)?  -- function type
 field     := type? name
 block     := '{' stmt* '}'

@@ -525,7 +525,37 @@ impl<'a> Parser<'a> {
         let mut ty = match self.peek().kind.clone() {
             TokenKind::Ident(name) => {
                 self.bump();
-                TypeExpr::Name(name, start)
+                // `MutMap<Int, String>` / `Task<Int>` — type arguments only
+                // ever follow an uppercase name, which keeps speculative
+                // type parses from swallowing `x < y` comparisons.
+                let upper = name.starts_with(char::is_uppercase);
+                if upper && self.at(&TokenKind::Lt) {
+                    self.bump();
+                    self.skip_newlines();
+                    let mut args = Vec::new();
+                    loop {
+                        args.push(self.try_parse_type()?);
+                        self.skip_newlines();
+                        if self.at(&TokenKind::Comma) {
+                            self.bump();
+                            self.skip_newlines();
+                        } else {
+                            break;
+                        }
+                    }
+                    if !self.at(&TokenKind::Gt) {
+                        return None;
+                    }
+                    self.bump();
+                    TypeExpr::Apply {
+                        name,
+                        name_span: start,
+                        args,
+                        span: start.to(self.prev_span()),
+                    }
+                } else {
+                    TypeExpr::Name(name, start)
+                }
             }
             TokenKind::LBracket => {
                 self.bump();

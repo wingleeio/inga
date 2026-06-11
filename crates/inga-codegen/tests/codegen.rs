@@ -34,8 +34,8 @@ fn bench_program_produces_ir() {
 #[test]
 fn balatro_game_produces_ir() {
     let path = format!("{}/../../games/balatro.inga", env!("CARGO_MANIFEST_DIR"));
-    let src = std::fs::read_to_string(path).unwrap();
-    let checked = check_source(&src);
+    let loaded = inga_core::modules::load_program(std::path::Path::new(&path)).unwrap();
+    let (checked, _mods) = inga_core::check_loaded(loaded);
     let errors: Vec<&str> = checked
         .diagnostics
         .iter()

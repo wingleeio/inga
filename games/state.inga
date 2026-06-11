@@ -1,0 +1,215 @@
+// INGA-LATRO game state: blinds, dealing, shop, sorting.
+
+use util
+use cards
+use jokers
+use poker
+
+// ---- game state ------------------------------------------------------------------
+
+pub targetFor :: (Int ante, Int blind) -> Int {
+    base = match ante {
+        1 -> 300
+        2 -> 800
+        3 -> 2000
+        4 -> 5000
+        5 -> 11000
+        6 -> 20000
+        7 -> 35000
+        _ -> 50000
+    }
+    base * (2 + blind) / 2
+}
+
+pub blindName :: (Int blind) -> String {
+    match blind {
+        0 -> "Small Blind"
+        1 -> "Big Blind"
+        _ -> "Boss Blind"
+    }
+}
+
+pub selCount :: (sel) -> Int {
+    cnt = MutMap()
+    map(range(8), (i) -> {
+        cnt.set(0, gn(cnt, 0) + gn(sel, i))
+        0
+    })
+    gn(cnt, 0)
+}
+
+pub shuffle :: (deck) {
+    map(range(52), (i) -> {
+        deck.set(i, i)
+        0
+    })
+    map(range(51), (k) -> {
+        i = 51 - k
+        j = random(i + 1)
+        a = gn(deck, i)
+        deck.set(i, gn(deck, j))
+        deck.set(j, a)
+        0
+    })
+}
+
+// Animation slots in `av`: 0..7 card lift (x1000), 10..17 deal slide (x1000).
+pub deal :: (g, deck, hand, av) {
+    map(range(8), (i) -> {
+        pos = gv(g, "deckPos")
+        if gn(hand, i) < 0 && pos < 52 {
+            hand.set(i, gn(deck, pos))
+            g.set("deckPos", pos + 1)
+            av.set(10 + i, 480000 + i * 45000) // slide in from the right
+            av.set(i, 0)
+        }
+        0
+    })
+}
+
+pub removeSelected :: (hand, sel) {
+    map(range(8), (i) -> {
+        if gn(sel, i) == 1 {
+            hand.set(i, -1)
+            sel.set(i, 0)
+        }
+        0
+    })
+}
+
+pub setupBlind :: (g, deck, hand, sel, av) {
+    g.set("score", 0)
+    g.set("hands", 4)
+    g.set("discards", 3)
+    g.set("target", targetFor(gv(g, "ante"), gv(g, "blind")))
+    g.set("deckPos", 0)
+    g.set("lastType", -1)
+    shuffle(deck)
+    map(range(8), (i) -> {
+        hand.set(i, -1)
+        sel.set(i, 0)
+        0
+    })
+    deal(g, deck, hand, av)
+}
+
+pub restart :: (g, deck, hand, sel, av) {
+    g.set("phase", 0)
+    g.set("ante", 1)
+    g.set("blind", 0)
+    g.set("money", 4)
+    g.set("jokers", 0)
+    g.set("popT", 0)
+    setupBlind(g, deck, hand, sel, av)
+}
+
+pub rollShop :: (g) {
+    first = random(15)
+    second = (first + 1 + random(14)) % 15
+    third = (second + 1 + random(13)) % 15
+    third = if third == first {
+        (third + 1) % 15
+    } else {
+        third
+    }
+    third = if third == second {
+        (third + 1) % 15
+    } else {
+        third
+    }
+    g.set("shop0", first)
+    g.set("shop1", second)
+    g.set("shop2", third)
+    g.set("bought0", 0)
+    g.set("bought1", 0)
+    g.set("bought2", 0)
+}
+
+pub openShop :: (g) {
+    g.set("phase", 1)
+    rollShop(g)
+}
+
+// Advance to the next blind (after the shop) and set it up.
+pub nextBlind :: (g, deck, hand, sel, av) {
+    blind = gv(g, "blind") + 1
+    if blind > 2 {
+        g.set("blind", 0)
+        g.set("ante", gv(g, "ante") + 1)
+    } else {
+        g.set("blind", blind)
+    }
+    g.set("phase", 0)
+    setupBlind(g, deck, hand, sel, av)
+}
+
+pub playHand :: (g, deck, hand, sel, jok, out, av) {
+    scoreSelected(hand, sel, jok, g, out)
+    if gn(out, 0) >= 0 && gv(g, "hands") > 0 {
+        gained = gn(out, 7) * gn(out, 8)
+        g.set("score", gv(g, "score") + gained)
+        g.set("lastType", gn(out, 0))
+        g.set("lastGain", gained)
+        g.set("popT", 60)
+        g.set("popVal", gained)
+        g.set("hands", gv(g, "hands") - 1)
+        removeSelected(hand, sel)
+        deal(g, deck, hand, av)
+        if gv(g, "score") >= gv(g, "target") {
+            g.set("money", gv(g, "money") + 3 + gv(g, "blind") + gv(g, "hands"))
+            if gv(g, "blind") == 2 && gv(g, "ante") == 8 {
+                g.set("phase", 3) // won the run
+            } else {
+                openShop(g)
+            }
+        } else if gv(g, "hands") == 0 {
+            g.set("phase", 2) // out of hands
+        }
+    }
+}
+
+pub discardSelected :: (g, deck, hand, sel, av) {
+    if gv(g, "discards") > 0 && selCount(sel) > 0 {
+        g.set("discards", gv(g, "discards") - 1)
+        removeSelected(hand, sel)
+        deal(g, deck, hand, av)
+    }
+}
+
+// Selection-sort the hand, descending by rank or by suit; selections and
+// animations travel with their cards.
+pub sortKey :: (Int card, Bool bySuit) -> Int {
+    if card < 0 {
+        -1
+    } else if bySuit {
+        card % 4 * 16 + card / 4
+    } else {
+        card / 4 * 4 + (3 - card % 4)
+    }
+}
+
+pub sortHand :: (hand, sel, av, Bool bySuit) {
+    map(range(8), (i) -> {
+        best = MutMap()
+        best.set(0, i)
+        map(range(8), (j) -> {
+            if j > i && sortKey(gn(hand, j), bySuit) > sortKey(gn(hand, gn(best, 0)), bySuit) {
+                best.set(0, j)
+            }
+            0
+        })
+        b = gn(best, 0)
+        if b != i {
+            c = gn(hand, i)
+            hand.set(i, gn(hand, b))
+            hand.set(b, c)
+            s = gn(sel, i)
+            sel.set(i, gn(sel, b))
+            sel.set(b, s)
+            l = gn(av, i)
+            av.set(i, gn(av, b))
+            av.set(b, l)
+        }
+        0
+    })
+}

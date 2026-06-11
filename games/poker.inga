@@ -1,0 +1,251 @@
+// INGA-LATRO poker evaluation: hand types, base chips/mult, scoring
+// with joker effects.
+
+use util
+use cards
+use jokers
+
+// ---- poker evaluation -----------------------------------------------------------
+//
+// Result map keys: 0 hand type (-1 = nothing selected), 3 card chips,
+// 4 cards selected, 5 flush, 6 hearts, 9 spades, 10 clubs, 11 diamonds,
+// 12 even cards, 13 odd cards, 14 has pair, 15 has trips, 16 straight,
+// 7 total chips, 8 total mult.
+
+pub baseChips :: (Int t) -> Int {
+    match t {
+        0 -> 5
+        1 -> 10
+        2 -> 20
+        3 -> 30
+        4 -> 30
+        5 -> 35
+        6 -> 40
+        7 -> 60
+        _ -> 100
+    }
+}
+
+pub baseMult :: (Int t) -> Int {
+    match t {
+        0 -> 1
+        1 -> 2
+        2 -> 2
+        3 -> 3
+        4 -> 4
+        5 -> 4
+        6 -> 4
+        7 -> 7
+        _ -> 8
+    }
+}
+
+pub handTypeName :: (Int t) -> String {
+    match t {
+        0 -> "High Card"
+        1 -> "Pair"
+        2 -> "Two Pair"
+        3 -> "Three of a Kind"
+        4 -> "Straight"
+        5 -> "Flush"
+        6 -> "Full House"
+        7 -> "Four of a Kind"
+        _ -> "Straight Flush"
+    }
+}
+
+pub evalSelected :: (hand, sel, out) {
+    rc = MutMap() // rank counts
+    sc = MutMap() // suit counts
+    out.set(0, -1)
+    out.set(3, 0)
+    out.set(4, 0)
+    out.set(5, 0)
+    out.set(6, 0)
+    out.set(9, 0)
+    out.set(10, 0)
+    out.set(11, 0)
+    out.set(12, 0)
+    out.set(13, 0)
+    out.set(14, 0)
+    out.set(15, 0)
+    out.set(16, 0)
+    map(range(8), (i) -> {
+        if gn(sel, i) == 1 && gn(hand, i) >= 0 {
+            c = gn(hand, i)
+            r = c / 4
+            s = c % 4
+            rc.set(r, gn(rc, r) + 1)
+            sc.set(s, gn(sc, s) + 1)
+            out.set(3, gn(out, 3) + chipsOf(c))
+            out.set(4, gn(out, 4) + 1)
+            suitKey = match s {
+                0 -> 9
+                1 -> 6
+                2 -> 11
+                _ -> 10
+            }
+            out.set(suitKey, gn(out, suitKey) + 1)
+            // Even ranks: 2,4,6,8,10. Odd: A,3,5,7,9.
+            if r <= 8 && r % 2 == 0 {
+                out.set(12, gn(out, 12) + 1)
+            }
+            if r <= 7 && r % 2 == 1 || r == 12 {
+                out.set(13, gn(out, 13) + 1)
+            }
+        }
+        0
+    })
+    n = gn(out, 4)
+    if n > 0 {
+        // t: 0 pairs, 1 trips, 2 quads, 3 distinct ranks, 4 min rank, 5 max rank
+        t = MutMap()
+        t.set(4, 99)
+        t.set(5, -1)
+        map(range(13), (r) -> {
+            c = gn(rc, r)
+            if c == 2 {
+                t.set(0, gn(t, 0) + 1)
+            }
+            if c == 3 {
+                t.set(1, gn(t, 1) + 1)
+            }
+            if c >= 4 {
+                t.set(2, gn(t, 2) + 1)
+            }
+            if c >= 2 {
+                out.set(14, 1)
+            }
+            if c >= 3 {
+                out.set(15, 1)
+            }
+            if c >= 1 {
+                t.set(3, gn(t, 3) + 1)
+                if r < gn(t, 4) {
+                    t.set(4, r)
+                }
+                if r > gn(t, 5) {
+                    t.set(5, r)
+                }
+            }
+            0
+        })
+        flush = n == 5 && (gn(sc, 0) == 5 || gn(sc, 1) == 5 || gn(sc, 2) == 5 || gn(sc, 3) == 5)
+        wheel = gn(rc, 12) > 0 && gn(rc, 0) > 0 && gn(rc, 1) > 0 && gn(rc, 2) > 0 && gn(rc, 3) > 0
+        straight = n == 5 && gn(t, 3) == 5 && (gn(t, 5) - gn(t, 4) == 4 || wheel)
+        if flush {
+            out.set(5, 1)
+        }
+        if straight {
+            out.set(16, 1)
+        }
+        ty = if straight && flush {
+            8
+        } else if gn(t, 2) >= 1 {
+            7
+        } else if gn(t, 0) >= 1 && gn(t, 1) >= 1 {
+            6
+        } else if flush {
+            5
+        } else if straight {
+            4
+        } else if gn(t, 1) >= 1 {
+            3
+        } else if gn(t, 0) >= 2 {
+            2
+        } else if gn(t, 0) == 1 {
+            1
+        } else {
+            0
+        }
+        out.set(0, ty)
+    }
+}
+
+// Full scoring including all fifteen jokers; fills out[7] and out[8].
+pub scoreSelected :: (hand, sel, jok, g, out) {
+    evalSelected(hand, sel, out)
+    t = gn(out, 0)
+    if t >= 0 {
+        chips = baseChips(t) + gn(out, 3)
+        chips = if hasJoker(jok, g, 5) {
+            chips + 30
+        } else {
+            chips
+        }
+        chips = if hasJoker(jok, g, 6) && gn(out, 14) == 1 {
+            chips + 50
+        } else {
+            chips
+        }
+        chips = if hasJoker(jok, g, 7) && gn(out, 15) == 1 {
+            chips + 100
+        } else {
+            chips
+        }
+        chips = if hasJoker(jok, g, 10) {
+            chips + 2 * gv(g, "money")
+        } else {
+            chips
+        }
+        chips = if hasJoker(jok, g, 13) {
+            chips + 31 * gn(out, 13)
+        } else {
+            chips
+        }
+        mult = baseMult(t)
+        mult = if hasJoker(jok, g, 0) {
+            mult + 4
+        } else {
+            mult
+        }
+        mult = if hasJoker(jok, g, 1) {
+            mult + 3 * gn(out, 11)
+        } else {
+            mult
+        }
+        mult = if hasJoker(jok, g, 2) {
+            mult + 3 * gn(out, 6)
+        } else {
+            mult
+        }
+        mult = if hasJoker(jok, g, 3) {
+            mult + 3 * gn(out, 9)
+        } else {
+            mult
+        }
+        mult = if hasJoker(jok, g, 4) {
+            mult + 3 * gn(out, 10)
+        } else {
+            mult
+        }
+        mult = if hasJoker(jok, g, 8) && gn(out, 4) <= 3 {
+            mult + 20
+        } else {
+            mult
+        }
+        mult = if hasJoker(jok, g, 9) && gn(out, 16) == 1 {
+            mult + 15
+        } else {
+            mult
+        }
+        mult = if hasJoker(jok, g, 12) {
+            mult + gn(out, 12)
+        } else {
+            mult
+        }
+        // Multiplicative jokers apply last.
+        mult = if hasJoker(jok, g, 11) && gv(g, "hands") == 1 {
+            mult * 3
+        } else {
+            mult
+        }
+        mult = if hasJoker(jok, g, 14) {
+            mult * 2
+        } else {
+            mult
+        }
+        out.set(7, chips)
+        out.set(8, mult)
+    }
+}

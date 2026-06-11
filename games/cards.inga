@@ -1,0 +1,47 @@
+// INGA-LATRO cards: ranks, suits, chip values.
+
+use util
+
+// ---- cards -------------------------------------------------------------------
+
+// Card id 0..51: rank = id / 4 (0 = "2" … 12 = Ace), suit = id % 4.
+pub rankName :: (Int r) -> String {
+    match r {
+        8  -> "10"
+        9  -> "J"
+        10 -> "Q"
+        11 -> "K"
+        12 -> "A"
+        _  -> "${r + 2}"
+    }
+}
+
+pub suitName :: (Int s) -> String {
+    match s {
+        0 -> "S"
+        1 -> "H"
+        2 -> "D"
+        _ -> "C"
+    }
+}
+
+// Spades slate, hearts red, diamonds orange, clubs blue.
+pub suitCol :: (Int s) -> Int {
+    match s {
+        0 -> rgb(60, 60, 95)
+        1 -> rgb(225, 60, 60)
+        2 -> rgb(235, 140, 50)
+        _ -> rgb(50, 110, 215)
+    }
+}
+
+pub chipsOf :: (Int card) -> Int {
+    r = card / 4
+    if r <= 8 {
+        r + 2
+    } else if r == 12 {
+        11
+    } else {
+        10
+    }
+}

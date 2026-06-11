@@ -1,0 +1,125 @@
+// INGA-LATRO ui utilities: packed-rgb helpers, text/buttons, the
+// swirling background shader.
+
+use Gfx
+
+// ---- small helpers ----------------------------------------------------------
+
+// Int-keyed and string-keyed map reads (two helpers because user functions
+// are monomorphic in v0.2).
+pub gn :: (m, Int k) -> Int {
+    m.get(k) |> getOrElse(0)
+}
+
+pub gv :: (m, String k) -> Int {
+    m.get(k) |> getOrElse(0)
+}
+
+pub rgb :: (Int r, Int g, Int b) -> Int {
+    r * 65536 + g * 256 + b
+}
+
+pub cap255 :: (Int v) -> Int {
+    if v > 255 {
+        255
+    } else {
+        v
+    }
+}
+
+pub brighten :: (Int packed, Int amount) -> Int {
+    rgb(cap255(packed / 65536 + amount), cap255(packed / 256 % 256 + amount), cap255(packed % 256 + amount))
+}
+
+// Scale a color toward black: keep = 0..255.
+pub dim :: (Int packed, Int keep) -> Int {
+    rgb(packed / 65536 * keep / 255, packed / 256 % 256 * keep / 255, packed % 256 * keep / 255)
+}
+
+pub textC :: (String s, Int x, Int y, Int size, Int packed) {
+    Gfx.text(s, x, y, size, packed / 65536, packed / 256 % 256, packed % 256)
+}
+
+pub centerText :: (String s, Int cx, Int y, Int size, Int packed) {
+    textC(s, cx - Gfx.textWidth(s, size) / 2, y, size, packed)
+}
+
+pub hit :: (Int x, Int y, Int w, Int h) -> Bool {
+    mx = Gfx.mouseX()
+    my = Gfx.mouseY()
+    mx >= x && mx <= x + w && my >= y && my <= y + h
+}
+
+// Draws a button (brightens on hover); returns true when clicked this frame.
+pub button :: (String label, Int x, Int y, Int w, Int h, Bool enabled, Int packed) -> Bool {
+    hovered = enabled && hit(x, y, w, h)
+    bg = if enabled {
+        if hovered {
+            brighten(packed, 35)
+        } else {
+            packed
+        }
+    } else {
+        rgb(70, 75, 85)
+    }
+    lift = if hovered {
+        2
+    } else {
+        0
+    }
+    Gfx.rect(x, y - lift, w, h, bg / 65536, bg / 256 % 256, bg % 256, 235)
+    Gfx.rectLines(x, y - lift, w, h, 2, 15, 20, 25, 255)
+    fg = if enabled {
+        rgb(245, 245, 245)
+    } else {
+        rgb(140, 145, 150)
+    }
+    centerText(label, x + w / 2, (y - lift) + h / 2 + 7, 22, fg)
+    enabled && Gfx.mousePressed() && hovered
+}
+
+// ---- the background shader ----------------------------------------------------
+//
+// Balatro's signature is the swirling paint background. This is a GLSL ES
+// fragment shader, compiled at runtime; iTime/iRes are provided by Gfx.
+
+swirlSrc :: () -> String {
+    "#version 100\n"
+        + "precision highp float;\n"
+        + "varying vec2 uv;\n"
+        + "varying lowp vec4 color;\n"
+        + "uniform float iTime;\n"
+        + "uniform vec2 iRes;\n"
+        + "void main() {\n"
+        + "    vec2 p = uv - 0.5;\n"
+        + "    p.x *= iRes.x / iRes.y;\n"
+        + "    float r = length(p);\n"
+        + "    float a = atan(p.y, p.x);\n"
+        + "    float t = iTime * 0.35;\n"
+        + "    float s = sin(a * 2.0 + r * 9.0 - t)\n"
+        + "            + sin(a * 3.0 - r * 14.0 + t * 0.7)\n"
+        + "            + sin(r * 22.0 - t * 1.3 + sin(a * 4.0 + t * 0.5));\n"
+        + "    float v = s * 0.22 + 0.5;\n"
+        + "    vec3 deep = vec3(0.05, 0.10, 0.16);\n"
+        + "    vec3 teal = vec3(0.06, 0.26, 0.30);\n"
+        + "    vec3 red  = vec3(0.52, 0.12, 0.16);\n"
+        + "    vec3 col = mix(deep, teal, smoothstep(0.25, 0.62, v));\n"
+        + "    col = mix(col, red, smoothstep(0.64, 0.95, v) * 0.85);\n"
+        + "    col *= 1.0 - 0.45 * r;\n"
+        + "    gl_FragColor = vec4(col, 1.0);\n"
+        + "}\n"
+}
+
+pub drawBackground :: (g) {
+    if gv(g, "shInit") == 0 {
+        g.set("shInit", 1)
+        g.set("shH", Gfx.shaderNew(swirlSrc()))
+    }
+    Gfx.clear(22, 30, 40)
+    h = gv(g, "shH")
+    if h >= 0 {
+        Gfx.shaderUse(h)
+        Gfx.rect(0, 0, 960, 540, 255, 255, 255, 255)
+        Gfx.shaderOff()
+    }
+}

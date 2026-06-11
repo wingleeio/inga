@@ -108,7 +108,8 @@ closure once per frame), so games don't need unbounded recursion — and the
 frame closure captures capability evidence like any other Inga closure.
 
 The proof is [`games/balatro.inga`](games/balatro.inga): **INGA-LATRO**, a
-Balatro-style roguelike deckbuilder in ~900 lines of pure Inga — poker-hand
+Balatro-style roguelike deckbuilder in ~1,000 lines of pure Inga, split
+across five modules (`use util`, `cards`, `jokers`, `poker`, `state`) — poker-hand
 scoring, escalating blinds and antes, fifteen jokers and a rerollable shop,
 animated card deals/hovers/score popups, and the signature swirling paint
 background written as a GLSL shader *inside the Inga source* and compiled at
@@ -132,7 +133,7 @@ editors/vscode        VS Code extension + TextMate grammar
 editors/zed           Zed extension (tree-sitter highlighting + LSP)
 tree-sitter-inga      tree-sitter grammar (used by the Zed extension)
 examples/             hello.inga, retry.inga, shapes.inga, arena.inga, modules.inga (+ geometry.inga), user_service.inga
-games/                balatro.inga — a Balatro-style deckbuilder on the Gfx module
+games/                balatro.inga (+ util, cards, jokers, poker, state) — a Balatro-style deckbuilder
 bench/                the same workloads in Inga, JavaScript, and Rust (see bench/README.md)
 docs/SPEC.md          language design: semantics, effect rows, execution strategy
 ```

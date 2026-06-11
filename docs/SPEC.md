@@ -75,7 +75,11 @@ fetchAndCache :: (id) { ... }                // a function
 - Type-before-name everywhere: `(String id)` in parameters, `{ Int id }` in
   fields, `Cache cache` for capability bindings, `String msg` in patterns.
   Omitted types are inferred.
-- `Name?` is an option type, `[Name]` a list type.
+- `Name?` is an option type, `[Name]` a list type, `(Int) -> Bool` a
+  function type (for callbacks). A plain arrow type is a *pure* contract;
+  `(Int) -> User ! DbError uses Logger` accepts effectful callbacks, and a
+  function with effects the annotation doesn't declare is rejected. An
+  unannotated callback parameter is simply inferred.
 - Constructors are positional in field order: `User(42, "Wing")`,
   `Circle(2.0)`; a fieldless variant is a value (`Dot`). A bare struct name
   is a *type tag* for `decode(raw, User)`.
@@ -331,7 +335,8 @@ decl      := 'use' name ('/' name)* ('{' name,* '}')?
 variant   := Upper ('{' field,* '}')?
 sig       := '(' param,* ')' ('->' type)? ('!' Upper,+)? ('uses' Upper,+)?
 param     := 'lazy'? type? name
-type      := Upper | lower | '[' type ']' | type '?'
+type      := Upper | lower | '[' type ']' | type '?' | '(' type ')'
+           | '(' type,* ')' '->' type ('!' Upper,+)? ('uses' Upper,+)?  -- function type
 field     := type? name
 block     := '{' stmt* '}'
 stmt      := Upper name                      -- capability bind

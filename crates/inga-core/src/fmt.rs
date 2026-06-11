@@ -716,8 +716,27 @@ fn render_param(param: &Param) -> String {
 fn render_type(ty: &TypeExpr) -> String {
     match ty {
         TypeExpr::Name(name, _) => name.clone(),
-        TypeExpr::Option(inner, _) => format!("{}?", render_type(inner)),
+        TypeExpr::Option(inner, _) => {
+            if matches!(**inner, TypeExpr::Func { .. }) {
+                format!("({})?", render_type(inner))
+            } else {
+                format!("{}?", render_type(inner))
+            }
+        }
         TypeExpr::List(inner, _) => format!("[{}]", render_type(inner)),
+        TypeExpr::Func { params, ret, errors, caps, .. } => {
+            let inner: Vec<String> = params.iter().map(render_type).collect();
+            let mut out = format!("({}) -> {}", inner.join(", "), render_type(ret));
+            if !errors.is_empty() {
+                let names: Vec<String> = errors.iter().map(|(n, _)| n.clone()).collect();
+                out.push_str(&format!(" ! {}", names.join(", ")));
+            }
+            if !caps.is_empty() {
+                let names: Vec<String> = caps.iter().map(|(n, _)| n.clone()).collect();
+                out.push_str(&format!(" uses {}", names.join(", ")));
+            }
+            out
+        }
     }
 }
 

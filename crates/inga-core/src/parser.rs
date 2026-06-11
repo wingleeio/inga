@@ -342,12 +342,12 @@ impl<'a> Parser<'a> {
     fn parse_field(&mut self) -> Option<Field> {
         let start = self.peek().span;
         let save = self.pos;
-        if let Some(ty) = self.try_parse_type() {
-            if self.at_ident() {
+        match self.try_parse_type() {
+            Some(ty) if self.at_ident() => {
                 let (name, _) = self.expect_ident("a field name");
                 return Some(Field { ty: Some(ty), name, span: start.to(self.prev_span()) });
             }
-            self.pos = save;
+            _ => self.pos = save,
         }
         if self.at_ident() {
             let (name, span) = self.expect_ident("a field name");
@@ -507,18 +507,19 @@ impl<'a> Parser<'a> {
             false
         };
         let save = self.pos;
-        if let Some(ty) = self.try_parse_type() {
-            if self.at_ident() {
+        match self.try_parse_type() {
+            Some(ty) if self.at_ident() => {
                 let (name, _) = self.expect_ident("a parameter name");
                 return Param { lazy, ty: Some(ty), name, span: start.to(self.prev_span()) };
             }
-            self.pos = save;
+            _ => self.pos = save,
         }
         let (name, span) = self.expect_ident("a parameter name");
         Param { lazy, ty: None, name, span: start.to(span) }
     }
 
-    /// Type grammar: `Name`, `[T]` (list), postfix `?` (option).
+    /// Type grammar: `Name`, `[T]` (list), postfix `?` (option),
+    /// `(T, ...) -> T [! rows] [uses rows]` (function), `(T)` (grouping).
     fn try_parse_type(&mut self) -> Option<TypeExpr> {
         let start = self.peek().span;
         let mut ty = match self.peek().kind.clone() {
@@ -534,6 +535,54 @@ impl<'a> Parser<'a> {
                 }
                 self.bump();
                 TypeExpr::List(Box::new(inner), start.to(self.prev_span()))
+            }
+            TokenKind::LParen => {
+                self.bump();
+                self.skip_newlines();
+                let mut params = Vec::new();
+                while !self.at(&TokenKind::RParen) && !self.at(&TokenKind::Eof) {
+                    params.push(self.try_parse_type()?);
+                    self.skip_newlines();
+                    if self.at(&TokenKind::Comma) {
+                        self.bump();
+                        self.skip_newlines();
+                    } else {
+                        break;
+                    }
+                }
+                if !self.at(&TokenKind::RParen) {
+                    return None;
+                }
+                self.bump();
+                if self.at(&TokenKind::Arrow) {
+                    self.bump();
+                    let ret = self.try_parse_type()?;
+                    // Rows bind to the innermost function type.
+                    let errors = if self.at(&TokenKind::Bang) {
+                        self.bump();
+                        self.parse_name_list("an error type")
+                    } else {
+                        Vec::new()
+                    };
+                    let caps = if self.at(&TokenKind::KwUses) {
+                        self.bump();
+                        self.parse_name_list("a service name")
+                    } else {
+                        Vec::new()
+                    };
+                    TypeExpr::Func {
+                        params,
+                        ret: Box::new(ret),
+                        errors,
+                        caps,
+                        span: start.to(self.prev_span()),
+                    }
+                } else if params.len() == 1 {
+                    // `(T)` — grouping, e.g. `((Int) -> Int)?`.
+                    params.pop().unwrap()
+                } else {
+                    return None;
+                }
             }
             _ => return None,
         };
@@ -657,8 +706,17 @@ impl<'a> Parser<'a> {
         }
         // `Type name = expr` (typed binding) or `Service name` (acquire)
         let save = self.pos;
-        if matches!(self.peek().kind, TokenKind::Ident(_) | TokenKind::LBracket) {
-            if let Some(ty) = self.try_parse_type() {
+        if matches!(
+            self.peek().kind,
+            TokenKind::Ident(_) | TokenKind::LBracket | TokenKind::LParen
+        ) {
+            // `(` is ambiguous (function type vs lambda/parens); a failed
+            // speculative type parse must rewind.
+            let parsed = self.try_parse_type();
+            if parsed.is_none() {
+                self.pos = save;
+            }
+            if let Some(ty) = parsed {
                 if let TokenKind::Ident(name) = self.peek().kind.clone() {
                     let name_span = self.peek().span;
                     self.bump();

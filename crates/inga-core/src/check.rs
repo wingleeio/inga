@@ -673,6 +673,43 @@ impl<'a> Checker<'a> {
             TypeExpr::List(inner, _) => {
                 Type::List(Box::new(self.resolve_type_expr(inner, tyvars)))
             }
+            TypeExpr::Func { params, ret, errors, caps, .. } => {
+                let params: Vec<Type> =
+                    params.iter().map(|t| self.resolve_type_expr(t, tyvars)).collect();
+                let ret = self.resolve_type_expr(ret, tyvars);
+                let errors = self.resolve_error_list(Some(errors));
+                let mut cap_set = BTreeSet::new();
+                for (name, span) in caps {
+                    if self.services.contains_key(name) {
+                        cap_set.insert(name.clone());
+                    } else {
+                        self.error(*span, format!("unknown service `{name}` in `uses`"));
+                    }
+                }
+                Type::Func(Rc::new(FuncType { params, ret, errors, caps: cap_set }))
+            }
+        }
+    }
+
+    /// Annotated function types are contracts: a function value flowing
+    /// into one must not have effects the annotation doesn't declare.
+    fn enforce_func_rows(&mut self, expected: &Type, found: &Type, span: Span) {
+        let exp = self.ctx.resolve(expected);
+        let act = self.ctx.resolve(found);
+        let (Type::Func(exp), Type::Func(act)) = (&exp, &act) else { return };
+        for e in act.errors.difference(&exp.errors) {
+            let rendered = self.render(expected);
+            self.error(
+                span,
+                format!("this function can fail with `{e}`, but the expected type {rendered} does not declare it"),
+            );
+        }
+        for c in act.caps.difference(&exp.caps) {
+            let rendered = self.render(expected);
+            self.error(
+                span,
+                format!("this function uses `{c}`, but the expected type {rendered} does not declare it"),
+            );
         }
     }
 
@@ -875,6 +912,7 @@ impl<'a> Checker<'a> {
                             let mut tyvars = HashMap::new();
                             let annotated = self.resolve_type_expr(annotation, &mut tyvars);
                             self.unify_at(&annotated, &value_ty, value.span, "binding");
+                            self.enforce_func_rows(&annotated, &value_ty, value.span);
                             annotated
                         }
                         None => value_ty,
@@ -1331,9 +1369,17 @@ impl<'a> Checker<'a> {
                     return Type::Unknown;
                 }
                 for (param_ty, arg) in f.params.iter().zip(args.iter()) {
+                    // A parameter already shaped as a function carries its
+                    // row contract; the callee's inferred rows account for
+                    // invoking it, so the conservative merge below would
+                    // double-count (enforce_func_rows keeps it honest).
+                    let contracted = matches!(self.ctx.resolve(param_ty), Type::Func(_));
                     let arg_ty = self.check_expr(arg);
                     self.unify_at(param_ty, &arg_ty, arg.span, "argument");
-                    self.add_func_arg_rows(&arg_ty);
+                    self.enforce_func_rows(param_ty, &arg_ty, arg.span);
+                    if !contracted {
+                        self.add_func_arg_rows(&arg_ty);
+                    }
                 }
                 self.merge_rows(&Rows { errors: f.errors.clone(), caps: f.caps.clone() });
                 f.ret.clone()
@@ -1435,6 +1481,7 @@ impl<'a> Checker<'a> {
             for (param_ty, arg) in params.iter().zip(args.iter()) {
                 let arg_ty = self.check_expr(arg);
                 self.unify_at(param_ty, &arg_ty, arg.span, "argument");
+                self.enforce_func_rows(param_ty, &arg_ty, arg.span);
                 self.add_func_arg_rows(&arg_ty);
             }
             for arg in args.iter().skip(params.len()) {
@@ -1891,6 +1938,7 @@ impl<'a> Checker<'a> {
                 for (param_ty, arg) in params.iter().zip(args.iter()) {
                     let arg_ty = self.check_expr(arg);
                     self.unify_at(param_ty, &arg_ty, arg.span, "argument");
+                    self.enforce_func_rows(param_ty, &arg_ty, arg.span);
                     self.add_func_arg_rows(&arg_ty);
                 }
                 for arg in args.iter().skip(params.len()) {

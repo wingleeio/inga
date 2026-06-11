@@ -973,3 +973,67 @@ main :: () {
         checked.info.refs
     );
 }
+
+// ---- function types --------------------------------------------------------------
+
+#[test]
+fn function_types_annotate_callbacks() {
+    let out = run(r#"
+struct Boom = { Int code }
+
+twice :: ((Int) -> Int f, Int x) -> Int {
+    f(f(x))
+}
+
+attempt :: ((Int) -> Int ! Boom f, Int x) -> Int {
+    f(x) |> catch { Boom(code) -> -code }
+}
+
+pick :: (((Int) -> Int)? maybe, Int x) -> Int {
+    match maybe {
+        Some(f) -> f(x)
+        None    -> x
+    }
+}
+
+main :: () {
+    println(twice((n) -> n * 3, 2))
+    println(attempt((n) -> {
+        if n > 5 {
+            fail Boom(n)
+        }
+        n * 10
+    }, 9))
+    println(pick(Some((n) -> n + 1), 41), pick(None, 7))
+    (Int) -> Int g = (n) -> n - 1
+    println(g(100))
+}
+"#);
+    assert_eq!(out, "18\n-9\n42 7\n99\n");
+}
+
+#[test]
+fn function_type_rows_are_contracts() {
+    let errors = check_errors(r#"
+struct Boom = { Int code }
+
+pure :: ((Int) -> Int f, Int x) -> Int {
+    f(x)
+}
+
+main :: () {
+    pure((n) -> {
+        if n > 5 {
+            fail Boom(n)
+        }
+        n
+    }, 3)
+}
+"#);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("can fail with `Boom`") && e.contains("does not declare")),
+        "got: {errors:?}"
+    );
+}

@@ -31,6 +31,9 @@ module.exports = grammar({
     [$._type, $._expression],
     [$.parameter, $._expression],
     [$.provide_item],
+    [$.parameters, $.function_type],
+    [$.error_row],
+    [$.uses_row],
   ],
 
   rules: {
@@ -132,7 +135,24 @@ module.exports = grammar({
 
     // ---- types -------------------------------------------------------------
 
-    _type: $ => choice($.type_identifier, $.list_type, $.option_type),
+    _type: $ =>
+      choice($.type_identifier, $.list_type, $.option_type, $.function_type, $.paren_type),
+
+    // `(Int, String) -> Bool`, optionally `! Errors uses Services`.
+    function_type: $ =>
+      prec.right(
+        seq(
+          '(',
+          optional(sepBy1(',', $._type)),
+          ')',
+          '->',
+          $._type,
+          optional($.error_row),
+          optional($.uses_row)
+        )
+      ),
+
+    paren_type: $ => seq('(', $._type, ')'),
 
     list_type: $ => seq('[', $._type, ']'),
 

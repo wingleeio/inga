@@ -211,7 +211,7 @@
       "patterns": [
         {
           "name": "support.function.builtin.inga",
-          "match": "\\b(println|print|show|encode|decode|map|getOrElse|orFail|retry|upTo|ignoreFailure|sleep|len|MutMap)(?=\\s*\\()"
+          "match": "\\b(println|print|show|encode|decode|map|filter|fold|at|concat|reverse|split|slice|indexOf|trim|parseInt|toFloat|floor|getOrElse|orFail|retry|upTo|ignoreFailure|sleep|spawn|await|assert|assertEq|len|range|random|nowMillis|nowMicros|MutMap)(?=\\s*\\()"
         },
         {
           "match": "\\b([a-z][A-Za-z0-9_]*)(?=\\s*\\()",

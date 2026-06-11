@@ -93,12 +93,42 @@ One binary, everything included:
 | `inga run file.inga` | type-check + run (reference interpreter, full language) |
 | `inga build file.inga [-o out]` | **compile to a native binary** (LLVM IR → clang -O2) |
 | `inga check files...` | diagnostics with source carets |
+| `inga test [files...]` | run `test*` functions; `assert`/`assertEq` failures point at the line |
 | `inga fmt [--check] files...` | canonical formatter (idempotent, keeps comments) |
 | `inga highlight file.inga` | ANSI syntax highlighting in the terminal |
 | `inga lsp` | language server: hover with inferred `!`/`uses` rows, diagnostics, go-to-definition, completion, formatting, semantic tokens |
 
 Editor support lives in [`editors/vscode`](editors/vscode) (TextMate grammar
 + LSP client).
+
+## Concurrency without a manual
+
+`spawn(action)` runs the action on its own OS thread; `await(task)` takes
+the result. The effect system is the whole safety story: a spawned action
+must be **self-contained** — every error handled, every service provided,
+inside the spawn — so there is nothing a task can dangle on, and nothing to
+learn beyond the two words:
+
+```inga
+a = spawn(crunch("medium", 100000))
+b = spawn(crunch("large", 10000000))
+println(await(a), await(b))           // ~Nx on N cores, zero locks
+```
+
+Each task gets its own heap (allocation stays lock-free); captured values
+are frozen before the thread starts so refcounts never race. Try it:
+`inga build examples/tasks.inga -o tasks && ./tasks`.
+
+## Tests are built in
+
+```sh
+inga test games/logic_test.inga
+```
+
+Every zero-parameter `test*` function is a test; `assert(cond)` and
+`assertEq(actual, expected)` are ordinary typed errors (`! AssertFailed`),
+so a failing assertion prints with the usual caret pointing at the line.
+INGA-LATRO's poker evaluator is tested this way.
 
 ## Graphics, and a game
 
@@ -115,7 +145,10 @@ across five modules (`use util`, `cards`, `jokers`, `poker`, `state`) — poker-
 scoring, escalating blinds and antes, fifteen jokers and a rerollable shop,
 animated card deals/hovers/score popups, and the signature swirling paint
 background written as a GLSL shader *inside the Inga source* and compiled at
-runtime via `graphics.shaderNew`:
+runtime via `graphics.shaderNew`. The frame closure opens with
+`provide Arena(256.kb)`, so everything built while drawing is freed
+wholesale at frame end — the render path does no refcount work — and the
+game logic ships with [`inga test` tests](games/logic_test.inga):
 
 ```sh
 inga build games/balatro.inga -o ingalatro && ./ingalatro
@@ -134,8 +167,8 @@ crates/inga-lsp       language server (lsp-server / lsp-types)
 editors/vscode        VS Code extension + TextMate grammar
 editors/zed           Zed extension (tree-sitter highlighting + LSP)
 tree-sitter-inga      tree-sitter grammar (used by the Zed extension)
-examples/             hello.inga, retry.inga, shapes.inga, arena.inga, modules.inga (+ geometry.inga), user_service.inga
-games/                balatro.inga (+ util, cards, jokers, poker, state) — a Balatro-style deckbuilder
+examples/             hello.inga, retry.inga, shapes.inga, arena.inga, tasks.inga, modules.inga (+ geometry.inga), user_service.inga
+games/                balatro.inga (+ util, cards, jokers, poker, state, logic_test) — a Balatro-style deckbuilder
 bench/                the same workloads in Inga, JavaScript, and Rust (see bench/README.md)
 docs/SPEC.md          language design: semantics, effect rows, execution strategy
 ```
@@ -153,20 +186,24 @@ away**: error rows become Rust-style `{value, err}` two-register returns,
 capability rows become Koka-style evidence parameters, and a capability
 method call is the same machine code as a Rust `dyn` call. Memory is
 **Perceus-style ARC** (non-atomic refcounts + compiler-emitted drop glue,
-small objects recycled through free lists) with opt-in region arenas:
-`provide Arena(256.kb)` makes a scope allocate from a region freed
-wholesale at scope end. Details in
+small objects recycled through free lists, one heap per thread so `spawn`
+never locks) with opt-in region arenas: `provide Arena(256.kb)` makes a
+scope allocate from a region freed wholesale at scope end, deep-copying the
+scope's result out as it dies. Details in
 [docs/SPEC.md §6](docs/SPEC.md#6-execution-how-inga-runs).
 
 The result ([benchmarks](bench/README.md)): **compiled Inga beats Node/V8 on
 all five benchmark workloads** — 2–3× on raw calls, DI dispatch, and string
-interpolation, ~380× on typed-error control flow — and beats idiomatic Rust
+interpolation, ~290× on typed-error control flow — and beats idiomatic Rust
 on two of them.
 
 ## Status
 
-v0.2 — a complete, tested vertical slice: language, inference, interpreter,
-**native LLVM backend**, formatter, LSP, editor tooling (`cargo test` covers
-all of it). Not yet: modules/packages, GC for compiled programs (bump
-allocator today), `encode`/`decode` in compiled mode, per-implementation
-capability precision, resumable handlers.
+v0.3 — a complete, tested vertical slice: language (structs/enums/tuples,
+record update, generics, exhaustive `match`, typed errors over any value),
+inference, interpreter, **native LLVM backend with full parity**
+(`show`/`==`/`encode`/`decode`/functions-as-values all compile),
+Perceus-style ARC + arenas with copy-out, `spawn`/`await` tasks, a built-in
+test runner, formatter, LSP, editor tooling (`cargo test` covers all of
+it). Not yet: a package manager, per-implementation capability precision,
+resumable handlers.

@@ -80,8 +80,10 @@
 (enum_variant name: (type_identifier) @constructor)
 (typed_pattern name: (identifier) @variable)
 
-; Option constructors and builtin modules.
+(record_update type: (type_identifier) @type)
+
+; Option constructors and builtin functions.
 ((type_identifier) @constructor
   (#match? @constructor "^(Some|None)$"))
-((type_identifier) @namespace
-  (#match? @namespace "^(Gfx|Schedule)$"))
+((identifier) @function.builtin
+  (#match? @function.builtin "^(println|print|show|encode|decode|map|filter|fold|at|concat|reverse|split|slice|indexOf|trim|parseInt|toFloat|floor|getOrElse|orFail|retry|ignoreFailure|sleep|spawn|await|assert|assertEq|len|range|random|nowMillis|nowMicros)$"))

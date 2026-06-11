@@ -20,25 +20,26 @@ rounds; tables report round 2 (JS round 1 warms the JIT).
 
 ## Results
 
-Apple Silicon (Darwin 25.4.0), 2026-06-10, all four runs back-to-back in one
+Apple Silicon (Darwin 25.4.0), 2026-06-11, all four runs back-to-back in one
 session. `inga build` / `rustc -O` 1.96.0 / clang 21 / node v24.16.0.
 Reproduce with `bench/run.sh`.
 
 | Workload | **Inga native** | JavaScript | Rust | Inga interp | native vs V8 |
 |---|---:|---:|---:|---:|---:|
-| `fib(27)` | **353 µs** | 1,018 µs | 531 µs | 147,487 µs | **2.9× faster** |
-| `fib_service(24)` | **140 µs** | 275 µs | 124 µs | 57,532 µs | **2.0× faster** |
-| `strings(24)` | **180 µs** | 459 µs | 3,730 µs | 41,254 µs | **2.6× faster** |
-| `errors(24)` | **544 µs** | 207,173 µs | 124 µs | 63,107 µs | **380× faster** |
-| `store(24)` | **631 µs** | 935 µs | 1,690 µs | 114,472 µs | **1.5× faster** |
+| `fib(27)` | **379 µs** | 1,018 µs | 527 µs | 147,397 µs | **2.7× faster** |
+| `fib_service(24)` | **149 µs** | 265 µs | 124 µs | 60,194 µs | **1.8× faster** |
+| `strings(24)` | **201 µs** | 456 µs | 3,770 µs | 41,807 µs | **2.3× faster** |
+| `errors(24)` | **733 µs** | 212,774 µs | 124 µs | 64,192 µs | **290× faster** |
+| `store(24)` | **727 µs** | 944 µs | 1,918 µs | 119,798 µs | **1.3× faster** |
 
 **Compiled Inga beats V8 on all five workloads** — and beats the idiomatic
 Rust version on two (`strings`, where `format!` allocates per node, and
 `store`, where std's `HashMap` pays for SipHash). These numbers include
-Inga's Perceus-style ARC: unlike the earlier never-freeing bump allocator,
-every workload now reclaims memory (`errors` pays ~2× for boxing failed
-values and refcounts and is still ~380× ahead of V8; `fib` and `store` got
-*faster* because dead objects recycle through warm free lists).
+Inga's Perceus-style ARC *and* the per-thread heaps that make `spawn` tasks
+lock-free: allocator state now lives in thread-local storage, which costs
+the allocation-heavy workloads a little (`errors` boxes a failed value per
+leaf and pays ~35% over a process-global heap; the rest move single-digit
+percents) and buys real parallelism with zero locks on every allocation.
 
 ## Why it's fast — and where that's earned vs. situational
 
@@ -65,10 +66,10 @@ The backend compiles Inga's two effect rows *away* (see
   plus one compiler fusion: `map.get(k) |> getOrElse(default)` (with a pure
   default) probes the table directly instead of boxing an `Option`.
 
-Two caveats worth saying out loud. First, allocation is a bump allocator
-that never frees — fine for short-lived processes and benchmarks, not a GC
-story (that's future work, and it flatters `strings`/`store` slightly).
-Second, V8 is running a dynamically-typed language; Inga's wins here are
+Two caveats worth saying out loud. First, memory is refcounted with
+compiler-emitted drop glue and a few deliberate, bounded leaks (closure
+captures, frozen task captures, generic-function results) rather than a
+tracing GC. Second, V8 is running a dynamically-typed language; Inga's wins here are
 wins of *language design* (static types and static effect rows make the fast
 lowering possible), not of compiler engineering heroics — LLVM does the
 heavy lifting.

@@ -488,6 +488,11 @@ frameEnd :: (g, deck, hand, sel, av, Bool won) {
 }
 
 frame :: (g, deck, hand, sel, jok, out, steps, av) {
+    // Per-frame arena: every string and list built while drawing lives in
+    // this region and is freed wholesale when the frame ends, so the render
+    // path does no refcount work at all. Game state lives in the MutMaps
+    // (their storage is the runtime's own, untouched by the region).
+    provide Arena(256.kb)
     drawBackground(g)
     phase = gv(g, "phase")
     if phase == 0 {

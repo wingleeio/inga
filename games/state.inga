@@ -30,12 +30,7 @@ pub blindName :: (Int blind) -> String {
 }
 
 pub selCount :: (sel) -> Int {
-    cnt = MutMap()
-    map(range(8), (i) -> {
-        cnt.set(0, gn(cnt, 0) + gn(sel, i))
-        0
-    })
-    gn(cnt, 0)
+    fold(range(8), 0, (acc, i) -> acc + gn(sel, i))
 }
 
 pub shuffle :: (deck) {

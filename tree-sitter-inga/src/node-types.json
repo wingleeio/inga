@@ -94,6 +94,10 @@
           "named": true
         },
         {
+          "type": "record_update",
+          "named": true
+        },
+        {
           "type": "string",
           "named": true
         },
@@ -181,7 +185,15 @@
           "named": true
         },
         {
+          "type": "record_update",
+          "named": true
+        },
+        {
           "type": "string",
+          "named": true
+        },
+        {
+          "type": "tuple_pattern",
           "named": true
         },
         {
@@ -265,6 +277,10 @@
         },
         {
           "type": "provide_expression",
+          "named": true
+        },
+        {
+          "type": "record_update",
           "named": true
         },
         {
@@ -356,6 +372,10 @@
         },
         {
           "type": "provide_expression",
+          "named": true
+        },
+        {
+          "type": "record_update",
           "named": true
         },
         {
@@ -454,6 +474,10 @@
           },
           {
             "type": "provide_expression",
+            "named": true
+          },
+          {
+            "type": "record_update",
             "named": true
           },
           {
@@ -653,6 +677,10 @@
           "named": true
         },
         {
+          "type": "record_update",
+          "named": true
+        },
+        {
           "type": "string",
           "named": true
         },
@@ -720,6 +748,10 @@
           {
             "type": "identifier",
             "named": true
+          },
+          {
+            "type": "number",
+            "named": true
           }
         ]
       }
@@ -786,6 +818,10 @@
         },
         {
           "type": "provide_expression",
+          "named": true
+        },
+        {
+          "type": "record_update",
           "named": true
         },
         {
@@ -962,6 +998,10 @@
             "named": true
           },
           {
+            "type": "record_update",
+            "named": true
+          },
+          {
             "type": "string",
             "named": true
           },
@@ -1078,6 +1118,10 @@
         },
         {
           "type": "provide_expression",
+          "named": true
+        },
+        {
+          "type": "record_update",
           "named": true
         },
         {
@@ -1204,6 +1248,10 @@
           "named": true
         },
         {
+          "type": "record_update",
+          "named": true
+        },
+        {
           "type": "string",
           "named": true
         },
@@ -1284,6 +1332,10 @@
           },
           {
             "type": "provide_expression",
+            "named": true
+          },
+          {
+            "type": "record_update",
             "named": true
           },
           {
@@ -1408,6 +1460,10 @@
           "named": true
         },
         {
+          "type": "record_update",
+          "named": true
+        },
+        {
           "type": "string",
           "named": true
         },
@@ -1488,6 +1544,10 @@
         },
         {
           "type": "provide_expression",
+          "named": true
+        },
+        {
+          "type": "record_update",
           "named": true
         },
         {
@@ -1602,6 +1662,10 @@
           },
           {
             "type": "provide_expression",
+            "named": true
+          },
+          {
+            "type": "record_update",
             "named": true
           },
           {
@@ -1768,7 +1832,7 @@
     "named": true,
     "fields": {},
     "children": {
-      "multiple": false,
+      "multiple": true,
       "required": true,
       "types": [
         {
@@ -1832,6 +1896,10 @@
           "named": true
         },
         {
+          "type": "record_update",
+          "named": true
+        },
+        {
           "type": "string",
           "named": true
         },
@@ -1851,7 +1919,7 @@
     "named": true,
     "fields": {},
     "children": {
-      "multiple": false,
+      "multiple": true,
       "required": true,
       "types": [
         {
@@ -1903,6 +1971,10 @@
         },
         {
           "type": "string",
+          "named": true
+        },
+        {
+          "type": "tuple_pattern",
           "named": true
         },
         {
@@ -2000,6 +2072,10 @@
           "named": true
         },
         {
+          "type": "record_update",
+          "named": true
+        },
+        {
           "type": "string",
           "named": true
         },
@@ -2065,6 +2141,114 @@
         },
         {
           "type": "type_identifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "record_update",
+    "named": true,
+    "fields": {
+      "field": {
+        "multiple": true,
+        "required": false,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "type_identifier",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "binary_expression",
+          "named": true
+        },
+        {
+          "type": "block",
+          "named": true
+        },
+        {
+          "type": "boolean",
+          "named": true
+        },
+        {
+          "type": "call_expression",
+          "named": true
+        },
+        {
+          "type": "fail_expression",
+          "named": true
+        },
+        {
+          "type": "field_expression",
+          "named": true
+        },
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "if_expression",
+          "named": true
+        },
+        {
+          "type": "lambda",
+          "named": true
+        },
+        {
+          "type": "list",
+          "named": true
+        },
+        {
+          "type": "match_expression",
+          "named": true
+        },
+        {
+          "type": "number",
+          "named": true
+        },
+        {
+          "type": "paren_expression",
+          "named": true
+        },
+        {
+          "type": "pipe_expression",
+          "named": true
+        },
+        {
+          "type": "provide_expression",
+          "named": true
+        },
+        {
+          "type": "record_update",
+          "named": true
+        },
+        {
+          "type": "string",
+          "named": true
+        },
+        {
+          "type": "type_identifier",
+          "named": true
+        },
+        {
+          "type": "unary_expression",
           "named": true
         }
       ]
@@ -2221,6 +2405,45 @@
     }
   },
   {
+    "type": "tuple_pattern",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "boolean",
+          "named": true
+        },
+        {
+          "type": "constructor_pattern",
+          "named": true
+        },
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "number",
+          "named": true
+        },
+        {
+          "type": "string",
+          "named": true
+        },
+        {
+          "type": "tuple_pattern",
+          "named": true
+        },
+        {
+          "type": "typed_pattern",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "typed_pattern",
     "named": true,
     "fields": {
@@ -2312,6 +2535,10 @@
         },
         {
           "type": "provide_expression",
+          "named": true
+        },
+        {
+          "type": "record_update",
           "named": true
         },
         {
@@ -2435,7 +2662,15 @@
     "named": false
   },
   {
+    "type": "..",
+    "named": false
+  },
+  {
     "type": "/",
+    "named": false
+  },
+  {
+    "type": ":",
     "named": false
   },
   {

@@ -27,6 +27,7 @@ module.exports = grammar({
   word: $ => $.identifier,
 
   conflicts: $ => [
+    [$._expression, $.record_update],
     [$._type, $.acquire, $._expression],
     [$._type, $._expression],
     [$.parameter, $._expression],
@@ -152,7 +153,8 @@ module.exports = grammar({
         )
       ),
 
-    paren_type: $ => seq('(', $._type, ')'),
+    // `(Int)` groups; `(Int, String)` is a tuple type.
+    paren_type: $ => seq('(', sepBy1(',', $._type), ')'),
 
     list_type: $ => seq('[', $._type, ']'),
 
@@ -181,6 +183,7 @@ module.exports = grammar({
         $.call_expression,
         $.field_expression,
         $.match_expression,
+        $.record_update,
         $.if_expression,
         $.fail_expression,
         $.provide_expression,
@@ -224,10 +227,25 @@ module.exports = grammar({
     arguments: $ => seq('(', optional(sepBy1(',', $._expression)), ')'),
 
     field_expression: $ =>
-      prec.left(PREC.field, seq($._expression, '.', field('field', $.identifier))),
+      prec.left(
+        PREC.field,
+        seq($._expression, '.', field('field', choice($.identifier, $.number)))
+      ),
 
     match_expression: $ =>
       seq('match', field('value', $._expression), '{', repeat($.arm), '}'),
+
+    // `User { ..u, name: v }` — copy `u`, overriding the listed fields.
+    record_update: $ =>
+      seq(
+        field('type', $.type_identifier),
+        '{',
+        '..',
+        $._expression,
+        repeat(seq(',', field('field', $.identifier), ':', $._expression)),
+        optional(','),
+        '}'
+      ),
 
     arm: $ => seq($._pattern, '->', $._expression, optional(',')),
 
@@ -235,12 +253,15 @@ module.exports = grammar({
       choice(
         $.typed_pattern,
         $.constructor_pattern,
+        $.tuple_pattern,
         $.identifier,
         $.number,
         $.string,
         $.boolean,
         seq('-', $.number)
       ),
+
+    tuple_pattern: $ => seq('(', sepBy1(',', $._pattern), ')'),
 
     // `String reason -> ...` — a type name followed by a binder; matches a
     // value of that type and binds it.
@@ -286,7 +307,8 @@ module.exports = grammar({
 
     list: $ => seq('[', optional(sepBy1(',', $._expression)), ']'),
 
-    paren_expression: $ => seq('(', $._expression, ')'),
+    // `(a)` groups; `(a, b)` is a tuple.
+    paren_expression: $ => seq('(', sepBy1(',', $._expression), ')'),
 
     // ---- literals --------------------------------------------------------------
 

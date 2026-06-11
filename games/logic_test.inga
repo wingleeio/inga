@@ -1,0 +1,114 @@
+// INGA-LATRO game-logic tests. Run with:
+//
+//   inga test games/logic_test.inga
+//
+// Each zero-parameter `test*` function is one test; `assert`/`assertEq`
+// failures are reported with the failing line.
+
+use util { gn }
+use cards { chipsOf, rankName, suitName }
+use poker { baseChips, baseMult, evalSelected, handTypeName }
+use state { blindName, selCount, sortKey, targetFor }
+
+// Card id = rank * 4 + suit (rank 0 = "2" … 12 = Ace; suit 1 = hearts).
+card :: (Int rank, Int suit) -> Int {
+    rank * 4 + suit
+}
+
+pick :: (hand, sel, Int slot, Int c) {
+    hand.set(slot, c)
+    sel.set(slot, 1)
+}
+
+emptyFrom :: (hand, Int start) {
+    map(range(8), (i) -> {
+        if i >= start {
+            hand.set(i, -1)
+        }
+        0
+    })
+}
+
+testCardBasics :: () {
+    assertEq(rankName(12), "A")
+    assertEq(rankName(0), "2")
+    assertEq(suitName(1), "H")
+    assertEq(chipsOf(card(12, 0)), 11) // aces are worth 11
+    assertEq(chipsOf(card(3, 2)), 5) // "5" is worth 5
+    assertEq(chipsOf(card(10, 1)), 10) // face cards are worth 10
+}
+
+testBlindsAndTargets :: () {
+    assertEq(blindName(0), "Small Blind")
+    assertEq(blindName(2), "Boss Blind")
+    assertEq(targetFor(1, 0), 300)
+    assertEq(targetFor(1, 2), 600)
+    assert(targetFor(2, 0) > targetFor(1, 2))
+}
+
+testSelCount :: () {
+    sel = MutMap()
+    assertEq(selCount(sel), 0)
+    sel.set(0, 1)
+    sel.set(4, 1)
+    assertEq(selCount(sel), 2)
+}
+
+testSortKeyOrdersByRankThenSuit :: () {
+    assert(sortKey(card(12, 0), false) > sortKey(card(11, 0), false))
+    assert(sortKey(card(5, 1), true) > sortKey(card(9, 0), true) == (1 > 0))
+    assertEq(sortKey(-1, false), -1) // empty slots sort last
+}
+
+testFlushBeatsNothing :: () {
+    hand = MutMap()
+    sel = MutMap()
+    out = MutMap()
+    // Five hearts with a rank gap: a flush (type 5), not a straight flush.
+    pick(hand, sel, 0, card(0, 1))
+    pick(hand, sel, 1, card(2, 1))
+    pick(hand, sel, 2, card(4, 1))
+    pick(hand, sel, 3, card(6, 1))
+    pick(hand, sel, 4, card(9, 1))
+    emptyFrom(hand, 5)
+    evalSelected(hand, sel, out)
+    assertEq(gn(out, 0), 5)
+    assertEq(handTypeName(gn(out, 0)), "Flush")
+    assertEq(gn(out, 6), 5) // all five count as hearts for joker effects
+}
+
+testPairAndChips :: () {
+    hand = MutMap()
+    sel = MutMap()
+    out = MutMap()
+    pick(hand, sel, 0, card(12, 0)) // A
+    pick(hand, sel, 1, card(12, 1)) // A
+    pick(hand, sel, 2, card(3, 2)) // 5
+    emptyFrom(hand, 3)
+    evalSelected(hand, sel, out)
+    assertEq(handTypeName(gn(out, 0)), "Pair")
+    assertEq(gn(out, 3), 11 + 11 + 5) // summed card chips
+    assertEq(gn(out, 14), 1) // pair flag for Sly Joker
+}
+
+testStraightAndWheel :: () {
+    hand = MutMap()
+    sel = MutMap()
+    out = MutMap()
+    // A-2-3-4-5 "wheel" straight, mixed suits.
+    pick(hand, sel, 0, card(12, 0))
+    pick(hand, sel, 1, card(0, 1))
+    pick(hand, sel, 2, card(1, 2))
+    pick(hand, sel, 3, card(2, 3))
+    pick(hand, sel, 4, card(3, 0))
+    emptyFrom(hand, 5)
+    evalSelected(hand, sel, out)
+    assertEq(handTypeName(gn(out, 0)), "Straight")
+    assertEq(gn(out, 16), 1) // straight flag for Mystic Summit
+}
+
+testScoreScalesWithHandType :: () {
+    assert(baseChips(8) > baseChips(1))
+    assert(baseMult(8) > baseMult(1))
+    assertEq(baseChips(1) * baseMult(1), 20) // a bare pair scores 10 x 2
+}

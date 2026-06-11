@@ -2319,7 +2319,20 @@ impl<'a> Checker<'a> {
             }
         }
         let recv_ty = self.check_expr(recv);
-        match self.ctx.resolve(&recv_ty) {
+        let resolved = {
+            let r = self.ctx.resolve(&recv_ty);
+            // `get`/`set`/`delete`/`size` are map vocabulary: an otherwise
+            // unconstrained receiver (e.g. an untyped parameter in a
+            // function nothing calls yet) defaults to MutMap.
+            if matches!(r, Type::Var(_)) && matches!(name, "get" | "set" | "delete" | "size") {
+                let m = Type::MutMap(Box::new(self.ctx.fresh()), Box::new(self.ctx.fresh()));
+                let _ = self.ctx.unify(&recv_ty, &m);
+                self.ctx.resolve(&recv_ty)
+            } else {
+                r
+            }
+        };
+        match resolved {
             Type::Service(service) => {
                 let method_info = self.services.get(&service).and_then(|s| {
                     s.methods

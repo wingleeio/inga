@@ -106,6 +106,10 @@ pub struct Facts {
     pub enum_variants: HashMap<String, Vec<(String, Vec<CType>)>>,
     /// Impl instance field types, by impl name.
     pub impl_fields: HashMap<String, Vec<CType>>,
+    /// Functions with universal type parameters: the backend exempts their
+    /// results from reclamation (uniform representation, no per-instance
+    /// drop glue — a bounded, documented leak).
+    pub generic_funcs: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -168,6 +172,9 @@ struct FuncInfo {
     name_span: Span,
     module: usize,
     is_pub: bool,
+    /// Type-variable ids from lowercase names in the signature — universally
+    /// quantified: instantiated fresh at every call site, rigid in the body.
+    rigid: Vec<u32>,
 }
 
 /// Module id for compiler builtins (always visible).
@@ -231,6 +238,7 @@ struct Checker<'a> {
 
     diags: Vec<Diagnostic>,
     record_info: bool,
+    current_rigid: std::collections::HashSet<u32>,
     raw_expr_types: HashMap<(u32, u32), Type>,
     info: CheckInfo,
     changed: bool,
@@ -256,6 +264,7 @@ impl<'a> Checker<'a> {
             impl_field_rows: HashMap::new(),
             diags: Vec::new(),
             record_info: false,
+            current_rigid: std::collections::HashSet::new(),
             raw_expr_types: HashMap::new(),
             info: CheckInfo::default(),
             changed: false,
@@ -531,6 +540,13 @@ impl<'a> Checker<'a> {
                         Some(t) => self.resolve_type_expr(t, &mut tyvars),
                         None => self.ctx.fresh(),
                     };
+                    let rigid: Vec<u32> = tyvars
+                        .values()
+                        .filter_map(|t| match t {
+                            Type::Var(v) => Some(*v),
+                            _ => None,
+                        })
+                        .collect();
                     let declared_errors = d
                         .sig
                         .errors
@@ -559,6 +575,7 @@ impl<'a> Checker<'a> {
                             name_span: d.name_span,
                             module: self.module_of(d.name_span),
                             is_pub: d.is_pub,
+                            rigid,
                         },
                     );
                 }
@@ -599,6 +616,14 @@ impl<'a> Checker<'a> {
 
     /// Add a failed value's type to the error row; diagnose unfailable types.
     fn add_fail_row(&mut self, ty: &Type, span: Span, what: &str) {
+        if self.is_rigid(ty) {
+            let rendered = self.render(ty);
+            self.error(
+                span,
+                format!("cannot `{what}` with the type parameter {rendered} (the `!` row needs a concrete type)"),
+            );
+            return;
+        }
         match self.row_tag_of(ty) {
             Ok(Some(tag)) => self.add_error_row(&tag),
             Ok(None) => {}
@@ -691,6 +716,52 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The variable id a rigid (universal) parameter currently resolves to —
+    /// body inference may alias it into another variable.
+    fn rigid_ids(&self, rigid: &[u32]) -> Vec<u32> {
+        rigid
+            .iter()
+            .filter_map(|v| match self.ctx.resolve(&Type::Var(*v)) {
+                Type::Var(w) => Some(w),
+                _ => None, // bound to a concrete type: monomorphic now
+            })
+            .collect()
+    }
+
+    /// Instantiate a generic function type: rigid (universal) variables that
+    /// are still unbound get fresh variables, consistently across the type.
+    fn instantiate(&mut self, ty: &Type, rigid: &[u32], map: &mut HashMap<u32, Type>) -> Type {
+        match self.ctx.resolve(ty) {
+            Type::Var(v) if rigid.contains(&v) => {
+                if let Some(t) = map.get(&v) {
+                    t.clone()
+                } else {
+                    let fresh = self.ctx.fresh();
+                    map.insert(v, fresh.clone());
+                    fresh
+                }
+            }
+            Type::Option(t) => Type::Option(Box::new(self.instantiate(&t, rigid, map))),
+            Type::List(t) => Type::List(Box::new(self.instantiate(&t, rigid, map))),
+            Type::MutMap(k, v) => Type::MutMap(
+                Box::new(self.instantiate(&k, rigid, map)),
+                Box::new(self.instantiate(&v, rigid, map)),
+            ),
+            Type::Func(f) => Type::Func(Rc::new(FuncType {
+                params: f.params.iter().map(|t| self.instantiate(t, rigid, map)).collect(),
+                ret: self.instantiate(&f.ret, rigid, map),
+                errors: f.errors.clone(),
+                caps: f.caps.clone(),
+            })),
+            other => other,
+        }
+    }
+
+    /// Is this an unbound type parameter of the function being checked?
+    fn is_rigid(&self, ty: &Type) -> bool {
+        matches!(self.ctx.resolve(ty), Type::Var(v) if self.current_rigid.contains(&v))
+    }
+
     /// Annotated function types are contracts: a function value flowing
     /// into one must not have effects the annotation doesn't declare.
     fn enforce_func_rows(&mut self, expected: &Type, found: &Type, span: Span) {
@@ -729,6 +800,8 @@ impl<'a> Checker<'a> {
         let Some(info) = self.funcs.get(&d.name) else { return };
         let params = info.params.clone();
         let ret = info.ret.clone();
+        let rigid = info.rigid.clone();
+        self.current_rigid = self.rigid_ids(&rigid).into_iter().collect();
 
         let mut scope = HashMap::new();
         for (param, ty) in d.sig.params.iter().zip(params.iter()) {
@@ -755,6 +828,7 @@ impl<'a> Checker<'a> {
             let sig = self.render_func_signature(&d.name);
             self.info.hovers.push((d.name_span, sig));
         }
+        self.current_rigid.clear();
     }
 
     fn check_impl(&mut self, d: &ImplDecl) {
@@ -1000,8 +1074,12 @@ impl<'a> Checker<'a> {
             let info = &self.funcs[&name];
             let params: Vec<CType> = info.params.iter().map(|t| self.ctype(t)).collect();
             let ret = self.ctype(&info.ret.clone());
+            let generic = !self.rigid_ids(&info.rigid).is_empty();
             self.info.facts.func_params.insert(name.clone(), params);
             self.info.facts.func_ret.insert(name.clone(), ret);
+            if generic {
+                self.info.facts.generic_funcs.insert(name.clone());
+            }
             self.info.facts.funcs.insert(
                 name,
                 RowFact {
@@ -1097,6 +1175,14 @@ impl<'a> Checker<'a> {
                         Type::Bool
                     }
                     UnOp::Neg => {
+                        if self.is_rigid(&ty) {
+                            let rendered = self.render(&ty);
+                            self.error(
+                                inner.span,
+                                format!("cannot negate the type parameter {rendered}; constrain it with an annotation"),
+                            );
+                            return Type::Unknown;
+                        }
                         let resolved = self.ctx.resolve(&ty);
                         match resolved {
                             Type::Int | Type::Float | Type::Var(_) | Type::Unknown => ty,
@@ -1176,11 +1262,14 @@ impl<'a> Checker<'a> {
         }
         if let Some(info) = self.funcs.get(name) {
             let (def_module, is_pub, def_span) = (info.module, info.is_pub, info.name_span);
+            let rigid = self.rigid_ids(&info.rigid);
             let rows = self.func_effective_rows(name);
             let info = &self.funcs[name];
+            let (params, ret) = (info.params.clone(), info.ret.clone());
+            let mut inst = HashMap::new();
             let func = Type::Func(Rc::new(FuncType {
-                params: info.params.clone(),
-                ret: info.ret.clone(),
+                params: params.iter().map(|t| self.instantiate(t, &rigid, &mut inst)).collect(),
+                ret: self.instantiate(&ret, &rigid, &mut inst),
                 errors: rows.errors,
                 caps: rows.caps,
             }));
@@ -1469,9 +1558,14 @@ impl<'a> Checker<'a> {
                     format!("`{member}` is private to module `{module_name}` (mark it `pub` to export it)"),
                 );
             }
+            let rigid = self.rigid_ids(&self.funcs[member].rigid);
             let rows = self.func_effective_rows(member);
             let info = &self.funcs[member];
             let (params, ret, def_span) = (info.params.clone(), info.ret.clone(), info.name_span);
+            let mut inst = HashMap::new();
+            let params: Vec<Type> =
+                params.iter().map(|t| self.instantiate(t, &rigid, &mut inst)).collect();
+            let ret = self.instantiate(&ret, &rigid, &mut inst);
             if params.len() != args.len() {
                 self.error(
                     span,
@@ -2605,6 +2699,15 @@ impl<'a> Checker<'a> {
         let rhs_ty = self.check_expr(rhs);
         self.unify_at(&lhs_ty, &rhs_ty, rhs.span, &format!("`{}` operands", op.symbol()));
         let operand = self.ctx.resolve(&lhs_ty);
+        // Type parameters are opaque: only `==`/`!=` (identity) apply.
+        if self.is_rigid(&lhs_ty) && !matches!(op, BinOp::Eq | BinOp::Ne) {
+            let rendered = self.render(&lhs_ty);
+            self.error(
+                span,
+                format!("`{}` is not defined for the type parameter {rendered}; constrain it with an annotation", op.symbol()),
+            );
+            return Type::Unknown;
+        }
         match op {
             BinOp::Add => match operand {
                 Type::Int | Type::Float | Type::Str | Type::Duration | Type::Var(_)

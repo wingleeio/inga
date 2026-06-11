@@ -1057,3 +1057,42 @@ main :: () {
         "[5, 4, 3] 15\n4 -1\n[1, 2, 3] [3, 2, 1]\n[\"a\", \"bb\", \"ccc\"] world\n2 -1 pad\n42 -1\n3.5 3\n"
     );
 }
+
+// ---- generics ---------------------------------------------------------------------
+
+#[test]
+fn generic_functions_instantiate_per_call_site() {
+    let out = run(r#"
+myMap :: ([a] xs, (a) -> b f) -> [b] {
+    fold(xs, [], (acc, x) -> concat(acc, [f(x)]))
+}
+
+first :: ([a] xs, a fallback) -> a {
+    at(xs, 0) |> getOrElse(fallback)
+}
+
+main :: () {
+    println(myMap([1, 2, 3], (n) -> n * n))
+    println(myMap(["a", "bb"], (s) -> len(s)))
+    println(first([7, 8], 0), first(["x"], "?"))
+}
+"#);
+    assert_eq!(out, "[1, 4, 9]\n[1, 2]\n7 x\n");
+}
+
+#[test]
+fn type_parameters_are_opaque() {
+    let errors = check_errors(r#"
+add :: (a x, a y) -> a {
+    x + y
+}
+
+main :: () {
+    println(add(1, 2))
+}
+"#);
+    assert!(
+        errors.iter().any(|e| e.contains("not defined for the type parameter")),
+        "got: {errors:?}"
+    );
+}

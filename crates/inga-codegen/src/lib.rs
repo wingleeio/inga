@@ -847,8 +847,14 @@ impl<'a> Cg<'a> {
             r
         };
         // The callee dup'ed the result; this function owns one reference.
-        let ret_cty = self.info.facts.func_ret.get(&decl.name).cloned().unwrap_or(CType::Int);
-        self.pool_value(f, &out, &ret_cty);
+        // Generic results are exempt from reclamation: their containers were
+        // assembled without element counts (uniform representation), so a
+        // deep release would underflow — leak them instead (sound, bounded).
+        if !self.info.facts.generic_funcs.contains(&decl.name) {
+            let ret_cty =
+                self.info.facts.func_ret.get(&decl.name).cloned().unwrap_or(CType::Int);
+            self.pool_value(f, &out, &ret_cty);
+        }
         let _ = span;
         out
     }

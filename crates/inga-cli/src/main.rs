@@ -6,7 +6,8 @@ use std::process::ExitCode;
 use inga_core::diag::{Diagnostic, Severity};
 use inga_core::span::LineIndex;
 use inga_core::token::{StrPart, Token, TokenKind};
-use inga_core::{check_source, fmt as inga_fmt, interp, lexer};
+use inga_core::modules::{load_program, ModuleSrc};
+use inga_core::{check_loaded, fmt as inga_fmt, interp, lexer};
 
 const USAGE: &str = "\
 inga — the Inga language
@@ -58,13 +59,15 @@ fn cmd_run(args: &[String]) -> ExitCode {
         eprintln!("usage: inga run <file.inga>");
         return ExitCode::FAILURE;
     };
-    let src = match read_file(path) {
-        Ok(s) => s,
-        Err(code) => return code,
+    let loaded = match load_program(Path::new(path)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: cannot read `{path}`: {e}");
+            return ExitCode::FAILURE;
+        }
     };
-    let checked = check_source(&src);
-    let has_errors = print_diagnostics(path, &src, &checked.diagnostics);
-    if has_errors {
+    let (checked, mods) = check_loaded(loaded);
+    if print_diagnostics_modules(&mods, &checked.diagnostics) {
         return ExitCode::FAILURE;
     }
     match interp::run(&checked.program, "main") {
@@ -73,7 +76,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
             match err.span {
                 Some(span) => {
                     let diag = Diagnostic::error(span, format!("runtime error: {}", err.message));
-                    print_diagnostics(path, &src, &[diag]);
+                    print_diagnostics_modules(&mods, &[diag]);
                 }
                 None => eprintln!("runtime error: {}", err.message),
             }
@@ -104,18 +107,21 @@ fn cmd_build(args: &[String]) -> ExitCode {
         eprintln!("usage: inga build <file.inga> [-o out] [--emit-ir]");
         return ExitCode::FAILURE;
     };
-    let src = match read_file(path) {
-        Ok(s) => s,
-        Err(code) => return code,
+    let loaded = match load_program(Path::new(path)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: cannot read `{path}`: {e}");
+            return ExitCode::FAILURE;
+        }
     };
-    let checked = check_source(&src);
-    if print_diagnostics(path, &src, &checked.diagnostics) {
+    let (checked, mods) = check_loaded(loaded);
+    if print_diagnostics_modules(&mods, &checked.diagnostics) {
         return ExitCode::FAILURE;
     }
     let ir = match inga_codegen::compile(&checked.program, &checked.info) {
         Ok(ir) => ir,
         Err(diagnostics) => {
-            print_diagnostics(path, &src, &diagnostics);
+            print_diagnostics_modules(&mods, &diagnostics);
             return ExitCode::FAILURE;
         }
     };
@@ -210,8 +216,17 @@ fn cmd_check(args: &[String]) -> ExitCode {
                 continue;
             }
         };
-        let checked = check_source(&src);
-        if print_diagnostics(path, &src, &checked.diagnostics) {
+        let _ = &src;
+        let loaded = match load_program(Path::new(path)) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("error: cannot read `{path}`: {e}");
+                failed = true;
+                continue;
+            }
+        };
+        let (checked, mods) = check_loaded(loaded);
+        if print_diagnostics_modules(&mods, &checked.diagnostics) {
             failed = true;
         } else if checked.diagnostics.is_empty() {
             println!("{path}: ok");
@@ -272,6 +287,28 @@ fn cmd_fmt(args: &[String]) -> ExitCode {
 // ---- diagnostics rendering -------------------------------------------------
 
 /// Prints diagnostics with source context. Returns true if any were errors.
+/// Render diagnostics whose spans live in the merged multi-module space.
+fn print_diagnostics_modules(modules: &[ModuleSrc], diagnostics: &[Diagnostic]) -> bool {
+    let mut has_errors = false;
+    for diag in diagnostics {
+        let module = modules
+            .iter()
+            .find(|m| m.contains(diag.span))
+            .or_else(|| modules.first());
+        let Some(module) = module else { continue };
+        let mut local = diag.clone();
+        local.span = inga_core::span::Span::new(
+            diag.span.start.saturating_sub(module.base),
+            diag.span.end.saturating_sub(module.base),
+        );
+        let path = module.path.display().to_string();
+        if print_diagnostics(&path, &module.src, std::slice::from_ref(&local)) {
+            has_errors = true;
+        }
+    }
+    has_errors
+}
+
 fn print_diagnostics(path: &str, src: &str, diagnostics: &[Diagnostic]) -> bool {
     let lines = LineIndex::new(src);
     let use_color = std::io::IsTerminal::is_terminal(&std::io::stderr());

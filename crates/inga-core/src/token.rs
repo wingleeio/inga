@@ -23,6 +23,8 @@ pub enum TokenKind {
     Newline,
 
     // Keywords
+    KwUse,
+    KwPub,
     KwStruct,
     KwEnum,
     KwService,
@@ -75,6 +77,8 @@ pub enum TokenKind {
 impl TokenKind {
     pub fn keyword(ident: &str) -> Option<TokenKind> {
         Some(match ident {
+            "use" => TokenKind::KwUse,
+            "pub" => TokenKind::KwPub,
             "struct" => TokenKind::KwStruct,
             "enum" => TokenKind::KwEnum,
             "service" => TokenKind::KwService,
@@ -102,6 +106,8 @@ impl TokenKind {
             TokenKind::Comment(_) => "comment".into(),
             TokenKind::Newline => "end of line".into(),
             TokenKind::Eof => "end of file".into(),
+            TokenKind::KwUse => "`use`".into(),
+            TokenKind::KwPub => "`pub`".into(),
             TokenKind::KwStruct => "`struct`".into(),
             TokenKind::KwEnum => "`enum`".into(),
             TokenKind::KwService => "`service`".into(),

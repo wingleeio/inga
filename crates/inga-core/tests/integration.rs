@@ -741,3 +741,136 @@ fn builtins_hover_with_their_signature() {
         "no builtin should fall back to the bare `(builtin)` hover"
     );
 }
+
+// ---- provide v2 / arenas / modules ---------------------------------------------
+
+#[test]
+fn provide_scopes_left_to_right_and_inline() {
+    let out = run(r#"
+service Logger {
+    log :: (String m)
+}
+service Db {
+    get :: () -> String
+}
+
+quiet :: Logger {
+    log :: (m) {
+        println("[q] ${m}")
+    }
+}
+
+db :: Db {
+    banner = {
+        Logger logger
+        logger.log("connect")
+        "up"
+    }
+    get :: () {
+        banner
+    }
+}
+
+main :: () {
+    provide quiet, db
+    Db d
+    println(d.get())
+}
+"#);
+    assert_eq!(out, "[q] connect\nup\n");
+}
+
+#[test]
+fn arena_scopes_check_and_run() {
+    let out = run(r#"
+main :: () {
+    n = provide Arena(64.kb) { len("in the region ${21 * 2}") }
+    println(n)
+}
+"#);
+    assert_eq!(out, "16\n");
+}
+
+#[test]
+fn arena_result_must_not_escape() {
+    let errors = check_errors(r#"
+main :: () {
+    s = provide Arena(64.kb) { "escapes ${1}" }
+    println(s)
+}
+"#);
+    assert!(
+        errors.iter().any(|e| e.contains("must not escape")),
+        "got: {errors:?}"
+    );
+}
+
+#[test]
+fn size_suffixes_are_ints() {
+    let out = run(r#"
+main :: () {
+    println(2.kb, 1.mb)
+}
+"#);
+    assert_eq!(out, "2048 1048576\n");
+}
+
+#[test]
+fn gfx_requires_use() {
+    let errors = check_errors(r#"
+main :: () {
+    Gfx.mouseX()
+}
+"#);
+    assert!(errors.iter().any(|e| e.contains("add `use Gfx`")), "got: {errors:?}");
+}
+
+#[test]
+fn modules_import_pub_and_hide_private() {
+    use std::path::Path;
+    let lib = r#"
+pub yell :: (String s) -> String {
+    "${s}${bang()}"
+}
+
+bang :: () -> String {
+    "!"
+}
+"#;
+    let main_src = r#"
+use lib
+
+main :: () {
+    println(yell("hey"))
+}
+"#;
+    let loaded = inga_core::modules::load_program_with(
+        Path::new("/virtual/main.inga"),
+        main_src.to_string(),
+        &mut |p| (p == Path::new("/virtual/lib.inga")).then(|| lib.to_string()),
+    );
+    let (checked, _mods) = inga_core::check_loaded(loaded);
+    let errors: Vec<&str> = checked
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .map(|d| d.message.as_str())
+        .collect();
+    assert!(errors.is_empty(), "unexpected: {errors:?}");
+    let out = interp::run_captured(&checked.program, "main").unwrap();
+    assert_eq!(out, "hey!\n");
+
+    // Private names do not cross the module boundary.
+    let bad = main_src.replace("yell(\"hey\")", "bang()");
+    let loaded = inga_core::modules::load_program_with(
+        Path::new("/virtual/main.inga"),
+        bad,
+        &mut |p| (p == Path::new("/virtual/lib.inga")).then(|| lib.to_string()),
+    );
+    let (checked, _mods) = inga_core::check_loaded(loaded);
+    assert!(
+        checked.diagnostics.iter().any(|d| d.message.contains("private to module `lib`")),
+        "got: {:?}",
+        checked.diagnostics
+    );
+}

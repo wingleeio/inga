@@ -7,7 +7,13 @@ use crate::span::Span;
 use crate::token::{StrPart, Token, TokenKind};
 
 pub fn lex(src: &str, diagnostics: &mut Vec<Diagnostic>) -> Vec<Token> {
-    let mut lexer = Lexer { src: src.as_bytes(), pos: 0, diagnostics };
+    lex_from(src, 0, diagnostics)
+}
+
+/// Lex with all spans offset by `base` — multi-module programs share one
+/// global span space (each module gets a disjoint range).
+pub fn lex_from(src: &str, base: u32, diagnostics: &mut Vec<Diagnostic>) -> Vec<Token> {
+    let mut lexer = Lexer { src: src.as_bytes(), pos: 0, base, diagnostics };
     let mut tokens = Vec::new();
     loop {
         let token = lexer.next_token();
@@ -23,6 +29,7 @@ pub fn lex(src: &str, diagnostics: &mut Vec<Diagnostic>) -> Vec<Token> {
 struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
+    base: u32,
     diagnostics: &'a mut Vec<Diagnostic>,
 }
 
@@ -42,7 +49,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn span_from(&self, start: usize) -> Span {
-        Span::new(start as u32, self.pos as u32)
+        Span::new(self.base + start as u32, self.base + self.pos as u32)
     }
 
     fn error(&mut self, span: Span, message: impl Into<String>) {
@@ -288,7 +295,7 @@ impl<'a> Lexer<'a> {
                 }
                 tokens.push(Token::new(
                     TokenKind::RBrace,
-                    Span::new(self.pos as u32 - 1, self.pos as u32),
+                    Span::new(self.base + self.pos as u32 - 1, self.base + self.pos as u32),
                 ));
                 continue;
             }
@@ -301,7 +308,7 @@ impl<'a> Lexer<'a> {
             }
             tokens.push(token);
         }
-        let end = self.pos as u32;
+        let end = self.base + self.pos as u32;
         tokens.push(Token::new(TokenKind::Eof, Span::new(end, end)));
         tokens
     }

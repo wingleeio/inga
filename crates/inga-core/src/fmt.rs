@@ -138,6 +138,14 @@ impl Printer {
             }
             match &decls[i] {
                 Decl::Struct(_) => unreachable!(),
+                Decl::Use(d) => {
+                    self.flush_comments_before(d.span.start, 0);
+                    self.blank_line_if_gap(self.lines.line(d.span.start));
+                    self.out.push_str(&format!("use {}", d.name));
+                    self.attach_trailing_comment(d.span.end);
+                    self.out.push('\n');
+                    self.prev_end_line = Some(self.lines.line(d.span.end));
+                }
                 Decl::Enum(d) => self.print_enum_decl(d),
                 Decl::Service(d) => self.print_service(d),
                 Decl::Impl(d) => self.print_impl(d),
@@ -174,7 +182,7 @@ impl Printer {
         self.blank_line_if_gap(self.lines.line(d.span.start));
         let body = render_field_block(&d.fields);
         let padded = format!("{:<width$}", d.name, width = name_width);
-        self.out.push_str(&format!("struct {padded} = {body}"));
+        self.out.push_str(&format!("{}struct {padded} = {body}", pub_prefix(d.is_pub)));
         self.attach_trailing_comment(d.span.end);
         self.out.push('\n');
         self.prev_end_line = Some(self.lines.line(d.span.end));
@@ -194,12 +202,12 @@ impl Printer {
                 }
             })
             .collect();
-        let inline = format!("enum {} = {}", d.name, variants.join(" | "));
+        let inline = format!("{}enum {} = {}", pub_prefix(d.is_pub), d.name, variants.join(" | "));
         if inline.len() <= MAX_WIDTH {
             self.out.push_str(&inline);
         } else {
             // One variant per line, `|` leading.
-            self.out.push_str(&format!("enum {} =\n", d.name));
+            self.out.push_str(&format!("{}enum {} =\n", pub_prefix(d.is_pub), d.name));
             for (i, v) in variants.iter().enumerate() {
                 self.push_indent(1);
                 if i > 0 {
@@ -219,7 +227,7 @@ impl Printer {
     fn print_service(&mut self, d: &ServiceDecl) {
         self.flush_comments_before(d.span.start, 0);
         self.blank_line_if_gap(self.lines.line(d.span.start));
-        self.out.push_str(&format!("service {} {{\n", d.name));
+        self.out.push_str(&format!("{}service {} {{\n", pub_prefix(d.is_pub), d.name));
         self.prev_end_line = Some(self.lines.line(d.span.start));
         for m in &d.methods {
             self.flush_comments_before(m.span.start, 1);
@@ -238,7 +246,7 @@ impl Printer {
     fn print_impl(&mut self, d: &ImplDecl) {
         self.flush_comments_before(d.span.start, 0);
         self.blank_line_if_gap(self.lines.line(d.span.start));
-        self.out.push_str(&format!("{} :: {} {{\n", d.name, d.service));
+        self.out.push_str(&format!("{}{} :: {} {{\n", pub_prefix(d.is_pub), d.name, d.service));
         self.prev_end_line = Some(self.lines.line(d.span.start));
         for (name, span, value) in &d.fields {
             self.flush_comments_before(span.start, 1);
@@ -262,7 +270,7 @@ impl Printer {
         self.flush_comments_before(d.span.start, indent);
         self.blank_line_if_gap(self.lines.line(d.span.start));
         self.push_indent(indent);
-        self.out.push_str(&format!("{} :: {} ", d.name, render_sig(&d.sig)));
+        self.out.push_str(&format!("{}{} :: {} ", pub_prefix(d.is_pub), d.name, render_sig(&d.sig)));
         self.print_block(&d.body, indent);
         self.out.push('\n');
         self.prev_end_line = Some(self.lines.line(d.span.end));
@@ -591,8 +599,13 @@ impl Printer {
 
 // ---- pure render helpers -----------------------------------------------------
 
+fn pub_prefix(is_pub: bool) -> &'static str {
+    if is_pub { "pub " } else { "" }
+}
+
 fn decl_span(decl: &Decl) -> Span {
     match decl {
+        Decl::Use(d) => d.span,
         Decl::Struct(d) => d.span,
         Decl::Enum(d) => d.span,
         Decl::Service(d) => d.span,

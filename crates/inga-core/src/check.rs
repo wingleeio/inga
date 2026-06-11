@@ -11,6 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::ast::*;
 use crate::diag::Diagnostic;
+use crate::modules::ModuleSrc;
 use crate::span::Span;
 use crate::types::{FuncType, Type, TypeCtx};
 use std::rc::Rc;
@@ -123,12 +124,16 @@ impl Rows {
 struct StructInfo {
     fields: Vec<(String, Type)>,
     name_span: Span,
+    module: usize,
+    is_pub: bool,
 }
 
 struct EnumInfo {
     /// Variant name -> typed fields, in declaration order.
     variants: Vec<(String, Vec<(String, Type)>)>,
     name_span: Span,
+    module: usize,
+    is_pub: bool,
 }
 
 struct MethodInfo {
@@ -141,12 +146,16 @@ struct MethodInfo {
 struct ServiceInfo {
     methods: Vec<(String, MethodInfo)>,
     name_span: Span,
+    module: usize,
+    is_pub: bool,
 }
 
 struct ImplInfo {
     service: String,
     fields: Vec<(String, Type)>,
     name_span: Span,
+    module: usize,
+    is_pub: bool,
 }
 
 struct FuncInfo {
@@ -157,10 +166,19 @@ struct FuncInfo {
     declared_errors: Option<BTreeSet<String>>,
     declared_caps: Option<BTreeSet<String>>,
     name_span: Span,
+    module: usize,
+    is_pub: bool,
 }
 
-pub fn check(program: &Program, diagnostics: &mut Vec<Diagnostic>) -> CheckInfo {
-    let mut checker = Checker::new(program);
+/// Module id for compiler builtins (always visible).
+const CORE_MODULE: usize = usize::MAX;
+
+pub fn check(
+    program: &Program,
+    modules: &[ModuleSrc],
+    diagnostics: &mut Vec<Diagnostic>,
+) -> CheckInfo {
+    let mut checker = Checker::new(program, modules);
     checker.collect_decls();
     // Declaration-level diagnostics survive the fixpoint's per-pass clears.
     let decl_diags = checker.diags.clone();
@@ -196,6 +214,7 @@ pub fn check(program: &Program, diagnostics: &mut Vec<Diagnostic>) -> CheckInfo 
 
 struct Checker<'a> {
     program: &'a Program,
+    modules: &'a [ModuleSrc],
     ctx: TypeCtx,
 
     structs: HashMap<String, StructInfo>,
@@ -221,9 +240,10 @@ struct Checker<'a> {
 }
 
 impl<'a> Checker<'a> {
-    fn new(program: &'a Program) -> Checker<'a> {
+    fn new(program: &'a Program, modules: &'a [ModuleSrc]) -> Checker<'a> {
         let mut checker = Checker {
             program,
+            modules,
             ctx: TypeCtx::default(),
             structs: HashMap::new(),
             enums: HashMap::new(),
@@ -248,6 +268,8 @@ impl<'a> Checker<'a> {
             StructInfo {
                 fields: vec![("message".into(), Type::Str)],
                 name_span: Span::default(),
+                module: CORE_MODULE,
+                is_pub: true,
             },
         );
         checker
@@ -261,18 +283,59 @@ impl<'a> Checker<'a> {
         self.diags.push(Diagnostic::warning(span, message));
     }
 
+    // ---- modules / visibility --------------------------------------------
+
+    fn module_of(&self, span: Span) -> usize {
+        self.modules.iter().position(|m| m.contains(span)).unwrap_or(0)
+    }
+
+    /// Enforce cross-module visibility: a reference from another module
+    /// needs the definition to be `pub` and its module to be imported.
+    fn gate(&mut self, name: &str, def_module: usize, is_pub: bool, ref_span: Span) {
+        if def_module == CORE_MODULE || self.modules.len() <= 1 {
+            return;
+        }
+        let ref_module = self.module_of(ref_span);
+        if ref_module == def_module {
+            return;
+        }
+        let def_name = match self.modules.get(def_module) {
+            Some(m) => m.name.clone(),
+            None => return,
+        };
+        if !self.modules[ref_module].imports.iter().any(|i| *i == def_name) {
+            self.error(
+                ref_span,
+                format!("`{name}` is defined in module `{def_name}`; add `use {def_name}`"),
+            );
+        } else if !is_pub {
+            self.error(
+                ref_span,
+                format!("`{name}` is private to module `{def_name}` (mark it `pub` to export it)"),
+            );
+        }
+    }
+
+    fn gfx_enabled(&self, span: Span) -> bool {
+        self.modules
+            .get(self.module_of(span))
+            .is_some_and(|m| m.imports.iter().any(|i| i == "Gfx"))
+    }
+
     // ---- declaration collection -----------------------------------------
 
     fn collect_decls(&mut self) {
         // First sweep: names only, so types can reference each other.
         for decl in &self.program.decls {
-            let (name, span, kind) = match decl {
-                Decl::Struct(d) => (&d.name, d.name_span, DefKind::Struct),
-                Decl::Enum(d) => (&d.name, d.name_span, DefKind::Enum),
-                Decl::Service(d) => (&d.name, d.name_span, DefKind::Service),
-                Decl::Impl(d) => (&d.name, d.name_span, DefKind::Impl),
-                Decl::Func(d) => (&d.name, d.name_span, DefKind::Func),
+            let (name, span, kind, is_pub) = match decl {
+                Decl::Use(_) => continue,
+                Decl::Struct(d) => (&d.name, d.name_span, DefKind::Struct, d.is_pub),
+                Decl::Enum(d) => (&d.name, d.name_span, DefKind::Enum, d.is_pub),
+                Decl::Service(d) => (&d.name, d.name_span, DefKind::Service, d.is_pub),
+                Decl::Impl(d) => (&d.name, d.name_span, DefKind::Impl, d.is_pub),
+                Decl::Func(d) => (&d.name, d.name_span, DefKind::Func, d.is_pub),
             };
+            let module = self.module_of(span);
             let dup = match kind {
                 DefKind::Struct | DefKind::Enum => {
                     self.structs.contains_key(name) || self.enums.contains_key(name)
@@ -288,17 +351,21 @@ impl<'a> Checker<'a> {
             }
             match kind {
                 DefKind::Struct => {
-                    self.structs
-                        .insert(name.clone(), StructInfo { fields: Vec::new(), name_span: span });
+                    self.structs.insert(
+                        name.clone(),
+                        StructInfo { fields: Vec::new(), name_span: span, module, is_pub },
+                    );
                 }
                 DefKind::Enum => {
-                    self.enums
-                        .insert(name.clone(), EnumInfo { variants: Vec::new(), name_span: span });
+                    self.enums.insert(
+                        name.clone(),
+                        EnumInfo { variants: Vec::new(), name_span: span, module, is_pub },
+                    );
                 }
                 DefKind::Service => {
                     self.services.insert(
                         name.clone(),
-                        ServiceInfo { methods: Vec::new(), name_span: span },
+                        ServiceInfo { methods: Vec::new(), name_span: span, module, is_pub },
                     );
                 }
                 _ => {}
@@ -308,6 +375,7 @@ impl<'a> Checker<'a> {
         // Second sweep: full signatures.
         for decl in &self.program.decls {
             match decl {
+                Decl::Use(_) => {}
                 Decl::Struct(d) => {
                     let mut fields = Vec::new();
                     let mut tyvars = HashMap::new();
@@ -394,9 +462,16 @@ impl<'a> Checker<'a> {
                     }
                     let fields: Vec<(String, Type)> =
                         d.fields.iter().map(|(name, _, _)| (name.clone(), self.ctx.fresh())).collect();
+                    let module = self.module_of(d.name_span);
                     self.impls.insert(
                         d.name.clone(),
-                        ImplInfo { service: d.service.clone(), fields, name_span: d.name_span },
+                        ImplInfo {
+                            service: d.service.clone(),
+                            fields,
+                            name_span: d.name_span,
+                            module,
+                            is_pub: d.is_pub,
+                        },
                     );
                 }
                 Decl::Func(d) => {
@@ -440,6 +515,8 @@ impl<'a> Checker<'a> {
                             declared_errors,
                             declared_caps,
                             name_span: d.name_span,
+                            module: self.module_of(d.name_span),
+                            is_pub: d.is_pub,
                         },
                     );
                 }
@@ -520,9 +597,24 @@ impl<'a> Checker<'a> {
                 "Unit" => Type::Unit,
                 "Duration" => Type::Duration,
                 "Schedule" => Type::Schedule,
-                _ if self.structs.contains_key(name) => Type::Named(name.clone()),
-                _ if self.enums.contains_key(name) => Type::Enum(name.clone()),
-                _ if self.services.contains_key(name) => Type::Service(name.clone()),
+                _ if self.structs.contains_key(name) => {
+                    let info = &self.structs[name];
+                    let (m, p) = (info.module, info.is_pub);
+                    self.gate(name, m, p, *span);
+                    Type::Named(name.clone())
+                }
+                _ if self.enums.contains_key(name) => {
+                    let info = &self.enums[name];
+                    let (m, p) = (info.module, info.is_pub);
+                    self.gate(name, m, p, *span);
+                    Type::Enum(name.clone())
+                }
+                _ if self.services.contains_key(name) => {
+                    let info = &self.services[name];
+                    let (m, p) = (info.module, info.is_pub);
+                    self.gate(name, m, p, *span);
+                    Type::Service(name.clone())
+                }
                 _ if !is_upper(name) => {
                     // Lowercase: a type parameter; same name = same variable
                     // within one signature.
@@ -756,6 +848,9 @@ impl<'a> Checker<'a> {
                     if service == "<error>" {
                         // Parser already reported.
                     } else if self.services.contains_key(service) {
+                        let info = &self.services[service];
+                        let (m, p) = (info.module, info.is_pub);
+                        self.gate(&service.clone(), m, p, *service_span);
                         self.add_cap_row(service);
                         if self.record_info {
                             self.info.hovers.push((*name_span, format!("{name} : {service}")));
@@ -1000,15 +1095,17 @@ impl<'a> Checker<'a> {
             }
         }
         if let Some(info) = self.funcs.get(name) {
+            let (def_module, is_pub, def_span) = (info.module, info.is_pub, info.name_span);
             let rows = self.func_effective_rows(name);
+            let info = &self.funcs[name];
             let func = Type::Func(Rc::new(FuncType {
                 params: info.params.clone(),
                 ret: info.ret.clone(),
                 errors: rows.errors,
                 caps: rows.caps,
             }));
+            self.gate(name, def_module, is_pub, span);
             if self.record_info {
-                let def_span = info.name_span;
                 self.info.refs.push((span, def_span));
                 let sig = self.render_func_signature(name);
                 self.info.hovers.push((span, sig));
@@ -1030,6 +1127,10 @@ impl<'a> Checker<'a> {
         if let Some(owner) = self.variant_owner.get(name).cloned() {
             // Enum variants: fieldless ones are values, the rest construct.
             let fields = self.variant_fields(&owner, name);
+            if let Some(info) = self.enums.get(&owner) {
+                let (m, p) = (info.module, info.is_pub);
+                self.gate(name, m, p, span);
+            }
             if self.record_info {
                 if let Some(info) = self.enums.get(&owner) {
                     self.info.refs.push((span, info.name_span));
@@ -1048,14 +1149,18 @@ impl<'a> Checker<'a> {
         if let Some(info) = self.structs.get(name) {
             // A bare struct name is a type tag (`decode(raw, User)`); calling
             // it constructs a value — `check_call` handles that case directly.
+            let (m, p, def_span) = (info.module, info.is_pub, info.name_span);
+            self.gate(name, m, p, span);
             if self.record_info {
-                self.info.refs.push((span, info.name_span));
+                self.info.refs.push((span, def_span));
             }
             return Type::Tag(name.to_string());
         }
         if let Some(info) = self.enums.get(name) {
+            let (m, p, def_span) = (info.module, info.is_pub, info.name_span);
+            self.gate(name, m, p, span);
             if self.record_info {
-                self.info.refs.push((span, info.name_span));
+                self.info.refs.push((span, def_span));
             }
             return Type::Tag(name.to_string());
         }
@@ -1134,14 +1239,20 @@ impl<'a> Checker<'a> {
                 }
                 // Struct / enum-variant constructors.
                 if let Some(fields) = self.structs.get(name).map(|i| i.fields.clone()) {
+                    let info = &self.structs[name];
+                    let (m, p, def_span) = (info.module, info.is_pub, info.name_span);
+                    self.gate(name, m, p, callee.span);
                     if self.record_info {
-                        let def_span = self.structs[name].name_span;
                         self.info.refs.push((callee.span, def_span));
                     }
                     return self.check_ctor(name, &fields, args, span, Type::Named(name.clone()));
                 }
                 if let Some(owner) = self.variant_owner.get(name).cloned() {
                     let fields = self.variant_fields(&owner, name);
+                    if let Some(info) = self.enums.get(&owner) {
+                        let (m, p) = (info.module, info.is_pub);
+                        self.gate(name, m, p, callee.span);
+                    }
                     if self.record_info {
                         if let Some(info) = self.enums.get(&owner) {
                             self.info.refs.push((callee.span, info.name_span));
@@ -1295,6 +1406,9 @@ impl<'a> Checker<'a> {
         args: &[&Expr],
         span: Span,
     ) -> Type {
+        if !self.gfx_enabled(name_span) {
+            self.error(name_span, "the graphics module is not imported here: add `use Gfx`");
+        }
         // (param types, return type); String = Str, closure handled separately.
         let sig: Option<(Vec<Type>, Type)> = match name {
             "run" => None, // special-cased below
@@ -2098,6 +2212,8 @@ impl<'a> Checker<'a> {
                 Some(info) => {
                     let def_span = info.name_span;
                     let service = info.service.clone();
+                    let (m, p) = (info.module, info.is_pub);
+                    self.gate(&item.name.clone(), m, p, item.name_span);
                     if self.record_info {
                         self.info.refs.push((item.name_span, def_span));
                         self.info
@@ -2254,6 +2370,7 @@ impl<'a> Checker<'a> {
         }
         for decl in &self.program.decls {
             let def = match decl {
+                Decl::Use(_) => continue,
                 Decl::Struct(d) => DefInfo {
                     name: d.name.clone(),
                     span: d.name_span,

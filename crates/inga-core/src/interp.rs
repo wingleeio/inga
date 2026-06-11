@@ -225,7 +225,7 @@ impl<'a> Interp<'a> {
                         );
                     }
                 }
-                Decl::Service(_) => {}
+                Decl::Service(_) | Decl::Use(_) => {}
             }
         }
         Interp {

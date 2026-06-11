@@ -191,6 +191,7 @@ impl<'a> Cg<'a> {
                 Decl::Func(d) => {
                     self.funcs.insert(d.name.clone(), d);
                 }
+                Decl::Use(_) => {}
             }
         }
     }

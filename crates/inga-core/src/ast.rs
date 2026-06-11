@@ -11,6 +11,8 @@ pub struct Program {
 
 #[derive(Debug)]
 pub enum Decl {
+    /// `use shapes` (a sibling file module) or `use Gfx` (a std module).
+    Use(UseDecl),
     /// `struct User = { Int id, String name }`
     Struct(StructDecl),
     /// `enum Shape = Circle { Float radius } | Rect { Float w, Float h } | Dot`
@@ -24,7 +26,16 @@ pub enum Decl {
 }
 
 #[derive(Debug)]
+pub struct UseDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub span: Span,
+}
+
+#[derive(Debug)]
 pub struct StructDecl {
+    /// Exported to importing modules?
+    pub is_pub: bool,
     pub name: String,
     pub name_span: Span,
     pub fields: Vec<Field>,
@@ -33,6 +44,7 @@ pub struct StructDecl {
 
 #[derive(Debug)]
 pub struct EnumDecl {
+    pub is_pub: bool,
     pub name: String,
     pub name_span: Span,
     pub variants: Vec<Variant>,
@@ -57,6 +69,7 @@ pub struct Field {
 
 #[derive(Debug)]
 pub struct ServiceDecl {
+    pub is_pub: bool,
     pub name: String,
     pub name_span: Span,
     pub methods: Vec<MethodSig>,
@@ -73,6 +86,7 @@ pub struct MethodSig {
 
 #[derive(Debug)]
 pub struct ImplDecl {
+    pub is_pub: bool,
     pub name: String,
     pub name_span: Span,
     pub service: String,
@@ -85,6 +99,7 @@ pub struct ImplDecl {
 
 #[derive(Debug)]
 pub struct FuncDecl {
+    pub is_pub: bool,
     pub name: String,
     pub name_span: Span,
     pub sig: Sig,

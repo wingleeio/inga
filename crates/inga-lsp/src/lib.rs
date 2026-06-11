@@ -25,7 +25,32 @@ use lsp_types::{
     TextDocumentSyncKind, TextEdit, Url,
 };
 
-use inga_core::check_source;
+use inga_core::check_source as check_single;
+use inga_core::Checked;
+
+/// Check an open document. When its URI maps to a real file, imports are
+/// resolved relative to it (open documents win over the disk copy); the
+/// entry module is always first, so its spans start at 0 and positions in
+/// the open file map 1:1.
+fn check_document(uri: &lsp_types::Url, src: &str, docs: &HashMap<Url, String>) -> Checked {
+    let Ok(path) = uri.to_file_path() else { return check_single(src) };
+    let loaded = inga_core::modules::load_program_with(&path, src.to_string(), &mut |p| {
+        let abs = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        Url::from_file_path(&abs)
+            .ok()
+            .and_then(|u| docs.get(&u).cloned())
+            .or_else(|| std::fs::read_to_string(p).ok())
+    });
+    let (checked, modules) = inga_core::check_loaded(loaded);
+    // Only surface results that live in the entry module (base 0).
+    let entry_end = modules.first().map(|m| m.end).unwrap_or(u32::MAX);
+    let mut checked = checked;
+    checked.diagnostics.retain(|d| d.span.start <= entry_end);
+    checked.info.hovers.retain(|(s, _)| s.start <= entry_end);
+    checked.info.defs.retain(|d| d.span.start <= entry_end);
+    checked.info.refs.retain(|(u, d)| u.start <= entry_end && d.start <= entry_end);
+    checked
+}
 use inga_core::diag::Severity;
 use inga_core::span::{LineIndex, Span};
 use inga_core::token::{StrPart, Token, TokenKind};
@@ -127,7 +152,7 @@ impl Server {
 
     fn compute_diagnostics(&self, uri: &Url) -> Vec<Diagnostic> {
         let Some(src) = self.documents.get(uri) else { return Vec::new() };
-        let checked = check_source(src);
+        let checked = check_document(uri, src, &self.documents);
         let lines = LineIndex::new(src);
         checked
             .diagnostics
@@ -185,7 +210,7 @@ impl Server {
         let src = self.documents.get(&uri)?;
         let lines = LineIndex::new(src);
         let offset = lines.offset_utf16(src, position.line, position.character);
-        let checked = check_source(src);
+        let checked = check_document(&uri, src, &self.documents);
         // Innermost hover span containing the offset.
         let best = checked
             .info
@@ -207,7 +232,7 @@ impl Server {
         let src = self.documents.get(&uri)?;
         let lines = LineIndex::new(src);
         let offset = lines.offset_utf16(src, position.line, position.character);
-        let checked = check_source(src);
+        let checked = check_document(&uri, src, &self.documents);
         let (_, def_span) = checked
             .info
             .refs
@@ -269,7 +294,7 @@ impl Server {
     fn completion(&self, params: lsp_types::CompletionParams) -> Option<CompletionResponse> {
         let uri = params.text_document_position.text_document.uri;
         let src = self.documents.get(&uri)?;
-        let checked = check_source(src);
+        let checked = check_document(&uri, src, &self.documents);
         let mut items: Vec<CompletionItem> = Vec::new();
         for def in &checked.info.defs {
             items.push(CompletionItem {

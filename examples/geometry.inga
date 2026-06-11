@@ -1,0 +1,30 @@
+// A library module: `pub` declarations are its exports. Import it from a
+// sibling file with `use geometry`.
+
+pub enum Shape = Circle { Float radius } | Rect { Float w, Float h } | Dot
+
+pub struct TooBig = { Float area }
+
+pub area :: (Shape s) -> Float {
+    match s {
+        Circle(r)  -> tau() / 2.0 * r * r
+        Rect(w, h) -> w * h
+        Dot        -> 0.0
+    }
+}
+
+pub checked :: (Shape s) -> Float ! String, TooBig {
+    a = area(s)
+    if a == 0.0 {
+        fail "a dot has no area"
+    }
+    if a > 100.0 {
+        fail TooBig(a)
+    }
+    a
+}
+
+// Private: not visible to importers.
+tau :: () -> Float {
+    6.28318
+}

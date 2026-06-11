@@ -145,18 +145,36 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_decl(&mut self) -> Option<Decl> {
+        if self.at(&TokenKind::KwUse) {
+            let start = self.peek().span;
+            self.bump();
+            let (name, name_span) = self.expect_ident("a module name");
+            return Some(Decl::Use(UseDecl { name, name_span, span: start.to(self.prev_span()) }));
+        }
+        let is_pub = if self.at(&TokenKind::KwPub) {
+            self.bump();
+            true
+        } else {
+            false
+        };
         match self.peek().kind.clone() {
             TokenKind::KwStruct => {
                 self.bump();
-                Some(Decl::Struct(self.parse_struct_decl()))
+                let mut d = self.parse_struct_decl();
+                d.is_pub = is_pub;
+                Some(Decl::Struct(d))
             }
             TokenKind::KwEnum => {
                 self.bump();
-                Some(Decl::Enum(self.parse_enum_decl()))
+                let mut d = self.parse_enum_decl();
+                d.is_pub = is_pub;
+                Some(Decl::Enum(d))
             }
             TokenKind::KwService => {
                 self.bump();
-                Some(Decl::Service(self.parse_service_decl()))
+                let mut d = self.parse_service_decl();
+                d.is_pub = is_pub;
+                Some(Decl::Service(d))
             }
             TokenKind::Ident(_) => {
                 let (name, name_span) = self.expect_ident("a declaration name");
@@ -164,9 +182,13 @@ impl<'a> Parser<'a> {
                     return None;
                 }
                 if self.at(&TokenKind::LParen) {
-                    Some(Decl::Func(self.parse_func_decl(name, name_span)))
+                    let mut d = self.parse_func_decl(name, name_span);
+                    d.is_pub = is_pub;
+                    Some(Decl::Func(d))
                 } else if self.at_ident() {
-                    Some(Decl::Impl(self.parse_impl_decl(name, name_span)))
+                    let mut d = self.parse_impl_decl(name, name_span);
+                    d.is_pub = is_pub;
+                    Some(Decl::Impl(d))
                 } else {
                     self.error_here("expected `(` (function) or a service name (implementation) after `::`");
                     None
@@ -175,7 +197,7 @@ impl<'a> Parser<'a> {
             _ => {
                 let found = self.peek().kind.describe();
                 self.error_here(format!(
-                    "expected a declaration (`struct`, `enum`, `service`, or `name :: ...`), found {found}"
+                    "expected a declaration (`use`, `struct`, `enum`, `service`, or `name :: ...`), found {found}"
                 ));
                 // Synchronize to the next line.
                 while !matches!(self.peek().kind, TokenKind::Newline | TokenKind::Eof) {
@@ -201,7 +223,7 @@ impl<'a> Parser<'a> {
         if self.expect(&TokenKind::LBrace, "`{`") {
             fields = self.parse_field_list();
         }
-        StructDecl { name, name_span, fields, span: start.to(self.prev_span()) }
+        StructDecl { is_pub: false, name, name_span, fields, span: start.to(self.prev_span()) }
     }
 
     /// Fields inside an already-opened `{ ... }`; consumes the closing brace.
@@ -276,7 +298,7 @@ impl<'a> Parser<'a> {
                 format!("enum `{name}` needs at least one variant"),
             ));
         }
-        EnumDecl { name, name_span, variants, span: start.to(self.prev_span()) }
+        EnumDecl { is_pub: false, name, name_span, variants, span: start.to(self.prev_span()) }
     }
 
     /// `String id` or `id` — type is optional.
@@ -332,7 +354,7 @@ impl<'a> Parser<'a> {
             }
             self.expect(&TokenKind::RBrace, "`}`");
         }
-        ServiceDecl { name, name_span, methods, span: start.to(self.prev_span()) }
+        ServiceDecl { is_pub: false, name, name_span, methods, span: start.to(self.prev_span()) }
     }
 
     fn parse_impl_decl(&mut self, name: String, name_span: Span) -> ImplDecl {
@@ -364,6 +386,7 @@ impl<'a> Parser<'a> {
             self.expect(&TokenKind::RBrace, "`}`");
         }
         ImplDecl {
+            is_pub: false,
             name,
             name_span,
             service,
@@ -383,7 +406,7 @@ impl<'a> Parser<'a> {
             self.error_here("expected `{` to start the function body");
             Block { stmts: Vec::new(), span: self.peek().span }
         };
-        FuncDecl { name, name_span, sig, body, span: name_span.to(self.prev_span()) }
+        FuncDecl { is_pub: false, name, name_span, sig, body, span: name_span.to(self.prev_span()) }
     }
 
     /// `(params) [-> Type] [! Err, Err] [uses Cap, Cap]`

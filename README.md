@@ -104,19 +104,24 @@ Editor support lives in [`editors/vscode`](editors/vscode) (TextMate grammar
 ## Concurrency without a manual
 
 `spawn(action)` runs the action on its own OS thread; `await(task)` takes
-the result. The effect system is the whole safety story: a spawned action
-must be **self-contained** — every error handled, every service provided,
-inside the spawn — so there is nothing a task can dangle on, and nothing to
-learn beyond the two words:
+the result. The effect system is the whole safety story — and it does the
+bookkeeping for you:
 
 ```inga
-a = spawn(crunch("medium", 100000))
-b = spawn(crunch("large", 10000000))
-println(await(a), await(b))           // ~Nx on N cores, zero locks
+a = crunch("medium", 100000) |> spawn   // crunch :: ... -> Report ! TooBig uses Adder
+b = crunch("large", 10000000) |> spawn  // both in flight; ~Nx on N cores, zero locks
+println(await(a) |> catch { TooBig -> fallback })
+println((await(b) |> catch { TooBig -> fallback }).total)
 ```
 
-Each task gets its own heap (allocation stays lock-free); captured values
-are frozen before the thread starts so refcounts never race. Try it:
+The action's errors travel in the task's type (`Task<Report ! TooBig>`) and
+**re-raise at the `await`** — catch them where you collect the result, or
+the compiler reminds you the same way it guards `main`. The action can use
+services in scope too, as long as every implementation is shareable across
+threads (scalar-only state); anything stateful gets a checker error telling
+you to provide a fresh one inside the spawn. Each task gets its own heap
+(allocation stays lock-free); captured values are frozen before the thread
+starts so refcounts never race. Try it:
 `inga build examples/tasks.inga -o tasks && ./tasks`.
 
 ## Tests are built in

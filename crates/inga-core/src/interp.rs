@@ -54,8 +54,9 @@ pub enum Value<'a> {
     /// Unevaluated `lazy` argument.
     Thunk(Rc<ThunkVal<'a>>),
     /// A finished task (`inga run` executes tasks at the spawn point; only
-    /// `inga build` runs them on real threads).
-    Task(Rc<Value<'a>>),
+    /// `inga build` runs them on real threads). Holds the result, or the
+    /// failure `await` re-raises: (error name, failed value).
+    Task(Rc<Result<Value<'a>, (String, Value<'a>)>>),
     /// Internal: a self-tail-call's arguments, unwound to `call_func`'s
     /// trampoline (never observable by programs).
     TailArgs(&'a FuncDecl, Vec<Value<'a>>),
@@ -1163,11 +1164,22 @@ impl<'a> Interp<'a> {
                 }
             }
             "spawn" if args.len() == 1 => match self.eval(args[0], scope) {
-                Ok(v) => Ok(Value::Task(Rc::new(v))),
-                Err(e) => Err(e),
+                Ok(v) => Ok(Value::Task(Rc::new(Ok(v)))),
+                // A typed failure belongs to the task; `await` re-raises it.
+                Err(Failure::Error { name, value, .. }) => {
+                    Ok(Value::Task(Rc::new(Err((name, value)))))
+                }
+                Err(fatal) => Err(fatal),
             },
             "await" if args.len() == 1 => match self.eval(args[0], scope) {
-                Ok(Value::Task(v)) => Ok((*v).clone()),
+                Ok(Value::Task(r)) => match &*r {
+                    Ok(v) => Ok(v.clone()),
+                    Err((name, value)) => Err(Failure::Error {
+                        name: name.clone(),
+                        value: value.clone(),
+                        span,
+                    }),
+                },
                 Ok(other) => self
                     .fatal(args[0].span, format!("`await` works on tasks, found {}", show(&other))),
                 Err(e) => Err(e),

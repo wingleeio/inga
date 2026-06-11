@@ -6,6 +6,7 @@
 //! part of unification; they are finite sets of names computed by a fixpoint
 //! in `check.rs`.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
@@ -24,8 +25,11 @@ pub enum Type {
     List(Box<Type>),
     /// `(T, U)`
     Tuple(Vec<Type>),
-    /// A running task; `await` yields the payload.
-    Task(Box<Type>),
+    /// A running task; `await` yields the payload and re-raises the
+    /// spawned action's errors. The error set is shared mutable state:
+    /// unifying two task types unions both cells, so every alias of the
+    /// type agrees (sets only grow — the row fixpoint stays monotone).
+    Task(Box<Type>, Rc<RefCell<BTreeSet<String>>>),
     /// A `struct` declaration (nominal record).
     Named(String),
     /// An `enum` declaration (nominal sum type).
@@ -81,7 +85,7 @@ impl TypeCtx {
             Type::Option(t) => Type::Option(Box::new(self.apply(&t))),
             Type::List(t) => Type::List(Box::new(self.apply(&t))),
             Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| self.apply(t)).collect()),
-            Type::Task(t) => Type::Task(Box::new(self.apply(&t))),
+            Type::Task(t, errs) => Type::Task(Box::new(self.apply(&t)), errs),
             Type::MutMap(k, v) => {
                 Type::MutMap(Box::new(self.apply(&k)), Box::new(self.apply(&v)))
             }
@@ -98,7 +102,7 @@ impl TypeCtx {
     fn occurs(&self, var: u32, ty: &Type) -> bool {
         match self.resolve(ty) {
             Type::Var(v) => v == var,
-            Type::Option(t) | Type::List(t) | Type::Task(t) => self.occurs(var, &t),
+            Type::Option(t) | Type::List(t) | Type::Task(t, _) => self.occurs(var, &t),
             Type::Tuple(ts) => ts.iter().any(|t| self.occurs(var, t)),
             Type::MutMap(k, v) => self.occurs(var, &k) || self.occurs(var, &v),
             Type::Func(f) => {
@@ -127,9 +131,18 @@ impl TypeCtx {
                 Ok(())
             }
             (_, Type::Var(_)) => self.unify(&b, &a),
-            (Type::Option(x), Type::Option(y))
-            | (Type::List(x), Type::List(y))
-            | (Type::Task(x), Type::Task(y)) => self.unify(x, y),
+            (Type::Option(x), Type::Option(y)) | (Type::List(x), Type::List(y)) => {
+                self.unify(x, y)
+            }
+            (Type::Task(x, xe), Type::Task(y, ye)) => {
+                if !Rc::ptr_eq(xe, ye) {
+                    let union: BTreeSet<String> =
+                        xe.borrow().union(&ye.borrow()).cloned().collect();
+                    *xe.borrow_mut() = union.clone();
+                    *ye.borrow_mut() = union;
+                }
+                self.unify(x, y)
+            }
             (Type::Tuple(xs), Type::Tuple(ys)) => {
                 if xs.len() != ys.len() {
                     return Err((a.clone(), b.clone()));
@@ -177,7 +190,16 @@ impl TypeCtx {
                 }
             }
             Type::List(t) => format!("[{}]", self.render(&t, names)),
-            Type::Task(t) => format!("Task<{}>", self.render(&t, names)),
+            Type::Task(t, errs) => {
+                let inner = self.render(&t, names);
+                let errs = errs.borrow();
+                if errs.is_empty() {
+                    format!("Task<{inner}>")
+                } else {
+                    let row = errs.iter().cloned().collect::<Vec<_>>().join(", ");
+                    format!("Task<{inner} ! {row}>")
+                }
+            }
             Type::Tuple(ts) => {
                 let inner: Vec<String> = ts.iter().map(|t| self.render(t, names)).collect();
                 format!("({})", inner.join(", "))

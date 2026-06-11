@@ -7,6 +7,7 @@
 //! subtracts error names; `provide` subtracts capability names. Declared rows
 //! are validated against (and unioned with) inferred rows at the end.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 
 use crate::ast::*;
@@ -1107,7 +1108,7 @@ impl<'a> Checker<'a> {
             Type::Option(t) => CType::Option(Box::new(self.ctype(&t))),
             Type::List(t) => CType::List(Box::new(self.ctype(&t))),
             Type::Tuple(ts) => CType::Tuple(ts.iter().map(|t| self.ctype(t)).collect()),
-            Type::Task(t) => CType::Task(Box::new(self.ctype(&t))),
+            Type::Task(t, _) => CType::Task(Box::new(self.ctype(&t))),
             Type::Named(n) => CType::Struct(n),
             Type::Enum(n) => CType::Enum(n),
             Type::Service(n) => CType::Service(n),
@@ -2068,30 +2069,27 @@ impl<'a> Checker<'a> {
                 if !check_arity(self, 1) {
                     return Some(Type::Unknown);
                 }
-                // By-name: the action runs on its own thread. It must be
-                // self-contained — its rows do not merge into the caller's.
+                // By-name: the action runs on its own thread. Its error row
+                // travels in the Task type (re-raised by `await`); its
+                // capability row merges into the spawner like a call — the
+                // task captures the evidence in scope — but only services
+                // safe to share across threads may cross.
                 let (action_ty, rows) = self.with_rows(|s| s.check_expr(args[0]));
-                if !rows.errors.is_empty() {
-                    let list = rows.errors.iter().cloned().collect::<Vec<_>>().join(", ");
-                    self.error(
-                        args[0].span,
-                        format!(
-                            "a spawned task must be self-contained: handle `{list}` \
-                             (e.g. with `|> catch`) before spawning"
-                        ),
-                    );
+                for cap in &rows.caps {
+                    if let Some(blocker) = self.unshareable_impl(cap) {
+                        self.error(
+                            args[0].span,
+                            format!(
+                                "a spawned task can use `{cap}` only if every implementation \
+                                 is shareable across threads (fields limited to Int/Float/\
+                                 Bool/Duration); `{blocker}` holds other state — provide a \
+                                 fresh `{cap}` inside the spawned expression instead"
+                            ),
+                        );
+                    }
                 }
-                if !rows.caps.is_empty() {
-                    let list = rows.caps.iter().cloned().collect::<Vec<_>>().join(", ");
-                    self.error(
-                        args[0].span,
-                        format!(
-                            "a spawned task must be self-contained: it still needs \
-                             `{list}` — provide it inside the spawned expression"
-                        ),
-                    );
-                }
-                Type::Task(Box::new(action_ty))
+                self.merge_rows(&Rows { errors: BTreeSet::new(), caps: rows.caps });
+                Type::Task(Box::new(action_ty), Rc::new(RefCell::new(rows.errors)))
             }
             "await" => {
                 if !check_arity(self, 1) {
@@ -2099,12 +2097,16 @@ impl<'a> Checker<'a> {
                 }
                 let task_ty = self.check_expr(args[0]);
                 let a = self.ctx.fresh();
+                let errs = Rc::new(RefCell::new(BTreeSet::new()));
                 self.unify_at(
-                    &Type::Task(Box::new(a.clone())),
+                    &Type::Task(Box::new(a.clone()), errs.clone()),
                     &task_ty,
                     args[0].span,
                     "await input",
                 );
+                // Re-raise the spawned action's failures here.
+                let errors = errs.borrow().clone();
+                self.merge_rows(&Rows { errors, caps: BTreeSet::new() });
                 a
             }
             "sleep" => {
@@ -2992,6 +2994,29 @@ impl<'a> Checker<'a> {
         body_ty
     }
 
+    /// A service may cross into a spawned task only when every
+    /// implementation's instance is immutable plain data: scalar fields
+    /// only (no maps, strings, functions, or nested services), so two
+    /// threads can never race on a refcount or shared mutation. Returns
+    /// the first offending implementation's name, or None when shareable.
+    fn unshareable_impl(&self, service: &str) -> Option<String> {
+        for (impl_name, info) in &self.impls {
+            if info.service != service {
+                continue;
+            }
+            let shareable = info.fields.iter().all(|(_, ty)| {
+                matches!(
+                    self.ctx.resolve(ty),
+                    Type::Int | Type::Float | Type::Bool | Type::Duration | Type::Unit
+                )
+            });
+            if !shareable {
+                return Some(impl_name.clone());
+            }
+        }
+        None
+    }
+
     /// Can a value of this type be deep-copied out of an arena region?
     /// Functions and mutable maps are shared by reference, so a copy of a
     /// value containing one would still point into the freed region.
@@ -3422,8 +3447,8 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("schedule.upTo", "schedule.upTo(schedule, times) -> Schedule — cap the retry count"),
         ("ignoreFailure", "ignoreFailure(lazy action) -> Unit — swallow the error channel"),
         ("sleep", "sleep(duration) -> Unit"),
-        ("spawn", "spawn(lazy action) -> Task<a> — run `action` on its own thread; it must be self-contained (no unhandled errors, no required capabilities)"),
-        ("await", "await(task) -> a — wait for a task and take its result"),
+        ("spawn", "spawn(lazy action) -> Task<a ! E> — run `action` on its own thread; its errors re-raise at `await`, and it may use shareable services in scope"),
+        ("await", "await(task) -> a ! E — wait for a task; re-raises the action's failure here (catch it at the await)"),
         ("assert", "assert(condition) -> Unit ! AssertFailed — for `inga test`"),
         ("assertEq", "assertEq(actual, expected) -> Unit ! AssertFailed — for `inga test`"),
         ("len", "len(stringOrList) -> Int"),

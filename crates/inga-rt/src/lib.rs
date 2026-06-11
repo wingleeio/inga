@@ -753,27 +753,32 @@ pub extern "C" fn rt_range(n: i64) -> i64 {
     p as i64
 }
 
-static mut RNG_STATE: u64 = 0;
+thread_local! {
+    // Per-thread so spawned tasks never race on the generator state.
+    static RNG_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
-/// xorshift64*, seeded from the clock on first use.
+/// xorshift64*, seeded from the clock on first use (per thread).
 #[no_mangle]
 pub extern "C" fn rt_random(n: i64) -> i64 {
     if n <= 0 {
         return 0;
     }
-    unsafe {
-        if RNG_STATE == 0 {
-            RNG_STATE = std::time::SystemTime::now()
+    RNG_STATE.with(|state| {
+        let mut s = state.get();
+        if s == 0 {
+            s = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0x4d595df4d0f33173)
                 | 1;
         }
-        RNG_STATE ^= RNG_STATE << 13;
-        RNG_STATE ^= RNG_STATE >> 7;
-        RNG_STATE ^= RNG_STATE << 17;
-        ((RNG_STATE.wrapping_mul(0x2545F4914F6CDD1D) >> 32) % n as u64) as i64
-    }
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        state.set(s);
+        ((s.wrapping_mul(0x2545F4914F6CDD1D) >> 32) % n as u64) as i64
+    })
 }
 
 // ---- graphics (GL-backed via miniquad/macroquad) ----------------------------------
@@ -1673,9 +1678,9 @@ pub extern "C" fn rt_freeze_slot(slot: i64, desc: i64) {
 }
 
 #[repr(C)]
-struct RtPair {
-    v: i64,
-    e: i64,
+pub struct RtPair {
+    pub v: i64,
+    pub e: i64,
 }
 
 /// Run a thunk closure `{ fnptr, captures... }` on a new thread; returns a
@@ -1695,19 +1700,22 @@ pub extern "C" fn rt_task_spawn(closure: i64) -> i64 {
         .spawn(move || {
             let f: extern "C" fn(*const i64) -> RtPair =
                 unsafe { std::mem::transmute(*(env as *const i64)) };
-            f(env as *const i64).v
+            let pair = f(env as *const i64);
+            (pair.v, pair.e)
         })
         .expect("spawn task thread");
     Box::into_raw(Box::new(handle)) as i64
 }
 
-/// Join a task and take its result. The result was allocated on the task's
-/// heap; heap chunks are never unmapped, and after the join the parent is
-/// its exclusive owner, so normal RC drops apply.
+/// Join a task and take its `{value, err}` pair — a failed action's error
+/// box re-raises at the await site. Either half was allocated on the
+/// task's heap; heap chunks are never unmapped, and after the join the
+/// parent is its exclusive owner, so normal RC drops apply.
 #[no_mangle]
-pub extern "C" fn rt_task_await(handle: i64) -> i64 {
-    let handle = unsafe { Box::from_raw(handle as *mut std::thread::JoinHandle<i64>) };
-    handle.join().unwrap_or(0)
+pub extern "C" fn rt_task_await(handle: i64) -> RtPair {
+    let handle = unsafe { Box::from_raw(handle as *mut std::thread::JoinHandle<(i64, i64)>) };
+    let (v, e) = handle.join().unwrap_or((0, 0));
+    RtPair { v, e }
 }
 
 // ---- JSON encode/decode over descriptors ----------------------------------------

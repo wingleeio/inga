@@ -1165,26 +1165,52 @@ fn tasks_spawn_await_round_trip() {
 }
 
 #[test]
-fn spawned_tasks_must_be_self_contained() {
-    // Unhandled error row.
+fn task_errors_reraise_at_await() {
+    // A failing action's error travels in the Task type and surfaces at
+    // the await, where the normal catch machinery applies.
+    let out = run(
+        "struct Boom = { Int n }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(7)\n}\n\nmain :: () {\n    t = risky() |> spawn\n    println(await(t) |> catch { Boom(n) -> n * 10 })\n}\n",
+    );
+    assert_eq!(out, "70\n");
+
+    // Left unhandled, it reaches `main`'s row like any other error.
     let errs = check_errors(
         "struct Boom = { Int n }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(1)\n}\n\nmain :: () {\n    t = spawn(risky())\n    println(await(t))\n}\n",
     );
     assert!(
-        errs.iter().any(|m| m.contains("self-contained") && m.contains("Boom")),
+        errs.iter().any(|m| m.contains("`main` does not handle the error `Boom`")),
         "got: {errs:?}"
     );
 
-    // Unprovided capability.
+    // Tasks aliased through a list union their error rows.
     let errs = check_errors(
-        "service Log {\n    say :: (String s)\n}\n\nshout :: () uses Log {\n    Log log\n    log.say(\"hi\")\n}\n\nmain :: () {\n    t = spawn(shout())\n    await(t)\n}\n",
+        "struct A = { Int n }\nstruct B = { Int n }\n\nfa :: () -> Int ! A {\n    fail A(1)\n}\n\nfb :: () -> Int ! B {\n    fail B(2)\n}\n\nmain :: () {\n    ts = [spawn(fa()), spawn(fb())]\n    map(ts, (t) -> await(t) |> catch { A -> 0 })\n}\n",
     );
     assert!(
-        errs.iter().any(|m| m.contains("self-contained") && m.contains("Log")),
+        errs.iter().any(|m| m.contains("`main` does not handle the error `B`")),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn spawned_tasks_share_only_stateless_services() {
+    // A scalar-state service crosses into the task; spawn captures the
+    // evidence in scope like a call would.
+    let out = run(
+        "service Adder {\n    add :: (Int a, Int b) -> Int\n}\n\nplainAdder :: Adder {\n    add :: (a, b) {\n        a + b\n    }\n}\n\ndouble :: (Int n) -> Int uses Adder {\n    Adder adder\n    adder.add(n, n)\n}\n\nmain :: () {\n    provide plainAdder\n    t = double(21) |> spawn\n    println(await(t))\n}\n",
+    );
+    assert_eq!(out, "42\n");
+
+    // A MutMap-backed implementation is rejected with guidance.
+    let errs = check_errors(
+        "service Store {\n    put :: (Int k, Int v)\n}\n\nmemStore :: Store {\n    m = MutMap()\n\n    put :: (k, v) {\n        m.set(k, v)\n    }\n}\n\nuseStore :: () uses Store {\n    Store store\n    store.put(1, 2)\n}\n\nmain :: () {\n    provide memStore\n    t = spawn(useStore())\n    await(t)\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("shareable") && m.contains("memStore")),
         "got: {errs:?}"
     );
 
-    // Handling the error inside the spawned expression makes it fine.
+    // Handling everything inside the spawn still works, of course.
     let out = run(
         "struct Boom = { Int n }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(7)\n}\n\nmain :: () {\n    t = spawn(risky() |> catch { Boom(n) -> n })\n    println(await(t))\n}\n",
     );

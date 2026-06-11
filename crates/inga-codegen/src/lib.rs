@@ -2333,8 +2333,11 @@ impl<'a> Cg<'a> {
                         | CType::Bool
                         | CType::Unit
                         | CType::Duration
-                        | CType::Tag(_) => {}
-                        CType::Func | CType::MutMap(..) | CType::Service(_) | CType::Task(_) => {
+                        | CType::Tag(_)
+                        // Instance records are immutable and never freed; the
+                        // checker has limited their fields to scalars.
+                        | CType::Service(_) => {}
+                        CType::Func | CType::MutMap(..) | CType::Task(_) => {
                             self.unsupported(
                                 args[0].span,
                                 "capturing a function value, map, or task in `spawn`",
@@ -2361,8 +2364,11 @@ impl<'a> Cg<'a> {
             }
             "await" if args.len() == 1 => {
                 let t = self.gen_expr(f, args[0]);
-                let out = self.tmp();
-                f.line(format!("{out} = call i64 @rt_task_await(i64 {t})"));
+                let pair = self.tmp();
+                f.line(format!("{pair} = call {{ i64, i64 }} @rt_task_await(i64 {t})"));
+                // A failed action's error re-raises here, through the normal
+                // handler chain — `await(t) |> catch {{ ... }}` just works.
+                let out = self.check_failure(f, &pair);
                 // The parent owns the task's result exclusively after the join.
                 let rcty = self.ctype_of_span(span);
                 self.pool_value(f, &out, &rcty);
@@ -3546,7 +3552,7 @@ declare i64 @rt_encode_desc(i64, i64)
 declare i64 @rt_decode_desc(i64, i64)
 declare void @rt_freeze_slot(i64, i64)
 declare i64 @rt_task_spawn(i64)
-declare i64 @rt_task_await(i64)
+declare { i64, i64 } @rt_task_await(i64)
 declare i64 @rt_random(i64)
 declare void @rt_gfx_run(i64, i64, i64, i64)
 declare void @rt_gfx_clear(i64, i64, i64)

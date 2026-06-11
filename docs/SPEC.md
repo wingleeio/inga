@@ -277,27 +277,37 @@ arenas:
 ### 6.5 Concurrency: tasks
 
 `spawn(action)` runs `action` on its own OS thread and returns a
-`Task<a>`; `await(task)` joins it and yields the result. There is no new
-syntax — `spawn` is a by-name builtin like `retry` — and no locks,
-channels, or `Send` bounds to learn. The safety rule is the effect system:
+`Task<a ! E>`; `await(task)` joins it and yields the result. There is no
+new syntax — `spawn` is a by-name builtin like `retry`, so it pipes
+(`crunch(n) |> spawn`) — and no locks, channels, or `Send` bounds to
+learn. The safety rules are the effect system:
 
 ```inga
-t = spawn(crunch("big", 10000000))   // runs now, on another thread
-u = spawn(fetch() |> catch { Timeout -> cached() })
-total = await(t) + process(await(u))
+t = crunch("big", 10000000) |> spawn   // runs now, on another thread
+u = fetch(url) |> spawn                // fetch :: ... ! Timeout
+total = await(t) + (await(u) |> catch { Timeout -> cached() })
 ```
 
-- **A spawned action must be self-contained**: its error row and capability
-  row must be empty. Handle failures with `catch` *inside* the spawn,
-  `provide` services *inside* it — the checker's message tells you which
-  name is outstanding. A task can therefore never observe a torn-down
-  handler scope, and `await` never fails.
-- Each thread has its **own heap and regions** (allocation is lock-free).
-  Captured values are **frozen** before the thread starts — marked static,
-  recursively, by type descriptor — so two threads never race on a
-  refcount; arena-allocated captures are copied out first. Heap chunks are
-  never returned to the OS, so a task's result outlives its thread, and
-  after the join the parent owns it exclusively.
+- **Errors re-raise at the `await`.** The action's error row travels in
+  the task's type (`Task<Report ! TooBig>` — visible on hover) and joins
+  the awaiting function's row, so you catch where you collect the result.
+  Tasks aliased through a list or a variable union their rows. Note the
+  pipeline `work() |> spawn |> await` is *sequential* (it waits before the
+  next spawn); spawn everything first, then await.
+- **Capabilities cross when they are shareable.** `spawn` captures the
+  evidence in scope like a call would, so the action may use any service
+  whose implementations carry only scalar state (`Int`/`Float`/`Bool`/
+  `Duration` fields — instance records are immutable and never freed, so
+  two threads can share them without racing). A `MutMap`- or string-state
+  implementation is rejected with guidance: provide a fresh one *inside*
+  the spawned expression.
+- Each thread has its **own heap and regions** (allocation is lock-free;
+  the random generator is per-thread too). Captured values are **frozen**
+  before the thread starts — marked static, recursively, by type
+  descriptor — so two threads never race on a refcount; arena-allocated
+  captures are copied out first. Heap chunks are never returned to the OS,
+  so a task's result (or its error box) outlives its thread, and after the
+  join the parent owns it exclusively.
 - `inga run` executes the action at the spawn point (same results,
   sequential); `inga build` runs it in parallel — four spawned workers are
   ~4× on a 4-core machine.

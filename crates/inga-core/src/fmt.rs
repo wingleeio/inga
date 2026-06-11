@@ -276,14 +276,38 @@ impl Printer {
         }
         self.out.push_str("{\n");
         self.prev_end_line = Some(self.lines.line(block.span.start));
-        for stmt in &block.stmts {
+        self.print_stmts(&block.stmts, indent + 1);
+        self.flush_comments_before(block.span.end, indent + 1);
+        self.push_indent(indent);
+        self.out.push('}');
+    }
+
+    fn print_stmts(&mut self, stmts: &[Stmt], indent: usize) {
+        for stmt in stmts {
+            // Braceless `provide` prints as a header line; its body is the
+            // rest of the enclosing block, at the same indent.
+            if let Stmt::Expr(expr) = stmt {
+                if let ExprKind::Provide { impls, body, inline: true } = &expr.kind {
+                    self.flush_comments_before(expr.span.start, indent);
+                    self.blank_line_if_gap(self.lines.line(expr.span.start));
+                    self.push_indent(indent);
+                    let items = self.render_provide_items(impls, indent);
+                    self.out.push_str(&format!("provide {items}"));
+                    let header_end = provide_items_end(impls).unwrap_or(expr.span.start);
+                    self.attach_trailing_comment(header_end);
+                    self.out.push('\n');
+                    self.prev_end_line = Some(self.lines.line(header_end));
+                    self.print_stmts(&body.stmts, indent);
+                    continue;
+                }
+            }
             let span = stmt_span(stmt);
-            self.flush_comments_before(span.start, indent + 1);
+            self.flush_comments_before(span.start, indent);
             self.blank_line_if_gap(self.lines.line(span.start));
-            self.push_indent(indent + 1);
+            self.push_indent(indent);
             match stmt {
                 Stmt::Expr(expr) => {
-                    let rendered = self.render_expr(expr, indent + 1);
+                    let rendered = self.render_expr(expr, indent);
                     self.out.push_str(&rendered);
                 }
                 Stmt::Bind { ty, name, value, .. } => {
@@ -292,7 +316,7 @@ impl Printer {
                         None => format!("{name} = "),
                     };
                     self.out.push_str(&prefix);
-                    let rendered = self.render_expr(value, indent + 1);
+                    let rendered = self.render_expr(value, indent);
                     self.out.push_str(&rendered);
                 }
                 Stmt::Acquire { service, name, .. } => {
@@ -303,9 +327,21 @@ impl Printer {
             self.out.push('\n');
             self.prev_end_line = Some(self.lines.line(span.end));
         }
-        self.flush_comments_before(block.span.end, indent + 1);
-        self.push_indent(indent);
-        self.out.push('}');
+    }
+
+    fn render_provide_items(&mut self, impls: &[ProvideItem], indent: usize) -> String {
+        let rendered: Vec<String> = impls
+            .iter()
+            .map(|item| match &item.args {
+                None => item.name.clone(),
+                Some(args) => {
+                    let inner: Vec<String> =
+                        args.iter().map(|a| self.render_expr(a, indent)).collect();
+                    format!("{}({})", item.name, inner.join(", "))
+                }
+            })
+            .collect();
+        rendered.join(", ")
     }
 
     // ---- expressions --------------------------------------------------------
@@ -386,9 +422,9 @@ impl Printer {
             ExprKind::Fail { error } => {
                 format!("fail {}", self.render_expr(error, indent))
             }
-            ExprKind::Provide { impls, body } => {
-                let names: Vec<String> = impls.iter().map(|(n, _)| n.clone()).collect();
-                let mut out = format!("provide {} ", names.join(", "));
+            ExprKind::Provide { impls, body, .. } => {
+                let items = self.render_provide_items(impls, indent);
+                let mut out = format!("provide {items} ");
                 out.push_str(&self.render_block_inline(body, indent));
                 out
             }
@@ -577,6 +613,15 @@ fn render_field_block(fields: &[Field]) -> String {
         })
         .collect();
     format!("{{ {} }}", rendered.join(", "))
+}
+
+/// End offset of a provide item list (for trailing-comment attachment).
+fn provide_items_end(impls: &[ProvideItem]) -> Option<u32> {
+    let last = impls.last()?;
+    Some(match &last.args {
+        Some(args) => args.last().map(|a| a.span.end).unwrap_or(last.name_span.end),
+        None => last.name_span.end,
+    })
 }
 
 fn stmt_span(stmt: &Stmt) -> Span {

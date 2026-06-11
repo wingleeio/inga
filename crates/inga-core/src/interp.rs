@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 use std::rc::Rc;
 
 use crate::ast::*;
-use crate::check::{DECODE_ERROR, DURATION_SUFFIXES};
+use crate::check::{DECODE_ERROR, DURATION_SUFFIXES, SIZE_SUFFIXES};
 use crate::span::Span;
 
 #[derive(Debug, Clone)]
@@ -398,18 +398,39 @@ impl<'a> Interp<'a> {
                     ),
                 }
             }
-            ExprKind::Provide { impls, body } => {
-                let mut frame = HashMap::new();
-                for (name, span) in impls {
-                    let Some(impl_decl) = self.impls.get(name.as_str()).copied() else {
-                        return self.fatal(*span, format!("unknown implementation `{name}`"));
-                    };
-                    let instance = self.instantiate_impl(impl_decl)?;
-                    frame.insert(impl_decl.service.clone(), Rc::new(instance));
+            ExprKind::Provide { impls, body, .. } => {
+                // Items scope left to right: each impl's field initializers
+                // run with the previous items already provided.
+                let mut pushed = 0usize;
+                let mut setup = || -> Result<(), Failure<'a>> {
+                    for item in impls {
+                        if item.name == "Arena" {
+                            // Allocation strategy is the host's concern here;
+                            // evaluate the size for effects/validation only.
+                            for arg in item.args.as_deref().unwrap_or(&[]) {
+                                self.eval(arg, scope)?;
+                            }
+                            continue;
+                        }
+                        let Some(impl_decl) = self.impls.get(item.name.as_str()).copied() else {
+                            return self
+                                .fatal(item.name_span, format!("unknown implementation `{}`", item.name));
+                        };
+                        let instance = self.instantiate_impl(impl_decl)?;
+                        let mut frame = HashMap::new();
+                        frame.insert(impl_decl.service.clone(), Rc::new(instance));
+                        self.provided.borrow_mut().push(frame);
+                        pushed += 1;
+                    }
+                    Ok(())
+                };
+                let result = match setup() {
+                    Ok(()) => self.eval_block(body, scope),
+                    Err(failure) => Err(failure),
+                };
+                for _ in 0..pushed {
+                    self.provided.borrow_mut().pop();
                 }
-                self.provided.borrow_mut().push(frame);
-                let result = self.eval_block(body, scope);
-                self.provided.borrow_mut().pop();
                 result
             }
             ExprKind::If { cond, then_block, else_branch } => {
@@ -1221,6 +1242,9 @@ impl<'a> Interp<'a> {
         if let Value::Int(n) = value {
             if let Some((_, factor)) = DURATION_SUFFIXES.iter().find(|(s, _)| *s == name) {
                 return Ok(Value::Duration(n * factor));
+            }
+            if let Some((_, factor)) = SIZE_SUFFIXES.iter().find(|(s, _)| *s == name) {
+                return Ok(Value::Int(n * factor));
             }
         }
         match value {

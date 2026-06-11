@@ -489,6 +489,14 @@ impl<'a> Parser<'a> {
     fn parse_block(&mut self) -> Block {
         let start = self.peek().span;
         self.expect(&TokenKind::LBrace, "`{`");
+        let stmts = self.parse_stmts_until_rbrace();
+        self.expect(&TokenKind::RBrace, "`}`");
+        Block { stmts, span: start.to(self.prev_span()) }
+    }
+
+    /// Statements inside an already-opened `{ ... }`; stops at (without
+    /// consuming) the closing brace.
+    fn parse_stmts_until_rbrace(&mut self) -> Vec<Stmt> {
         let mut stmts = Vec::new();
         loop {
             self.skip_newlines();
@@ -496,6 +504,22 @@ impl<'a> Parser<'a> {
                 break;
             }
             let before = self.pos;
+            // The braceless `provide` statement scopes over the rest of the
+            // enclosing block; it must be intercepted before parse_stmt.
+            if self.at(&TokenKind::KwProvide) && self.provide_is_inline() {
+                let start = self.peek().span;
+                self.bump();
+                let impls = self.parse_provide_items();
+                let body_start = self.peek().span;
+                let body_stmts = self.parse_stmts_until_rbrace();
+                let body = Block { stmts: body_stmts, span: body_start.to(self.prev_span()) };
+                let span = start.to(self.prev_span());
+                stmts.push(Stmt::Expr(Expr {
+                    kind: ExprKind::Provide { impls, body, inline: true },
+                    span,
+                }));
+                break;
+            }
             stmts.push(self.parse_stmt());
             // Statements must be followed by a newline, `;`, or `}`.
             if !matches!(
@@ -513,8 +537,50 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
         }
-        self.expect(&TokenKind::RBrace, "`}`");
-        Block { stmts, span: start.to(self.prev_span()) }
+        stmts
+    }
+
+    /// After `provide`, decide between the braced and braceless forms: scan
+    /// past the item list (idents, commas, balanced parens); a `{` before the
+    /// end of the line means a braced body.
+    fn provide_is_inline(&self) -> bool {
+        let mut n = 1; // past `provide`
+        let mut depth = 0usize;
+        loop {
+            match &self.nth(n).kind {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => depth = depth.saturating_sub(1),
+                TokenKind::LBrace if depth == 0 => return false,
+                TokenKind::Newline | TokenKind::Semi | TokenKind::RBrace | TokenKind::Eof
+                    if depth == 0 =>
+                {
+                    return true;
+                }
+                TokenKind::Eof => return true,
+                _ => {}
+            }
+            n += 1;
+        }
+    }
+
+    /// `consoleLogger, Arena(256.kb), fakeDb`
+    fn parse_provide_items(&mut self) -> Vec<ProvideItem> {
+        let mut items = Vec::new();
+        loop {
+            let (name, name_span) = self.expect_ident("an implementation name");
+            if name == "<error>" {
+                break;
+            }
+            let args = if self.at(&TokenKind::LParen) { Some(self.parse_args()) } else { None };
+            items.push(ProvideItem { name, name_span, args });
+            if self.at(&TokenKind::Comma) {
+                self.bump();
+                self.skip_newlines();
+            } else {
+                break;
+            }
+        }
+        items
     }
 
     fn parse_stmt(&mut self) -> Stmt {
@@ -880,24 +946,11 @@ impl<'a> Parser<'a> {
             }
             TokenKind::KwProvide => {
                 self.bump();
-                let mut impls = Vec::new();
-                loop {
-                    let (name, span) = self.expect_ident("an implementation name");
-                    if name == "<error>" {
-                        break;
-                    }
-                    impls.push((name, span));
-                    if self.at(&TokenKind::Comma) {
-                        self.bump();
-                        self.skip_newlines();
-                    } else {
-                        break;
-                    }
-                }
+                let impls = self.parse_provide_items();
                 self.skip_newlines();
                 let body = self.parse_block();
                 Expr {
-                    kind: ExprKind::Provide { impls, body },
+                    kind: ExprKind::Provide { impls, body, inline: false },
                     span: start.to(self.prev_span()),
                 }
             }

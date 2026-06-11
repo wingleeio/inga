@@ -8,8 +8,11 @@
 //! - A string is `{ i64 byte_len, bytes... }`.
 //! - A list is `{ i64 len, item0, item1, ... }`.
 //! - `Option` is `0` for `None`, else a pointer to one boxed value.
-//! - Memory is bump-allocated and never freed (no GC in v0.2; programs are
-//!   short-lived processes).
+//! - Memory is Perceus-style ARC by default (8-byte refcount header per
+//!   object, non-atomic — compiled Inga is single-threaded; the compiler
+//!   emits type-directed drop glue), with optional `provide Arena(n)`
+//!   regions whose allocations are bump-allocated and freed wholesale at
+//!   scope end.
 
 use std::io::Write;
 use std::time::Instant;
@@ -20,35 +23,196 @@ thread_local! {
 
 // ---- allocator ---------------------------------------------------------------
 //
-// Raw bump allocator. Compiled Inga programs are single-threaded, allocations
-// are 8-aligned, never freed, and codegen initializes every slot it
-// allocates, so this can be a two-pointer fast path (~3 ns).
+// Every allocation carries an 8-byte header word immediately before the
+// payload pointer:
+//
+//   meta >= 1  — RC-heap object; meta is the (non-atomic) refcount
+//   meta == -1 — static constant (string literals); dup/release are no-ops
+//   meta == -2 — arena object; freed wholesale when its region is popped
+//
+// The compiler emits type-directed drop glue: `rt_release` decs; when the
+// count hits zero the glue releases heap-typed children and calls
+// `rt_free`. `provide Arena(n)` pushes a region; allocations in its dynamic
+// extent are bump-allocated (overflow chains chunks) and freed together.
 
-const CHUNK: usize = 1 << 22; // 4 MiB
+const META_STATIC: i64 = -1;
+const META_ARENA: i64 = -2;
 
-static mut BUMP_PTR: *mut u8 = std::ptr::null_mut();
-static mut BUMP_END: *mut u8 = std::ptr::null_mut();
-
-#[cold]
-unsafe fn bump_refill(size: usize) {
-    let cap = CHUNK.max(size);
-    let layout = std::alloc::Layout::from_size_align(cap, 8).unwrap();
-    let chunk = std::alloc::alloc(layout); // leaked by design
-    BUMP_PTR = chunk;
-    BUMP_END = chunk.add(cap);
+struct Region {
+    /// Chunks owned by this region: (base ptr, capacity).
+    chunks: Vec<(*mut u8, usize)>,
+    cursor: *mut u8,
+    end: *mut u8,
 }
 
-/// Allocate `size` bytes, 8-aligned, uninitialized. Never freed.
+static mut REGIONS: Vec<Region> = Vec::new();
+
+#[allow(static_mut_refs)]
+fn regions() -> &'static mut Vec<Region> {
+    // Single-threaded by construction (compiled Inga has no threads).
+    unsafe { &mut REGIONS }
+}
+
+unsafe fn raw_chunk(cap: usize) -> *mut u8 {
+    std::alloc::alloc(std::alloc::Layout::from_size_align(cap, 8).unwrap())
+}
+
+/// Push an arena region of `bytes` capacity (overflow chains more chunks).
+#[no_mangle]
+pub extern "C" fn rt_arena_push(bytes: i64) {
+    let cap = ((bytes.max(4096) as usize) + 7) & !7;
+    unsafe {
+        let base = raw_chunk(cap);
+        regions().push(Region { chunks: vec![(base, cap)], cursor: base, end: base.add(cap) });
+    }
+}
+
+/// Pop the innermost region, freeing all its allocations at once.
+#[no_mangle]
+pub extern "C" fn rt_arena_pop() {
+    if let Some(region) = regions().pop() {
+        unsafe {
+            for (base, cap) in region.chunks {
+                std::alloc::dealloc(base, std::alloc::Layout::from_size_align(cap, 8).unwrap());
+            }
+        }
+    }
+}
+
+#[cold]
+unsafe fn region_grow(region: &mut Region, need: usize) {
+    let cap = need.max(region.chunks.last().map(|(_, c)| *c).unwrap_or(4096));
+    let base = raw_chunk(cap);
+    region.chunks.push((base, cap));
+    region.cursor = base;
+    region.end = base.add(cap);
+}
+
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(p: *mut u8);
+}
+
+// The RC heap: segregated free lists for small objects (1..=MAX_CLASS i64
+// slots, including the header), refilled from bump chunks; larger objects
+// go to libc malloc. The header packs `class << CLASS_SHIFT | refcount`, so
+// `rt_free` knows which list a dead object returns to — freed memory is
+// reused at bump-allocator speed (the practical payoff of Perceus reuse).
+
+const CLASS_SHIFT: u32 = 48;
+const RC_MASK: i64 = (1 << CLASS_SHIFT) - 1;
+const MAX_CLASS: usize = 16; // up to 16 slots = 120 payload bytes
+const HUGE: usize = 0;
+const HEAP_CHUNK: usize = 1 << 20;
+
+static mut FREE_LISTS: [*mut u8; MAX_CLASS + 1] = [std::ptr::null_mut(); MAX_CLASS + 1];
+static mut HEAP_PTR: *mut u8 = std::ptr::null_mut();
+static mut HEAP_END: *mut u8 = std::ptr::null_mut();
+
+#[cold]
+unsafe fn heap_refill() {
+    // Chunks are permanent; their blocks recycle through the free lists.
+    HEAP_PTR = malloc(HEAP_CHUNK);
+    HEAP_END = HEAP_PTR.add(HEAP_CHUNK);
+}
+
+/// Allocate from the RC heap, bypassing any active arena (error boxes must
+/// survive region pops). Refcount starts at 1.
+#[no_mangle]
+pub extern "C" fn rt_alloc_global(size: i64) -> *mut u8 {
+    let slots = 1 + (((size.max(0) as usize) + 7) >> 3); // header + payload
+    unsafe {
+        if slots <= MAX_CLASS {
+            let head = FREE_LISTS[slots];
+            let p = if !head.is_null() {
+                FREE_LISTS[slots] = *(head as *mut *mut u8);
+                head
+            } else {
+                let bytes = slots * 8;
+                if HEAP_PTR.is_null() || HEAP_PTR.add(bytes) > HEAP_END {
+                    heap_refill();
+                }
+                let p = HEAP_PTR;
+                HEAP_PTR = HEAP_PTR.add(bytes);
+                p
+            };
+            *(p as *mut i64) = ((slots as i64) << CLASS_SHIFT) | 1;
+            p.add(8)
+        } else {
+            let p = malloc(slots * 8);
+            *(p as *mut i64) = ((HUGE as i64) << CLASS_SHIFT) | 1;
+            p.add(8)
+        }
+    }
+}
+
+/// Allocate `size` bytes, 8-aligned, uninitialized, preceded by a header.
+/// Inside an arena scope the bytes come from the innermost region;
+/// otherwise from the RC heap.
 #[no_mangle]
 pub extern "C" fn rt_alloc(size: i64) -> *mut u8 {
     unsafe {
-        let size = ((size.max(0) as usize) + 7) & !7;
-        if BUMP_PTR.is_null() || BUMP_PTR.add(size) > BUMP_END {
-            bump_refill(size);
+        if let Some(region) = regions().last_mut() {
+            let size = ((size.max(0) as usize) + 7) & !7;
+            let need = 8 + size;
+            if region.cursor.add(need) > region.end {
+                region_grow(region, need);
+            }
+            let p = region.cursor;
+            region.cursor = region.cursor.add(need);
+            *(p as *mut i64) = META_ARENA;
+            return p.add(8);
         }
-        let p = BUMP_PTR;
-        BUMP_PTR = BUMP_PTR.add(size);
-        p
+        rt_alloc_global(size)
+    }
+}
+
+/// Bump a refcount (no-op for static and arena objects). Null-safe.
+#[no_mangle]
+pub extern "C" fn rt_dup(v: i64) -> i64 {
+    if v != 0 {
+        unsafe {
+            let meta = (v as *mut i64).sub(1);
+            if *meta >= 1 {
+                *meta += 1; // rc lives in the low bits; the class is untouched
+            }
+        }
+    }
+    v
+}
+
+/// Drop one reference; returns 1 when the object just hit zero and the
+/// caller (compiler-emitted drop glue) must release children and free it.
+#[no_mangle]
+pub extern "C" fn rt_release(v: i64) -> i64 {
+    if v == 0 {
+        return 0;
+    }
+    unsafe {
+        let meta = (v as *mut i64).sub(1);
+        if *meta < 1 {
+            debug_assert!(*meta == META_STATIC || *meta == META_ARENA);
+            return 0;
+        }
+        *meta -= 1;
+        (*meta & RC_MASK == 0) as i64
+    }
+}
+
+/// Free an object whose refcount already reached zero (drop glue only):
+/// small classes recycle through their free list, huge ones go back to the
+/// system allocator.
+#[no_mangle]
+pub extern "C" fn rt_free(v: i64) {
+    unsafe {
+        let base = (v as *mut u8).sub(8);
+        let class = (*(base as *mut i64) >> CLASS_SHIFT) as usize;
+        if class == HUGE {
+            free(base);
+        } else {
+            *(base as *mut *mut u8) = FREE_LISTS[class];
+            FREE_LISTS[class] = base;
+        }
     }
 }
 
@@ -314,6 +478,15 @@ fn map_ref<'a>(m: i64) -> &'a mut RtMap {
 #[no_mangle]
 pub extern "C" fn rt_map_new() -> i64 {
     Box::into_raw(Box::new(RtMap::with_cap(16))) as i64
+}
+
+/// Drop glue for MutMap: frees the map's own storage. Values the map still
+/// holds keep the references they were given by `set` (a known leak).
+#[no_mangle]
+pub extern "C" fn rt_map_free(m: i64) {
+    if m != 0 {
+        unsafe { drop(Box::from_raw(m as *mut RtMap)) };
+    }
 }
 
 fn box_value(v: i64) -> i64 {

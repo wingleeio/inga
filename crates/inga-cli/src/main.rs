@@ -176,7 +176,9 @@ fn cmd_build(args: &[String]) -> ExitCode {
     match status {
         Ok(s) if s.success() => {
             if !emit_ir {
-                let _ = std::fs::remove_file(&ll_path);
+                if std::env::var("INGA_KEEP_LL").is_err() {
+                    let _ = std::fs::remove_file(&ll_path);
+                }
             } else {
                 println!("{ll_path}: LLVM IR");
             }

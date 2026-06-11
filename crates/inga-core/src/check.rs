@@ -18,6 +18,10 @@ use std::rc::Rc;
 pub const DURATION_SUFFIXES: [(&str, i64); 5] =
     [("millis", 1), ("seconds", 1000), ("minutes", 60_000), ("hours", 3_600_000), ("days", 86_400_000)];
 
+/// Byte-size suffixes (`256.kb`): plain Int factors, used by `Arena(...)`.
+pub const SIZE_SUFFIXES: [(&str, i64); 3] =
+    [("kb", 1024), ("mb", 1024 * 1024), ("gb", 1024 * 1024 * 1024)];
+
 /// Builtin struct raised by `decode`.
 pub const DECODE_ERROR: &str = "DecodeError";
 
@@ -90,6 +94,17 @@ pub struct Facts {
     pub funcs: HashMap<String, RowFact>,
     /// Keyed by (service, method): the union row across all implementations.
     pub methods: HashMap<(String, String), RowFact>,
+    /// Resolved parameter / return types, consumed by the backend's
+    /// refcount insertion (drop glue needs to know what is heap-shaped).
+    pub func_params: HashMap<String, Vec<CType>>,
+    pub func_ret: HashMap<String, CType>,
+    pub method_params: HashMap<(String, String), Vec<CType>>,
+    pub method_ret: HashMap<(String, String), CType>,
+    /// Struct field types and enum variant field types, by name.
+    pub struct_fields: HashMap<String, Vec<CType>>,
+    pub enum_variants: HashMap<String, Vec<(String, Vec<CType>)>>,
+    /// Impl instance field types, by impl name.
+    pub impl_fields: HashMap<String, Vec<CType>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -165,6 +180,11 @@ pub fn check(program: &Program, diagnostics: &mut Vec<Diagnostic>) -> CheckInfo 
     checker.diags.clear();
     checker.record_info = true;
     checker.run_pass();
+    let raw = std::mem::take(&mut checker.raw_expr_types);
+    for (key, ty) in raw {
+        let resolved = checker.ctype(&ty);
+        checker.info.expr_types.insert(key, resolved);
+    }
     checker.validate_declared_rows();
     checker.record_def_details();
     checker.record_facts();
@@ -192,6 +212,7 @@ struct Checker<'a> {
 
     diags: Vec<Diagnostic>,
     record_info: bool,
+    raw_expr_types: HashMap<(u32, u32), Type>,
     info: CheckInfo,
     changed: bool,
 
@@ -215,6 +236,7 @@ impl<'a> Checker<'a> {
             impl_field_rows: HashMap::new(),
             diags: Vec::new(),
             record_info: false,
+            raw_expr_types: HashMap::new(),
             info: CheckInfo::default(),
             changed: false,
             scopes: Vec::new(),
@@ -763,8 +785,10 @@ impl<'a> Checker<'a> {
     fn check_expr(&mut self, expr: &Expr) -> Type {
         let ty = self.check_expr_inner(expr);
         if self.record_info {
-            let resolved = self.ctype(&ty);
-            self.info.expr_types.insert((expr.span.start, expr.span.end), resolved);
+            // Raw types; resolved to CTypes only after the pass completes,
+            // so later unifications (e.g. a map's key type fixed by a later
+            // call) are reflected in earlier expressions' records.
+            self.raw_expr_types.insert((expr.span.start, expr.span.end), ty.clone());
         }
         ty
     }
@@ -798,6 +822,11 @@ impl<'a> Checker<'a> {
     fn record_facts(&mut self) {
         for name in self.funcs.keys().cloned().collect::<Vec<_>>() {
             let rows = self.func_effective_rows(&name);
+            let info = &self.funcs[&name];
+            let params: Vec<CType> = info.params.iter().map(|t| self.ctype(t)).collect();
+            let ret = self.ctype(&info.ret.clone());
+            self.info.facts.func_params.insert(name.clone(), params);
+            self.info.facts.func_ret.insert(name.clone(), ret);
             self.info.facts.funcs.insert(
                 name,
                 RowFact {
@@ -805,6 +834,32 @@ impl<'a> Checker<'a> {
                     caps: rows.caps.iter().cloned().collect(),
                 },
             );
+        }
+        for (sname, sinfo) in &self.services {
+            for (mname, m) in &sinfo.methods {
+                let key = (sname.clone(), mname.clone());
+                let params: Vec<CType> = m.params.iter().map(|t| self.ctype(t)).collect();
+                self.info.facts.method_params.insert(key.clone(), params);
+                self.info.facts.method_ret.insert(key, self.ctype(&m.ret));
+            }
+        }
+        for (name, info) in &self.structs {
+            let fields: Vec<CType> = info.fields.iter().map(|(_, t)| self.ctype(t)).collect();
+            self.info.facts.struct_fields.insert(name.clone(), fields);
+        }
+        for (name, info) in &self.enums {
+            let variants: Vec<(String, Vec<CType>)> = info
+                .variants
+                .iter()
+                .map(|(v, fields)| {
+                    (v.clone(), fields.iter().map(|(_, t)| self.ctype(t)).collect())
+                })
+                .collect();
+            self.info.facts.enum_variants.insert(name.clone(), variants);
+        }
+        for (name, info) in &self.impls {
+            let fields: Vec<CType> = info.fields.iter().map(|(_, t)| self.ctype(t)).collect();
+            self.info.facts.impl_fields.insert(name.clone(), fields);
         }
         let pairs: Vec<(String, String)> = self
             .services
@@ -890,7 +945,7 @@ impl<'a> Checker<'a> {
                 // `fail` never produces a value; it unifies with anything.
                 self.ctx.fresh()
             }
-            ExprKind::Provide { impls, body } => self.check_provide(impls, body),
+            ExprKind::Provide { impls, body, .. } => self.check_provide(impls, body),
             ExprKind::If { cond, then_block, else_branch } => {
                 let cond_ty = self.check_expr(cond);
                 self.unify_at(&Type::Bool, &cond_ty, cond.span, "`if` condition");
@@ -1665,6 +1720,16 @@ impl<'a> Checker<'a> {
                 _ => {}
             }
         }
+        // Size suffixes: `256.kb` is just an Int in bytes.
+        if SIZE_SUFFIXES.iter().any(|(s, _)| *s == name) {
+            match resolved {
+                Type::Int | Type::Var(_) | Type::Unknown => {
+                    self.unify_at(&Type::Int, &recv_ty, recv.span, "size value");
+                    return Type::Int;
+                }
+                _ => {}
+            }
+        }
 
         match resolved {
             Type::Named(type_name) => self.struct_field_type(&type_name, name, name_span),
@@ -1985,26 +2050,72 @@ impl<'a> Checker<'a> {
 
     // ---- provide ------------------------------------------------------------------
 
-    fn check_provide(&mut self, impls: &[(String, Span)], body: &Block) -> Type {
+    fn check_provide(&mut self, impls: &[ProvideItem], body: &Block) -> Type {
+        // Items scope left to right: a later impl's field initializers may
+        // use the services provided before it in the same list.
         let mut provided: BTreeSet<String> = BTreeSet::new();
-        for (name, span) in impls {
-            match self.impls.get(name) {
-                Some(info) => {
-                    provided.insert(info.service.clone());
-                    let def_span = info.name_span;
-                    if self.record_info {
-                        self.info.refs.push((*span, def_span));
-                        let service = info.service.clone();
-                        self.info.hovers.push((*span, format!("{name} :: {service}")));
+        let mut has_arena = false;
+        for item in impls {
+            if item.name == "Arena" {
+                has_arena = true;
+                match item.args.as_deref() {
+                    Some([arg]) => {
+                        let ty = self.check_expr(arg);
+                        self.unify_at(&Type::Int, &ty, arg.span, "arena size");
                     }
-                    // Constructing the impl runs its field initializers.
-                    let field_rows = self.impl_field_rows.get(name).cloned().unwrap_or_default();
+                    _ => {
+                        self.error(
+                            item.name_span,
+                            "`Arena` takes one Int size argument, like `Arena(256.kb)`",
+                        );
+                        for arg in item.args.as_deref().unwrap_or(&[]) {
+                            self.check_expr(arg);
+                        }
+                    }
+                }
+                if self.record_info {
+                    self.info.hovers.push((
+                        item.name_span,
+                        "Arena(Int bytes) — allocate this scope in a region, freed when it ends"
+                            .to_string(),
+                    ));
+                }
+                continue;
+            }
+            if let Some(args) = &item.args {
+                self.error(
+                    item.name_span,
+                    format!(
+                        "`{}` does not take arguments in `provide` (only `Arena(size)` does)",
+                        item.name
+                    ),
+                );
+                for arg in args {
+                    self.check_expr(arg);
+                }
+            }
+            match self.impls.get(&item.name) {
+                Some(info) => {
+                    let def_span = info.name_span;
+                    let service = info.service.clone();
+                    if self.record_info {
+                        self.info.refs.push((item.name_span, def_span));
+                        self.info
+                            .hovers
+                            .push((item.name_span, format!("{} :: {service}", item.name)));
+                    }
+                    // Constructing the impl runs its field initializers; they
+                    // see only the services provided earlier in this list.
+                    let mut field_rows =
+                        self.impl_field_rows.get(&item.name).cloned().unwrap_or_default();
+                    field_rows.caps.retain(|c| !provided.contains(c));
                     self.merge_rows(&field_rows);
+                    provided.insert(service);
                 }
                 None => {
                     self.error(
-                        *span,
-                        format!("unknown implementation `{name}` (declare it like `{name} :: SomeService {{ ... }}`)"),
+                        item.name_span,
+                        format!("unknown implementation `{}` (declare it like `{} :: SomeService {{ ... }}`)", item.name, item.name),
                     );
                 }
             }
@@ -2012,6 +2123,28 @@ impl<'a> Checker<'a> {
         let (body_ty, mut rows) = self.with_rows(|s| s.check_block(body));
         rows.caps.retain(|c| !provided.contains(c));
         self.merge_rows(&rows);
+        // An arena is freed when the scope ends; a heap-shaped result would
+        // escape it. Until copy-out lands, require a scalar result.
+        if has_arena {
+            match self.ctx.resolve(&body_ty) {
+                Type::Int
+                | Type::Float
+                | Type::Bool
+                | Type::Unit
+                | Type::Duration
+                | Type::Var(_)
+                | Type::Unknown => {}
+                other => {
+                    let rendered = self.render(&other);
+                    self.error(
+                        last_span(body),
+                        format!(
+                            "the value of an `Arena` scope must not escape it: this scope produces {rendered} (return a scalar, or move the consumer inside the scope)"
+                        ),
+                    );
+                }
+            }
+        }
         body_ty
     }
 

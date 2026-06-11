@@ -57,6 +57,9 @@ const DURATION_SUFFIXES: [(&str, i64); 5] = [
     ("days", 86_400_000),
 ];
 
+const SIZE_SUFFIXES: [(&str, i64); 3] =
+    [("kb", 1024), ("mb", 1024 * 1024), ("gb", 1024 * 1024 * 1024)];
+
 // ---- program-level state -----------------------------------------------------
 
 struct ServiceMeta {
@@ -100,6 +103,8 @@ struct Cg<'a> {
     globals: String,
     functions: String,
     str_consts: HashMap<Vec<u8>, String>,
+    /// Memoized drop-glue symbols, keyed by a canonical type key.
+    drop_syms: HashMap<String, String>,
     tmp: u32,
     label: u32,
     errors: Vec<Diagnostic>,
@@ -120,6 +125,7 @@ impl<'a> Cg<'a> {
             globals: String::new(),
             functions: String::new(),
             str_consts: HashMap::new(),
+            drop_syms: HashMap::new(),
             tmp: 0,
             label: 0,
             errors: Vec::new(),
@@ -201,13 +207,21 @@ impl<'a> Cg<'a> {
         format!("{base}.{}", self.label)
     }
 
+    /// A string literal: `{ i64 meta(-1 = static), i64 len, bytes }`. The
+    /// returned constant points past the meta word so dup/release see the
+    /// static marker and no-op.
     fn str_const(&mut self, text: &str) -> String {
         let bytes = text.as_bytes().to_vec();
+        let len = bytes.len();
+        let refer = |name: &str| {
+            format!(
+                "ptrtoint (ptr getelementptr inbounds (<{{ i64, i64, [{len} x i8] }}>, ptr {name}, i32 0, i32 1) to i64)"
+            )
+        };
         if let Some(name) = self.str_consts.get(&bytes) {
-            return format!("ptrtoint (ptr {name} to i64)");
+            return refer(name);
         }
         let name = format!("@ing.s{}", self.str_consts.len());
-        let len = bytes.len();
         let mut escaped = String::new();
         for b in &bytes {
             match b {
@@ -223,10 +237,10 @@ impl<'a> Cg<'a> {
         }
         let _ = writeln!(
             self.globals,
-            "{name} = private unnamed_addr constant <{{ i64, [{len} x i8] }}> <{{ i64 {len}, [{len} x i8] c\"{escaped}\" }}>"
+            "{name} = private unnamed_addr constant <{{ i64, i64, [{len} x i8] }}> <{{ i64 -1, i64 {len}, [{len} x i8] c\"{escaped}\" }}>"
         );
         self.str_consts.insert(bytes, name.clone());
-        format!("ptrtoint (ptr {name} to i64)")
+        refer(&name)
     }
 
     fn func_row(&self, name: &str) -> RowFact {
@@ -298,18 +312,22 @@ impl<'a> Cg<'a> {
             params.push(format!("i64 {reg}"));
             f.evidence.insert(cap.clone(), reg);
         }
-        for param in &decl.sig.params {
+        let param_ctys =
+            self.info.facts.func_params.get(&decl.name).cloned().unwrap_or_default();
+        for (i, param) in decl.sig.params.iter().enumerate() {
             let reg = format!("%p.{}", param.name);
             params.push(format!("i64 {reg}"));
             let slot = f.alloca(self, &param.name);
             f.line(format!("store i64 {reg}, ptr {slot}"));
+            let cty = param_ctys.get(i).cloned().unwrap_or(CType::Int);
             f.scopes
                 .last_mut()
                 .unwrap()
-                .insert(param.name.clone(), LocalVar { slot, lazy: param.lazy });
+                .insert(param.name.clone(), LocalVar { slot, lazy: param.lazy, cty });
         }
         let value = self.gen_block(&mut f, &decl.body);
-        f.ret(self, &value);
+        let ret_cty = self.info.facts.func_ret.get(&decl.name).cloned();
+        f.ret(self, &value, ret_cty.as_ref());
         self.emit_fn(&format!("@ing.fn.{}", decl.name), &params, f);
     }
 
@@ -329,7 +347,10 @@ impl<'a> Cg<'a> {
                 params.push(format!("i64 {reg}"));
                 f.evidence.insert(cap.clone(), reg);
             }
-            for param in &method.sig.params {
+            let mkey = (service.clone(), method.name.clone());
+            let param_ctys =
+                self.info.facts.method_params.get(&mkey).cloned().unwrap_or_default();
+            for (i, param) in method.sig.params.iter().enumerate() {
                 if param.lazy {
                     self.unsupported(param.span, "`lazy` parameters on service methods");
                 }
@@ -337,11 +358,14 @@ impl<'a> Cg<'a> {
                 params.push(format!("i64 {reg}"));
                 let slot = f.alloca(self, &param.name);
                 f.line(format!("store i64 {reg}, ptr {slot}"));
+                let cty = param_ctys.get(i).cloned().unwrap_or(CType::Int);
                 f.scopes
                     .last_mut()
                     .unwrap()
-                    .insert(param.name.clone(), LocalVar { slot, lazy: false });
+                    .insert(param.name.clone(), LocalVar { slot, lazy: false, cty });
             }
+            let field_ctys =
+                self.info.facts.impl_fields.get(&decl.name).cloned().unwrap_or_default();
             // Impl fields load from the instance (after the method slots).
             for (i, field) in impl_fields.iter().enumerate() {
                 let slot = f.alloca(self, field);
@@ -352,10 +376,15 @@ impl<'a> Cg<'a> {
                 let v = self.tmp();
                 f.line(format!("{v} = load i64, ptr {gep}"));
                 f.line(format!("store i64 {v}, ptr {slot}"));
-                f.scopes.last_mut().unwrap().insert(field.clone(), LocalVar { slot, lazy: false });
+                let cty = field_ctys.get(i).cloned().unwrap_or(CType::Int);
+                f.scopes
+                    .last_mut()
+                    .unwrap()
+                    .insert(field.clone(), LocalVar { slot, lazy: false, cty });
             }
             let value = self.gen_block(&mut f, &method.body);
-            f.ret(self, &value);
+            let ret_cty = self.info.facts.method_ret.get(&mkey).cloned();
+            f.ret(self, &value, ret_cty.as_ref());
             self.emit_fn(&format!("@ing.m.{}.{}", decl.name, method.name), &params, f);
         }
     }
@@ -366,6 +395,11 @@ impl<'a> Cg<'a> {
         self.functions.push_str("entry:\n");
         for a in &f.allocas {
             let _ = writeln!(self.functions, "  {a}");
+        }
+        // Pool slots are zeroed up front: a branch may skip the store that
+        // fills one, and drop glue treats 0 as "nothing to do".
+        for (slot, _) in &f.pool {
+            let _ = writeln!(self.functions, "  store i64 0, ptr {slot}");
         }
         for line in &f.body {
             if line.ends_with(':') {
@@ -395,7 +429,11 @@ impl<'a> Cg<'a> {
                     let v = self.gen_expr(f, value);
                     let slot = f.alloca(self, name);
                     f.line(format!("store i64 {v}, ptr {slot}"));
-                    f.scopes.last_mut().unwrap().insert(name.clone(), LocalVar { slot, lazy: false });
+                    let cty = self.ctype_of(value);
+                    f.scopes
+                        .last_mut()
+                        .unwrap()
+                        .insert(name.clone(), LocalVar { slot, lazy: false, cty });
                     result = "0".to_string();
                 }
                 Stmt::Acquire { service, name, name_span, .. } => {
@@ -405,7 +443,11 @@ impl<'a> Cg<'a> {
                     };
                     let slot = f.alloca(self, name);
                     f.line(format!("store i64 {ev}, ptr {slot}"));
-                    f.scopes.last_mut().unwrap().insert(name.clone(), LocalVar { slot, lazy: false });
+                    let cty = CType::Service(service.clone());
+                    f.scopes
+                        .last_mut()
+                        .unwrap()
+                        .insert(name.clone(), LocalVar { slot, lazy: false, cty });
                     result = "0".to_string();
                 }
             }
@@ -432,9 +474,14 @@ impl<'a> Cg<'a> {
                 self.store_slot(f, &ptr, 0, &items.len().to_string());
                 for (i, item) in items.iter().enumerate() {
                     let v = self.gen_expr(f, item);
+                    let icty = self.ctype_of(item);
+                    self.dup_value(f, &v, &icty);
                     self.store_slot(f, &ptr, 1 + i as i64, &v);
                 }
-                self.ptr_to_int(f, &ptr)
+                let out = self.ptr_to_int(f, &ptr);
+                let cty = self.ctype_of(expr);
+                self.pool_value(f, &out, &cty);
+                out
             }
             ExprKind::Call { callee, args } => {
                 let arg_refs: Vec<&Expr> = args.iter().collect();
@@ -484,7 +531,7 @@ impl<'a> Cg<'a> {
                 f.start_block(&dead);
                 "0".to_string()
             }
-            ExprKind::Provide { impls, body } => self.gen_provide(f, impls, body),
+            ExprKind::Provide { impls, body, .. } => self.gen_provide(f, impls, body),
             ExprKind::If { cond, then_block, else_branch } => {
                 let c = self.gen_expr(f, cond);
                 let slot = f.fresh_slot(self);
@@ -520,7 +567,7 @@ impl<'a> Cg<'a> {
             let v = self.tmp();
             f.line(format!("{v} = load i64, ptr {}", local.slot));
             if local.lazy {
-                return self.force_thunk(f, &v);
+                return self.force_thunk(f, &v, &local.cty);
             }
             return v;
         }
@@ -537,7 +584,9 @@ impl<'a> Cg<'a> {
                 }
                 let ptr = self.gen_alloc(f, 1);
                 self.store_slot(f, &ptr, 0, &vmeta.id.to_string());
-                return self.ptr_to_int(f, &ptr);
+                let out = self.ptr_to_int(f, &ptr);
+                self.pool_value(f, &out, &CType::Enum(vmeta.enum_name.clone()));
+                return out;
             }
             self.unsupported(span, "using a constructor as a value");
             return "0".to_string();
@@ -563,6 +612,20 @@ impl<'a> Cg<'a> {
         }
     }
 
+    /// The value type a `!`-row tag names (for typed-bind payloads).
+    fn ctype_of_tag(&self, tag: &str) -> CType {
+        match tag {
+            "Int" => CType::Int,
+            "Float" => CType::Float,
+            "Bool" => CType::Bool,
+            "String" => CType::Str,
+            "Duration" => CType::Duration,
+            _ if self.struct_meta.contains_key(tag) => CType::Struct(tag.to_string()),
+            _ if self.enum_simple.contains_key(tag) => CType::Enum(tag.to_string()),
+            _ => CType::Int,
+        }
+    }
+
     /// Box a failed value with its type tag and route it to the handler.
     fn emit_fail_value(&mut self, f: &mut FnCtx, v: &str, cty: &CType, span: Span) {
         let id = match Self::tag_of_ctype(cty).and_then(|t| self.tag_ids.get(t)) {
@@ -572,7 +635,11 @@ impl<'a> Cg<'a> {
                 return;
             }
         };
-        let ptr = self.gen_alloc(f, 2);
+        // The box outlives any arena scope and is deliberately never freed
+        // (it may be re-raised across functions whose pools have drained).
+        self.dup_value(f, v, &cty.clone());
+        let ptr = self.tmp();
+        f.line(format!("{ptr} = call ptr @rt_alloc_global(i64 16)"));
         self.store_slot(f, &ptr, 0, &id.to_string());
         self.store_slot(f, &ptr, 1, v);
         let err = self.ptr_to_int(f, &ptr);
@@ -580,7 +647,7 @@ impl<'a> Cg<'a> {
     }
 
     /// Force a lazy value: thunk = { fnptr, captures... }, fnptr(env) -> {v, err}.
-    fn force_thunk(&mut self, f: &mut FnCtx, thunk: &str) -> String {
+    fn force_thunk(&mut self, f: &mut FnCtx, thunk: &str, cty: &CType) -> String {
         let p = self.tmp();
         f.line(format!("{p} = inttoptr i64 {thunk} to ptr"));
         let fp_i = self.tmp();
@@ -589,7 +656,9 @@ impl<'a> Cg<'a> {
         f.line(format!("{fp} = inttoptr i64 {fp_i} to ptr"));
         let r = self.tmp();
         f.line(format!("{r} = call {{ i64, i64 }} {fp}(ptr {p})"));
-        self.check_failure(f, &r)
+        let out = self.check_failure(f, &r);
+        self.pool_value(f, &out, &cty.clone());
+        out
     }
 
     /// Extract {value, err} and branch to the failure path when err != 0.
@@ -647,13 +716,17 @@ impl<'a> Cg<'a> {
                     return v;
                 }
                 if let Some(fields) = self.struct_meta.get(name).cloned() {
-                    return self.gen_construct(f, args, None, fields.len());
+                    let out = self.gen_construct(f, args, None, fields.len());
+                    self.pool_value(f, &out.clone(), &CType::Struct(name.clone()));
+                    return out;
                 }
                 if let Some(vmeta) = self.variant_meta.get(name).cloned() {
                     if vmeta.simple {
                         return vmeta.id.to_string();
                     }
-                    return self.gen_construct(f, args, Some(vmeta.id), vmeta.fields.len());
+                    let out = self.gen_construct(f, args, Some(vmeta.id), vmeta.fields.len());
+                    self.pool_value(f, &out.clone(), &CType::Enum(vmeta.enum_name.clone()));
+                    return out;
                 }
                 if let Some(decl) = self.funcs.get(name.as_str()).copied() {
                     return self.gen_user_call(f, decl, args, span);
@@ -663,7 +736,8 @@ impl<'a> Cg<'a> {
         // Calling a function value (closure).
         let callee_v = self.gen_expr(f, callee);
         let arg_vals: Vec<String> = args.iter().map(|a| self.gen_expr(f, a)).collect();
-        self.gen_closure_call(f, &callee_v, &arg_vals)
+        let result_cty = self.ctype_of_span(span);
+        self.gen_closure_call(f, &callee_v, &arg_vals, &result_cty)
     }
 
     fn gen_user_call(
@@ -691,7 +765,7 @@ impl<'a> Cg<'a> {
             call_args.push(format!("i64 {v}"));
         }
         let name = format!("@ing.fn.{}", decl.name);
-        if fallible {
+        let out = if fallible {
             let r = self.tmp();
             f.line(format!("{r} = call {{ i64, i64 }} {name}({})", call_args.join(", ")));
             self.check_failure(f, &r)
@@ -699,7 +773,12 @@ impl<'a> Cg<'a> {
             let r = self.tmp();
             f.line(format!("{r} = call i64 {name}({})", call_args.join(", ")));
             r
-        }
+        };
+        // The callee dup'ed the result; this function owns one reference.
+        let ret_cty = self.info.facts.func_ret.get(&decl.name).cloned().unwrap_or(CType::Int);
+        self.pool_value(f, &out, &ret_cty);
+        let _ = span;
+        out
     }
 
     /// Structs are plain field tuples; boxed enum variants carry their
@@ -718,6 +797,8 @@ impl<'a> Cg<'a> {
         }
         for (i, arg) in args.iter().enumerate() {
             let v = self.gen_expr(f, arg);
+            let acty = self.ctype_of(arg);
+            self.dup_value(f, &v, &acty);
             self.store_slot(f, &ptr, (header + i) as i64, &v);
         }
         self.ptr_to_int(f, &ptr)
@@ -777,7 +858,7 @@ impl<'a> Cg<'a> {
                 f.line(format!("{fp_i} = load i64, ptr {gep}"));
                 let fp = self.tmp();
                 f.line(format!("{fp} = inttoptr i64 {fp_i} to ptr"));
-                if fallible {
+                let out = if fallible {
                     let r = self.tmp();
                     f.line(format!("{r} = call {{ i64, i64 }} {fp}({})", call_args.join(", ")));
                     self.check_failure(f, &r)
@@ -785,9 +866,18 @@ impl<'a> Cg<'a> {
                     let r = self.tmp();
                     f.line(format!("{r} = call i64 {fp}({})", call_args.join(", ")));
                     r
-                }
+                };
+                let ret_cty = self
+                    .info
+                    .facts
+                    .method_ret
+                    .get(&(service.clone(), name.to_string()))
+                    .cloned()
+                    .unwrap_or(CType::Int);
+                self.pool_value(f, &out, &ret_cty);
+                out
             }
-            CType::MutMap(k, _) => {
+            CType::MutMap(k, vc) => {
                 let m = self.gen_expr(f, recv);
                 let kind = match *k {
                     CType::Str => "str",
@@ -798,11 +888,30 @@ impl<'a> Cg<'a> {
                         let key = self.gen_expr(f, args[0]);
                         let r = self.tmp();
                         f.line(format!("{r} = call i64 @rt_map_get_{kind}(i64 {m}, i64 {key})"));
+                        // The fresh Some-box is pooled; its drop glue would
+                        // steal the map's reference to the inner value, so
+                        // take one for the box.
+                        let vcty = (*vc).clone();
+                        if self.is_rc(&vcty) {
+                            let (dup_l, done_l) = (self.label("mg.dup"), self.label("mg.done"));
+                            let c = self.tmp();
+                            f.line(format!("{c} = icmp ne i64 {r}, 0"));
+                            f.line(format!("br i1 {c}, label %{dup_l}, label %{done_l}"));
+                            f.start_block(&dup_l);
+                            let inner = self.load_slot_from_int(f, &r, 0);
+                            let t = self.tmp();
+                            f.line(format!("{t} = call i64 @rt_dup(i64 {inner})"));
+                            f.line(format!("br label %{done_l}"));
+                            f.start_block(&done_l);
+                        }
+                        self.pool_value(f, &r, &CType::Option(Box::new(vcty)));
                         r
                     }
                     "set" if args.len() == 2 => {
                         let key = self.gen_expr(f, args[0]);
                         let v = self.gen_expr(f, args[1]);
+                        let vcty = self.ctype_of(args[1]);
+                        self.dup_value(f, &v, &vcty);
                         f.line(format!("call void @rt_map_set_{kind}(i64 {m}, i64 {key}, i64 {v})"));
                         "0".to_string()
                     }
@@ -831,8 +940,12 @@ impl<'a> Cg<'a> {
 
     fn gen_field(&mut self, f: &mut FnCtx, recv: &Expr, name: &str, name_span: Span) -> String {
         let recv_ty = self.ctype_of(recv);
-        // Duration suffixes on Ints.
-        if let Some((_, factor)) = DURATION_SUFFIXES.iter().find(|(s, _)| *s == name) {
+        // Duration and size suffixes on Ints.
+        if let Some((_, factor)) = DURATION_SUFFIXES
+            .iter()
+            .chain(SIZE_SUFFIXES.iter())
+            .find(|(s, _)| *s == name)
+        {
             if recv_ty == CType::Int {
                 let v = self.gen_expr(f, recv);
                 let out = self.tmp();
@@ -899,6 +1012,7 @@ impl<'a> Cg<'a> {
                 BinOp::Add => {
                     let out = self.tmp();
                     f.line(format!("{out} = call i64 @rt_str_concat(i64 {l}, i64 {r})"));
+                    self.pool_value(f, &out, &CType::Str);
                     out
                 }
                 BinOp::Eq | BinOp::Ne => {
@@ -1041,6 +1155,7 @@ impl<'a> Cg<'a> {
                 Some(prev) => {
                     let out = self.tmp();
                     f.line(format!("{out} = call i64 @rt_str_concat(i64 {prev}, i64 {v})"));
+                    self.pool_value(f, &out, &CType::Str);
                     out
                 }
             });
@@ -1064,6 +1179,7 @@ impl<'a> Cg<'a> {
         };
         let out = self.tmp();
         f.line(format!("{out} = call i64 @{call}(i64 {v})"));
+        self.pool_value(f, &out, &CType::Str);
         out
     }
 
@@ -1178,7 +1294,8 @@ impl<'a> Cg<'a> {
                 if !tag_test(self, f, ty, &bind_l) {
                     return;
                 }
-                self.bind_local(f, name, payload);
+                let cty = self.ctype_of_tag(ty);
+                self.bind_local_typed(f, name, payload, cty);
                 f.line(format!("br label %{ok}"));
             }
             PatternKind::Int(n) => {
@@ -1222,12 +1339,16 @@ impl<'a> Cg<'a> {
     }
 
     fn bind_local(&mut self, f: &mut FnCtx, name: &str, value: &str) {
+        self.bind_local_typed(f, name, value, CType::Int);
+    }
+
+    fn bind_local_typed(&mut self, f: &mut FnCtx, name: &str, value: &str, cty: CType) {
         let s = f.alloca(self, name);
         f.line(format!("store i64 {value}, ptr {s}"));
         f.scopes
             .last_mut()
             .unwrap()
-            .insert(name.to_string(), LocalVar { slot: s, lazy: false });
+            .insert(name.to_string(), LocalVar { slot: s, lazy: false, cty });
     }
 
     /// Destructure a struct/variant pattern's bindings. `header` is the
@@ -1305,9 +1426,7 @@ impl<'a> Cg<'a> {
         match &pat.kind {
             PatternKind::Wildcard => f.line(format!("br label %{ok}")),
             PatternKind::Bind(name) => {
-                let s = f.alloca(self, name);
-                f.line(format!("store i64 {v}, ptr {s}"));
-                f.scopes.last_mut().unwrap().insert(name.clone(), LocalVar { slot: s, lazy: false });
+                self.bind_local_typed(f, name, v, vty.clone());
                 f.line(format!("br label %{ok}"));
             }
             PatternKind::Int(n) => {
@@ -1426,11 +1545,24 @@ impl<'a> Cg<'a> {
 
     // ---- provide -----------------------------------------------------------------------------
 
-    fn gen_provide(&mut self, f: &mut FnCtx, impls: &[(String, Span)], body: &Block) -> String {
+    fn gen_provide(&mut self, f: &mut FnCtx, impls: &[ProvideItem], body: &Block) -> String {
         let saved = f.evidence.clone();
-        for (name, span) in impls {
+        let mut arenas = 0usize;
+        for item in impls {
+            if item.name == "Arena" {
+                // Push a region; allocations in the dynamic extent of the
+                // body come from it and are freed wholesale at scope end.
+                let size = match item.args.as_deref() {
+                    Some([arg]) => self.gen_expr(f, arg),
+                    _ => "0".to_string(),
+                };
+                f.line(format!("call void @rt_arena_push(i64 {size})"));
+                arenas += 1;
+                continue;
+            }
+            let name = &item.name;
             let Some(meta) = self.impls.get(name.as_str()) else {
-                self.unsupported(*span, "this implementation");
+                self.unsupported(item.name_span, "this implementation");
                 continue;
             };
             let decl = meta.decl;
@@ -1448,18 +1580,50 @@ impl<'a> Cg<'a> {
             f.scopes.push(HashMap::new());
             for (i, (fname, _, init)) in decl.fields.iter().enumerate() {
                 let v = self.gen_expr(f, init);
+                let fcty = self.ctype_of(init);
+                self.dup_value(f, &v, &fcty);
                 self.store_slot(f, &ptr, (methods.len() + i) as i64, &v);
                 let s = f.alloca(self, fname);
                 f.line(format!("store i64 {v}, ptr {s}"));
-                f.scopes.last_mut().unwrap().insert(fname.clone(), LocalVar { slot: s, lazy: false });
+                f.scopes
+                    .last_mut()
+                    .unwrap()
+                    .insert(fname.clone(), LocalVar { slot: s, lazy: false, cty: fcty });
             }
             f.scopes.pop();
             let inst = self.ptr_to_int(f, &ptr);
             f.evidence.insert(service, inst);
         }
+        if arenas == 0 {
+            let v = self.gen_block(f, body);
+            f.evidence = saved;
+            return v;
+        }
+        // Failures inside the body must pop the region(s) before propagating
+        // so the arena stack stays balanced.
+        let cleanup = self.label("arena.unwind");
+        let done = self.label("arena.done");
+        let slot = f.fresh_slot(self);
+        f.handlers.push(cleanup.clone());
         let v = self.gen_block(f, body);
+        f.handlers.pop();
+        f.line(format!("store i64 {v}, ptr {slot}"));
+        for _ in 0..arenas {
+            f.line("call void @rt_arena_pop()".to_string());
+        }
+        f.line(format!("br label %{done}"));
+        f.start_block(&cleanup);
+        for _ in 0..arenas {
+            f.line("call void @rt_arena_pop()".to_string());
+        }
+        let err = self.tmp();
+        f.line(format!("{err} = load i64, ptr %err.slot"));
+        self.emit_failure(f, &err);
+        f.start_block(&done);
         f.evidence = saved;
-        v
+        let out = self.tmp();
+        f.line(format!("{out} = load i64, ptr {slot}"));
+        out
     }
 
     // ---- closures and thunks --------------------------------------------------------------------
@@ -1487,6 +1651,10 @@ impl<'a> Cg<'a> {
         });
         let evidence: Vec<(String, String)> =
             f.evidence.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let capture_ctys: Vec<CType> = captured
+            .iter()
+            .map(|name| f.lookup(name).map(|l| l.cty).unwrap_or(CType::Int))
+            .collect();
 
         // Build the closure body as a fresh function.
         self.label += 1;
@@ -1508,7 +1676,7 @@ impl<'a> Cg<'a> {
                 .scopes
                 .last_mut()
                 .unwrap()
-                .insert(name.clone(), LocalVar { slot, lazy: false });
+                .insert(name.clone(), LocalVar { slot, lazy: false, cty: capture_ctys[i].clone() });
         }
         for (i, (service, _)) in evidence.iter().enumerate() {
             let gep = self.tmp();
@@ -1527,28 +1695,41 @@ impl<'a> Cg<'a> {
                 .scopes
                 .last_mut()
                 .unwrap()
-                .insert(p.name.clone(), LocalVar { slot, lazy: false });
+                .insert(p.name.clone(), LocalVar { slot, lazy: false, cty: CType::Int });
         }
         let v = self.gen_expr(&mut inner, body);
-        inner.ret(self, &v);
+        let body_cty = self.ctype_of(body);
+        inner.ret(self, &v, Some(&body_cty));
         self.emit_fn(&fn_name, &inner_params, inner);
 
-        // Allocate the closure record at the creation site.
+        // Allocate the closure record at the creation site. Captured heap
+        // values are dup'ed — the record owns its references (released only
+        // when closures gain their own drop glue; a known leak).
         let ptr = self.gen_alloc(f, (1 + captured.len() + evidence.len()) as i64);
         self.store_slot(f, &ptr, 0, &format!("ptrtoint (ptr {fn_name} to i64)"));
         for (i, name) in captured.iter().enumerate() {
             let local = f.lookup(name).unwrap();
             let v = self.tmp();
             f.line(format!("{v} = load i64, ptr {}", local.slot));
+            let cty = capture_ctys[i].clone();
+            self.dup_value(f, &v, &cty);
             self.store_slot(f, &ptr, 1 + i as i64, &v);
         }
         for (i, (_, ev)) in evidence.iter().enumerate() {
             self.store_slot(f, &ptr, (1 + captured.len() + i) as i64, ev);
         }
-        self.ptr_to_int(f, &ptr)
+        let out = self.ptr_to_int(f, &ptr);
+        self.pool_value(f, &out, &CType::Func);
+        out
     }
 
-    fn gen_closure_call(&mut self, f: &mut FnCtx, closure: &str, args: &[String]) -> String {
+    fn gen_closure_call(
+        &mut self,
+        f: &mut FnCtx,
+        closure: &str,
+        args: &[String],
+        result_cty: &CType,
+    ) -> String {
         let p = self.tmp();
         f.line(format!("{p} = inttoptr i64 {closure} to ptr"));
         let fp_i = self.tmp();
@@ -1561,7 +1742,9 @@ impl<'a> Cg<'a> {
         }
         let r = self.tmp();
         f.line(format!("{r} = call {{ i64, i64 }} {fp}({})", call_args.join(", ")));
-        self.check_failure(f, &r)
+        let out = self.check_failure(f, &r);
+        self.pool_value(f, &out, &result_cty.clone());
+        out
     }
 
     // ---- builtins -----------------------------------------------------------------------------
@@ -1580,7 +1763,9 @@ impl<'a> Cg<'a> {
         self.store_slot(f, &ptr, 0, &kind.to_string());
         self.store_slot(f, &ptr, 1, &base);
         self.store_slot(f, &ptr, 2, "-1");
-        self.ptr_to_int(f, &ptr)
+        let out = self.ptr_to_int(f, &ptr);
+        self.pool_value(f, &out, &CType::Schedule);
+        out
     }
 
     /// The graphics module: thin calls into the GL-backed runtime. `run`
@@ -1648,8 +1833,10 @@ impl<'a> Cg<'a> {
                             let space = self.str_const(" ");
                             let t1 = self.tmp();
                             f.line(format!("{t1} = call i64 @rt_str_concat(i64 {prev}, i64 {space})"));
+                            self.pool_value(f, &t1, &CType::Str);
                             let t2 = self.tmp();
                             f.line(format!("{t2} = call i64 @rt_str_concat(i64 {t1}, i64 {s})"));
+                            self.pool_value(f, &t2, &CType::Str);
                             t2
                         }
                     });
@@ -1667,8 +1854,10 @@ impl<'a> Cg<'a> {
                     let q = self.str_const("\"");
                     let t1 = self.tmp();
                     f.line(format!("{t1} = call i64 @rt_str_concat(i64 {q}, i64 {v})"));
+                    self.pool_value(f, &t1, &CType::Str);
                     let t2 = self.tmp();
                     f.line(format!("{t2} = call i64 @rt_str_concat(i64 {t1}, i64 {q})"));
+                    self.pool_value(f, &t2, &CType::Str);
                     t2
                 } else {
                     self.to_display_str(f, &v, &cty, span)
@@ -1703,9 +1892,13 @@ impl<'a> Cg<'a> {
             }
             "Some" if args.len() == 1 => {
                 let v = self.gen_expr(f, args[0]);
+                let icty = self.ctype_of(args[0]);
+                self.dup_value(f, &v, &icty);
                 let ptr = self.gen_alloc(f, 1);
                 self.store_slot(f, &ptr, 0, &v);
-                self.ptr_to_int(f, &ptr)
+                let out = self.ptr_to_int(f, &ptr);
+                self.pool_value(f, &out, &CType::Option(Box::new(icty)));
+                out
             }
             "getOrElse" if args.len() == 2 => {
                 // Fusion: `map.get(k) |> getOrElse(simple)` probes the map
@@ -1722,6 +1915,14 @@ impl<'a> Cg<'a> {
                             f.line(format!(
                                 "{out} = call i64 @rt_map_get_or_{kind}(i64 {m}, i64 {key}, i64 {d})"
                             ));
+                            // Own the result (map value or default alike),
+                            // then let the pool release it.
+                            let rcty = self.ctype_of_span(span);
+                            if self.is_rc(&rcty) {
+                                let t = self.tmp();
+                                f.line(format!("{t} = call i64 @rt_dup(i64 {out})"));
+                                self.pool_value(f, &out, &rcty);
+                            }
                             return Some(out);
                         }
                     }
@@ -1781,7 +1982,9 @@ impl<'a> Cg<'a> {
                 self.store_slot(f, &ptr, 0, &kind);
                 self.store_slot(f, &ptr, 1, &base);
                 self.store_slot(f, &ptr, 2, &n);
-                self.ptr_to_int(f, &ptr)
+                let out = self.ptr_to_int(f, &ptr);
+                self.pool_value(f, &out, &CType::Schedule);
+                out
             }
             "sleep" if args.len() == 1 => {
                 let v = self.gen_expr(f, args[0]);
@@ -1802,6 +2005,7 @@ impl<'a> Cg<'a> {
                 let n = self.gen_expr(f, args[0]);
                 let out = self.tmp();
                 f.line(format!("{out} = call i64 @rt_range(i64 {n})"));
+                self.pool_value(f, &out, &CType::List(Box::new(CType::Int)));
                 out
             }
             "random" if args.len() == 1 => {
@@ -1933,6 +2137,11 @@ impl<'a> Cg<'a> {
         let container_ty = self.ctype_of(args[0]);
         let container = self.gen_expr(f, args[0]);
         let func = self.gen_expr(f, args[1]);
+        let result_cty = self.ctype_of_span(span);
+        let elem_cty = match &result_cty {
+            CType::List(t) | CType::Option(t) => (**t).clone(),
+            _ => CType::Int,
+        };
         match container_ty {
             CType::List(_) => {
                 let n = self.load_slot_from_int(f, &container, 0);
@@ -1963,7 +2172,8 @@ impl<'a> Cg<'a> {
                 f.line(format!("{gep} = getelementptr i64, ptr {src_p}, i64 {idx1}"));
                 let item = self.tmp();
                 f.line(format!("{item} = load i64, ptr {gep}"));
-                let mapped = self.gen_closure_call(f, &func, &[item]);
+                let mapped = self.gen_closure_call(f, &func, &[item], &elem_cty);
+                self.dup_value(f, &mapped, &elem_cty.clone());
                 let ogep = self.tmp();
                 f.line(format!("{ogep} = getelementptr i64, ptr {out_p}, i64 {idx1}"));
                 f.line(format!("store i64 {mapped}, ptr {ogep}"));
@@ -1972,7 +2182,9 @@ impl<'a> Cg<'a> {
                 f.line(format!("store i64 {next}, ptr {i_slot}"));
                 f.line(format!("br label %{loop_l}"));
                 f.start_block(&done);
-                self.ptr_to_int(f, &out_p)
+                let out = self.ptr_to_int(f, &out_p);
+                self.pool_value(f, &out, &result_cty);
+                out
             }
             CType::Option(_) => {
                 let slot = f.fresh_slot(self);
@@ -1983,10 +2195,12 @@ impl<'a> Cg<'a> {
                 f.line(format!("br i1 {c}, label %{some_l}, label %{cont}"));
                 f.start_block(&some_l);
                 let inner = self.load_slot_from_int(f, &container, 0);
-                let mapped = self.gen_closure_call(f, &func, &[inner]);
+                let mapped = self.gen_closure_call(f, &func, &[inner], &elem_cty);
+                self.dup_value(f, &mapped, &elem_cty.clone());
                 let boxed = self.gen_alloc(f, 1);
                 self.store_slot(f, &boxed, 0, &mapped);
                 let bi = self.ptr_to_int(f, &boxed);
+                self.pool_value(f, &bi, &result_cty);
                 f.line(format!("store i64 {bi}, ptr {slot}"));
                 f.line(format!("br label %{cont}"));
                 f.start_block(&cont);
@@ -2031,6 +2245,207 @@ impl<'a> Cg<'a> {
         f.line(format!("{out} = ptrtoint ptr {ptr_reg} to i64"));
         out
     }
+
+    // ---- reference counting -----------------------------------------------------------------
+    //
+    // Perceus-style ARC with function-scoped reclamation: every fresh heap
+    // value is registered in the function's pool (an alloca holding it plus
+    // its type's drop glue) and released when the function returns; values
+    // stored into longer-lived objects are dup'ed at the store. Refcounts
+    // are non-atomic; statics and arena objects are skipped by the runtime.
+
+    fn ctype_of_span(&self, span: Span) -> CType {
+        self.info.expr_types.get(&(span.start, span.end)).cloned().unwrap_or(CType::Int)
+    }
+
+    /// Canonical key for memoizing drop glue per type shape.
+    fn ckey(cty: &CType) -> String {
+        match cty {
+            CType::Int => "i".into(),
+            CType::Float => "f".into(),
+            CType::Bool => "b".into(),
+            CType::Str => "s".into(),
+            CType::Unit => "u".into(),
+            CType::Duration => "d".into(),
+            CType::Schedule => "h".into(),
+            CType::Option(t) => format!("o{}", Self::ckey(t)),
+            CType::List(t) => format!("l{}", Self::ckey(t)),
+            CType::Struct(n) => format!("S{n}"),
+            CType::Enum(n) => format!("E{n}"),
+            CType::Service(n) => format!("V{n}"),
+            CType::Tag(n) => format!("T{n}"),
+            CType::MutMap(..) => "M".into(),
+            CType::Func => "F".into(),
+        }
+    }
+
+    fn is_rc(&mut self, cty: &CType) -> bool {
+        self.drop_fn(cty).is_some()
+    }
+
+    /// Bump a refcount when a heap-shaped value is stored into something
+    /// that outlives the current statement.
+    fn dup_value(&mut self, f: &mut FnCtx, v: &str, cty: &CType) {
+        if self.is_rc(cty) {
+            let t = self.tmp();
+            f.line(format!("{t} = call i64 @rt_dup(i64 {v})"));
+        }
+    }
+
+    /// Register a fresh (owned) heap value in the function's pool; it is
+    /// released when the function returns.
+    fn pool_value(&mut self, f: &mut FnCtx, v: &str, cty: &CType) {
+        if let Some(sym) = self.drop_fn(cty) {
+            let slot = f.fresh_slot(self);
+            f.line(format!("store i64 {v}, ptr {slot}"));
+            f.pool.push((slot, sym));
+        }
+    }
+
+    /// The drop-glue symbol for a type, or None for non-refcounted types.
+    /// Glue releases one reference; on reaching zero it releases heap-typed
+    /// children and frees the object. Composite types always get their own
+    /// glue (memoized before recursing, so cyclic types terminate).
+    fn drop_fn(&mut self, cty: &CType) -> Option<String> {
+        match cty {
+            CType::Int
+            | CType::Float
+            | CType::Bool
+            | CType::Unit
+            | CType::Duration
+            | CType::Tag(_)
+            | CType::Service(_)
+            | CType::MutMap(..) => None,
+            CType::Enum(n) if self.enum_simple.get(n).copied().unwrap_or(true) => None,
+            CType::Str | CType::Schedule | CType::Func => Some(self.leaf_drop()),
+            CType::Option(inner) => {
+                let key = Self::ckey(cty);
+                if let Some(sym) = self.drop_syms.get(&key) {
+                    return Some(sym.clone());
+                }
+                let sym = format!("@ing.drop.{}", self.drop_syms.len());
+                self.drop_syms.insert(key, sym.clone());
+                let child = self.drop_fn(inner);
+                let mut body = String::new();
+                if let Some(child) = child {
+                    body.push_str("  %p = inttoptr i64 %v to ptr\n  %iv = load i64, ptr %p\n");
+                    let _ = writeln!(body, "  call void {child}(i64 %iv)");
+                }
+                self.emit_drop_glue(&sym, &body);
+                Some(sym)
+            }
+            CType::List(inner) => {
+                let key = Self::ckey(cty);
+                if let Some(sym) = self.drop_syms.get(&key) {
+                    return Some(sym.clone());
+                }
+                let sym = format!("@ing.drop.{}", self.drop_syms.len());
+                self.drop_syms.insert(key, sym.clone());
+                match self.drop_fn(inner) {
+                    Some(child) => self.emit_list_drop_glue(&sym, &child),
+                    None => self.emit_drop_glue(&sym, ""),
+                }
+                Some(sym)
+            }
+            CType::Struct(n) => {
+                let key = Self::ckey(cty);
+                if let Some(sym) = self.drop_syms.get(&key) {
+                    return Some(sym.clone());
+                }
+                let sym = format!("@ing.drop.{}", self.drop_syms.len());
+                self.drop_syms.insert(key, sym.clone());
+                let fields = self.info.facts.struct_fields.get(n).cloned().unwrap_or_default();
+                let mut body = String::new();
+                let mut loaded = false;
+                for (i, fcty) in fields.iter().enumerate() {
+                    if let Some(child) = self.drop_fn(fcty) {
+                        if !loaded {
+                            body.push_str("  %p = inttoptr i64 %v to ptr\n");
+                            loaded = true;
+                        }
+                        let _ = writeln!(
+                            body,
+                            "  %f{i}.p = getelementptr i64, ptr %p, i64 {i}\n  %f{i} = load i64, ptr %f{i}.p\n  call void {child}(i64 %f{i})"
+                        );
+                    }
+                }
+                self.emit_drop_glue(&sym, &body);
+                Some(sym)
+            }
+            CType::Enum(n) => {
+                let key = Self::ckey(cty);
+                if let Some(sym) = self.drop_syms.get(&key) {
+                    return Some(sym.clone());
+                }
+                let sym = format!("@ing.drop.{}", self.drop_syms.len());
+                self.drop_syms.insert(key, sym.clone());
+                let variants = self.info.facts.enum_variants.get(n).cloned().unwrap_or_default();
+                // Variants with heap fields get a switch case; others fall
+                // straight through to the free.
+                let mut cases = String::new();
+                let mut blocks = String::new();
+                for (vid, (vname, fields)) in variants.iter().enumerate() {
+                    let mut decs = String::new();
+                    for (i, fcty) in fields.iter().enumerate() {
+                        if let Some(child) = self.drop_fn(fcty) {
+                            let off = 1 + i;
+                            let _ = writeln!(
+                                decs,
+                                "  %{vname}.f{i}.p = getelementptr i64, ptr %p, i64 {off}\n  %{vname}.f{i} = load i64, ptr %{vname}.f{i}.p\n  call void {child}(i64 %{vname}.f{i})"
+                            );
+                        }
+                    }
+                    if !decs.is_empty() {
+                        let _ = writeln!(cases, "    i64 {vid}, label %v{vid}");
+                        let _ = writeln!(blocks, "v{vid}:\n{decs}  br label %free.go");
+                    }
+                }
+                let body = if cases.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "  %p = inttoptr i64 %v to ptr\n  %vid = load i64, ptr %p\n  switch i64 %vid, label %free.go [\n{cases}  ]\n{blocks}"
+                    )
+                };
+                if cases.is_empty() {
+                    self.emit_drop_glue(&sym, &body);
+                } else {
+                    // Bodies with a switch need the explicit free.go join.
+                    let _ = writeln!(
+                        self.functions,
+                        "define void {sym}(i64 %v) {{\nentry:\n  %dead = call i64 @rt_release(i64 %v)\n  %c = icmp ne i64 %dead, 0\n  br i1 %c, label %free, label %done\nfree:\n{body}\nfree.go:\n  call void @rt_free(i64 %v)\n  br label %done\ndone:\n  ret void\n}}\n"
+                    );
+                }
+                Some(sym)
+            }
+        }
+    }
+
+    fn leaf_drop(&mut self) -> String {
+        if let Some(sym) = self.drop_syms.get("leaf") {
+            return sym.clone();
+        }
+        let sym = "@ing.drop.leaf".to_string();
+        self.drop_syms.insert("leaf".into(), sym.clone());
+        self.emit_drop_glue(&sym, "");
+        sym
+    }
+
+    /// Standard glue shape: release; if the count hit zero run `free_body`
+    /// (child releases) and free the object.
+    fn emit_drop_glue(&mut self, sym: &str, free_body: &str) {
+        let _ = writeln!(
+            self.functions,
+            "define void {sym}(i64 %v) {{\nentry:\n  %dead = call i64 @rt_release(i64 %v)\n  %c = icmp ne i64 %dead, 0\n  br i1 %c, label %free, label %done\nfree:\n{free_body}  call void @rt_free(i64 %v)\n  br label %done\ndone:\n  ret void\n}}\n"
+        );
+    }
+
+    fn emit_list_drop_glue(&mut self, sym: &str, child: &str) {
+        let _ = writeln!(
+            self.functions,
+            "define void {sym}(i64 %v) {{\nentry:\n  %i.slot = alloca i64\n  %dead = call i64 @rt_release(i64 %v)\n  %c = icmp ne i64 %dead, 0\n  br i1 %c, label %head, label %done\nhead:\n  %p = inttoptr i64 %v to ptr\n  %n = load i64, ptr %p\n  store i64 0, ptr %i.slot\n  br label %loop\nloop:\n  %i = load i64, ptr %i.slot\n  %lt = icmp slt i64 %i, %n\n  br i1 %lt, label %body, label %free\nbody:\n  %i1 = add i64 %i, 1\n  %gep = getelementptr i64, ptr %p, i64 %i1\n  %e = load i64, ptr %gep\n  call void {child}(i64 %e)\n  store i64 %i1, ptr %i.slot\n  br label %loop\nfree:\n  call void @rt_free(i64 %v)\n  br label %done\ndone:\n  ret void\n}}\n"
+        );
+    }
 }
 
 // ---- per-function emission context -----------------------------------------------
@@ -2039,6 +2454,8 @@ impl<'a> Cg<'a> {
 struct LocalVar {
     slot: String,
     lazy: bool,
+    /// Static type, when known — drives refcount ops at capture sites.
+    cty: CType,
 }
 
 struct FnCtx {
@@ -2047,6 +2464,10 @@ struct FnCtx {
     scopes: Vec<HashMap<String, LocalVar>>,
     evidence: HashMap<String, String>,
     handlers: Vec<String>,
+    /// Fresh heap values owned by this function: (slot, drop glue symbol).
+    /// Slots are zeroed at entry (branches may skip the producing store)
+    /// and drained — dropped — on every return path.
+    pool: Vec<(String, String)>,
     fallible: bool,
     needs_propagate: bool,
     needs_panic: bool,
@@ -2061,6 +2482,7 @@ impl FnCtx {
             scopes: vec![HashMap::new()],
             evidence: HashMap::new(),
             handlers: Vec::new(),
+            pool: Vec::new(),
             fallible,
             needs_propagate: false,
             needs_panic: false,
@@ -2068,6 +2490,16 @@ impl FnCtx {
         };
         ctx.allocas.push("%err.slot = alloca i64".to_string());
         ctx
+    }
+
+    /// Release every pooled value (the function is about to return).
+    fn drain_pool(&mut self, cg: &mut Cg) {
+        let pool = self.pool.clone();
+        for (slot, sym) in pool {
+            let v = cg.tmp();
+            self.line(format!("{v} = load i64, ptr {slot}"));
+            self.line(format!("call void {sym}(i64 {v})"));
+        }
     }
 
     fn line(&mut self, s: String) {
@@ -2100,8 +2532,17 @@ impl FnCtx {
         self.alloca(cg, "tmp")
     }
 
-    /// Final return + the propagate/panic epilogue blocks if needed.
-    fn ret(&mut self, cg: &mut Cg, value: &str) {
+    /// Final return + the propagate/panic epilogue blocks if needed. A
+    /// heap-shaped result is dup'ed before the pool drains so the caller
+    /// receives an owned reference.
+    fn ret(&mut self, cg: &mut Cg, value: &str, ret_cty: Option<&CType>) {
+        if let Some(cty) = ret_cty {
+            if cg.is_rc(cty) {
+                let t = cg.tmp();
+                self.line(format!("{t} = call i64 @rt_dup(i64 {value})"));
+            }
+        }
+        self.drain_pool(cg);
         if self.fallible {
             let a = cg.tmp();
             self.line(format!("{a} = insertvalue {{ i64, i64 }} undef, i64 {value}, 0"));
@@ -2115,6 +2556,7 @@ impl FnCtx {
             self.start_block("propagate");
             let e = cg.tmp();
             self.line(format!("{e} = load i64, ptr %err.slot"));
+            self.drain_pool(cg);
             let a = cg.tmp();
             self.line(format!("{a} = insertvalue {{ i64, i64 }} undef, i64 0, 0"));
             let b = cg.tmp();
@@ -2235,6 +2677,12 @@ declare void @rt_map_set_str(i64, i64, i64)
 declare i64 @rt_map_get_str(i64, i64)
 declare void @rt_map_del_str(i64, i64)
 declare i64 @rt_map_size(i64)
+declare void @rt_arena_push(i64)
+declare void @rt_arena_pop()
+declare ptr @rt_alloc_global(i64)
+declare i64 @rt_dup(i64)
+declare i64 @rt_release(i64)
+declare void @rt_free(i64)
 declare i64 @rt_range(i64)
 declare i64 @rt_random(i64)
 declare void @rt_gfx_run(i64, i64, i64, i64)

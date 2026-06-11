@@ -171,12 +171,24 @@ pub enum ExprKind {
     Match { scrutinee: Box<Expr>, arms: Vec<Arm> },
     /// `fail UserNotFound(id)`
     Fail { error: Box<Expr> },
-    /// `provide consoleLogger, memoryCache { body }`
-    Provide { impls: Vec<(String, Span)>, body: Block },
+    /// `provide consoleLogger, memoryCache { body }`, or the braceless
+    /// statement form whose body is the rest of the enclosing block
+    /// (`inline`). Items scope left to right: later items' field
+    /// initializers see the services provided before them.
+    Provide { impls: Vec<ProvideItem>, body: Block, inline: bool },
     If { cond: Box<Expr>, then_block: Block, else_branch: Option<Box<Expr>> },
     Block(Block),
     /// `(x, y) -> expr`
     Lambda { params: Vec<Param>, body: Box<Expr> },
+}
+
+/// One item of a `provide` list: an implementation name, or a configured
+/// builtin resource like `Arena(256.kb)`.
+#[derive(Debug)]
+pub struct ProvideItem {
+    pub name: String,
+    pub name_span: Span,
+    pub args: Option<Vec<Expr>>,
 }
 
 #[derive(Debug)]

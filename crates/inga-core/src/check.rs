@@ -2939,29 +2939,61 @@ impl<'a> Checker<'a> {
         let (body_ty, mut rows) = self.with_rows(|s| s.check_block(body));
         rows.caps.retain(|c| !provided.contains(c));
         self.merge_rows(&rows);
-        // An arena is freed when the scope ends; a heap-shaped result would
-        // escape it. Until copy-out lands, require a scalar result.
+        // An arena is freed when the scope ends; the scope's value is
+        // deep-copied out first. Only plain data can be copied — functions
+        // and mutable maps are shared by reference and would dangle.
         if has_arena {
-            match self.ctx.resolve(&body_ty) {
-                Type::Int
-                | Type::Float
-                | Type::Bool
-                | Type::Unit
-                | Type::Duration
-                | Type::Var(_)
-                | Type::Unknown => {}
-                other => {
-                    let rendered = self.render(&other);
-                    self.error(
-                        last_span(body),
-                        format!(
-                            "the value of an `Arena` scope must not escape it: this scope produces {rendered} (return a scalar, or move the consumer inside the scope)"
-                        ),
-                    );
-                }
+            let mut seen = std::collections::HashSet::new();
+            if !self.arena_copyable(&body_ty, &mut seen) {
+                let rendered = self.render(&self.ctx.resolve(&body_ty));
+                self.error(
+                    last_span(body),
+                    format!(
+                        "the value of an `Arena` scope is copied out when the scope ends, but {rendered} contains a function or mutable map, which cannot be copied (return plain data, or move the consumer inside the scope)"
+                    ),
+                );
             }
         }
         body_ty
+    }
+
+    /// Can a value of this type be deep-copied out of an arena region?
+    /// Functions and mutable maps are shared by reference, so a copy of a
+    /// value containing one would still point into the freed region.
+    fn arena_copyable(&self, ty: &Type, seen: &mut std::collections::HashSet<String>) -> bool {
+        match self.ctx.resolve(ty) {
+            Type::Func(_) | Type::Service(_) | Type::MutMap(..) => false,
+            Type::Option(t) | Type::List(t) => self.arena_copyable(&t, seen),
+            Type::Tuple(ts) => ts.iter().all(|t| self.arena_copyable(t, seen)),
+            Type::Named(n) => {
+                if !seen.insert(n.clone()) {
+                    return true; // recursive type: already being checked
+                }
+                match self.structs.get(&n) {
+                    Some(info) => {
+                        let fields = info.fields.clone();
+                        fields.iter().all(|(_, t)| self.arena_copyable(t, seen))
+                    }
+                    None => true,
+                }
+            }
+            Type::Enum(n) => {
+                if !seen.insert(n.clone()) {
+                    return true;
+                }
+                match self.enums.get(&n) {
+                    Some(info) => {
+                        let variants = info.variants.clone();
+                        variants
+                            .iter()
+                            .all(|(_, fs)| fs.iter().all(|(_, t)| self.arena_copyable(t, seen)))
+                    }
+                    None => true,
+                }
+            }
+            // Task payloads live on the task's own heap, never in a region.
+            _ => true,
+        }
     }
 
     // ---- binary ---------------------------------------------------------------------

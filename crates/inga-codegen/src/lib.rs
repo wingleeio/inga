@@ -611,7 +611,9 @@ impl<'a> Cg<'a> {
                 f.start_block(&dead);
                 "0".to_string()
             }
-            ExprKind::Provide { impls, body, .. } => self.gen_provide(f, impls, body),
+            ExprKind::Provide { impls, body, .. } => {
+                self.gen_provide(f, impls, body, expr.span)
+            }
             ExprKind::If { cond, then_block, else_branch } => {
                 let c = self.gen_expr(f, cond);
                 let slot = f.fresh_slot(self);
@@ -1817,7 +1819,13 @@ impl<'a> Cg<'a> {
 
     // ---- provide -----------------------------------------------------------------------------
 
-    fn gen_provide(&mut self, f: &mut FnCtx, impls: &[ProvideItem], body: &Block) -> String {
+    fn gen_provide(
+        &mut self,
+        f: &mut FnCtx,
+        impls: &[ProvideItem],
+        body: &Block,
+        span: Span,
+    ) -> String {
         let saved = f.evidence.clone();
         let mut arenas = 0usize;
         for item in impls {
@@ -1877,11 +1885,33 @@ impl<'a> Cg<'a> {
         let done = self.label("arena.done");
         let slot = f.fresh_slot(self);
         f.handlers.push(cleanup.clone());
+        // Everything allocated in the scope's dynamic extent comes from the
+        // region; pooled drops would read freed headers after the pop, and
+        // the wholesale free covers them anyway.
+        let pool_mark = f.pool.len();
+        f.arena_depth += 1;
         let v = self.gen_block(f, body);
+        f.arena_depth -= 1;
+        f.pool.truncate(pool_mark);
         f.handlers.pop();
-        f.line(format!("store i64 {v}, ptr {slot}"));
-        for _ in 0..arenas {
-            f.line("call void @rt_arena_pop()".to_string());
+        // Heap-shaped results are deep-copied past each region before it is
+        // freed (the checker has already rejected uncopyable types).
+        let result_cty = self.ctype_of_span(span);
+        let needs_copy = result_cty != CType::Func && self.is_rc(&result_cty);
+        if needs_copy {
+            let desc = self.desc_const(&result_cty.clone());
+            let mut cur = v;
+            for _ in 0..arenas {
+                let next = self.tmp();
+                f.line(format!("{next} = call i64 @rt_arena_copy_out(i64 {cur}, i64 {desc})"));
+                cur = next;
+            }
+            f.line(format!("store i64 {cur}, ptr {slot}"));
+        } else {
+            f.line(format!("store i64 {v}, ptr {slot}"));
+            for _ in 0..arenas {
+                f.line("call void @rt_arena_pop()".to_string());
+            }
         }
         f.line(format!("br label %{done}"));
         f.start_block(&cleanup);
@@ -1895,6 +1925,12 @@ impl<'a> Cg<'a> {
         f.evidence = saved;
         let out = self.tmp();
         f.line(format!("{out} = load i64, ptr {slot}"));
+        // The copy is a fresh value owned by this function — unless this
+        // scope sits inside another arena scope of the same function, in
+        // which case the copy lives in that region and is freed with it.
+        if needs_copy && f.arena_depth == 0 {
+            self.pool_value(f, &out, &result_cty);
+        }
         out
     }
 
@@ -3227,6 +3263,9 @@ struct FnCtx {
     needs_propagate: bool,
     needs_panic: bool,
     slot_counter: u32,
+    /// Arena scopes currently open in this function's body. Values pooled
+    /// inside one are region-allocated and freed wholesale, never dropped.
+    arena_depth: usize,
 }
 
 impl FnCtx {
@@ -3243,6 +3282,7 @@ impl FnCtx {
             fallible,
             needs_propagate: false,
             needs_panic: false,
+            arena_depth: 0,
             slot_counter: 0,
         };
         ctx.allocas.push("%err.slot = alloca i64".to_string());
@@ -3442,6 +3482,7 @@ declare void @rt_map_del_str(i64, i64)
 declare i64 @rt_map_size(i64)
 declare void @rt_arena_push(i64)
 declare void @rt_arena_pop()
+declare i64 @rt_arena_copy_out(i64, i64)
 declare ptr @rt_alloc_global(i64)
 declare i64 @rt_dup(i64)
 declare i64 @rt_release(i64)

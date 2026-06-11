@@ -1493,6 +1493,23 @@ pub extern "C" fn rt_copy_desc(v: i64, desc: i64) -> i64 {
     copy_desc(v, &mut Desc::new(&d))
 }
 
+/// Carry an arena scope's result past the region it lives in: pop the
+/// innermost region off the stack (keeping its memory alive), deep-copy the
+/// value — the copy now allocates from the enclosing region or the RC
+/// heap — then free the region wholesale.
+#[no_mangle]
+pub extern "C" fn rt_arena_copy_out(v: i64, desc: i64) -> i64 {
+    let d = unsafe { std::str::from_utf8_unchecked(str_bytes(desc)) }.to_string();
+    let Some(region) = rt().regions.pop() else { return v };
+    let copied = copy_desc(v, &mut Desc::new(&d));
+    unsafe {
+        for (base, cap) in region.chunks {
+            std::alloc::dealloc(base, std::alloc::Layout::from_size_align(cap, 8).unwrap());
+        }
+    }
+    copied
+}
+
 // ---- tasks (spawn / await) -------------------------------------------------------
 //
 // `spawn(action)` runs the action on its own OS thread. The checker

@@ -796,17 +796,16 @@ main :: () {
 }
 
 #[test]
-fn arena_result_must_not_escape() {
-    let errors = check_errors(r#"
+fn arena_results_are_copied_out() {
+    // Heap-shaped results no longer need to stay inside the scope — they
+    // are deep-copied past the region as it is freed.
+    let out = run(r#"
 main :: () {
     s = provide Arena(64.kb) { "escapes ${1}" }
     println(s)
 }
 "#);
-    assert!(
-        errors.iter().any(|e| e.contains("must not escape")),
-        "got: {errors:?}"
-    );
+    assert_eq!(out, "escapes 1\n");
 }
 
 #[test]
@@ -1196,4 +1195,23 @@ fn spawned_tasks_must_be_self_contained() {
 fn await_requires_a_task() {
     let errs = check_errors("main :: () {\n    println(await(3))\n}\n");
     assert!(errs.iter().any(|m| m.contains("Task")), "got: {errs:?}");
+}
+
+#[test]
+fn arena_scopes_copy_their_value_out() {
+    let out = run(
+        "struct Stats = { Int count, [Int] kept }\n\nsummarize :: ([Int] xs) -> Stats {\n    provide Arena(64.kb)\n    evens = filter(xs, (x) -> x % 2 == 0)\n    Stats(len(evens), evens)\n}\n\nmain :: () {\n    println(summarize(range(6)))\n}\n",
+    );
+    assert_eq!(out, "Stats(count: 3, kept: [0, 2, 4])\n");
+}
+
+#[test]
+fn arena_scopes_reject_uncopyable_values() {
+    let errs = check_errors(
+        "main :: () {\n    f = {\n        provide Arena(16.kb)\n        (Int x) -> x + 1\n    }\n    println(f(1))\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("cannot be copied")),
+        "got: {errs:?}"
+    );
 }

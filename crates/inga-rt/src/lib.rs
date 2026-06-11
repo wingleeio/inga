@@ -1357,6 +1357,15 @@ fn eq_desc(a: i64, b: i64, d: &mut Desc) -> bool {
     }
 }
 
+/// "assertEq failed: <a> != <b>", rendered via the type descriptor.
+#[no_mangle]
+pub extern "C" fn rt_assert_eq_msg(a: i64, b: i64, desc: i64) -> i64 {
+    let d = unsafe { std::str::from_utf8_unchecked(str_bytes(desc)) }.to_string();
+    let left = show_desc(a, &mut Desc::new(&d), true);
+    let right = show_desc(b, &mut Desc::new(&d), true);
+    make_str(format!("assertEq failed: {left} != {right}").as_bytes())
+}
+
 #[no_mangle]
 pub extern "C" fn rt_eq_desc(a: i64, b: i64, desc: i64) -> i64 {
     let d = unsafe { std::str::from_utf8_unchecked(str_bytes(desc)) };

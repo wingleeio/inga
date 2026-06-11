@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 use std::rc::Rc;
 
 use crate::ast::*;
-use crate::check::{DECODE_ERROR, DURATION_SUFFIXES, SIZE_SUFFIXES};
+use crate::check::{ASSERT_FAILED, DECODE_ERROR, DURATION_SUFFIXES, SIZE_SUFFIXES};
 use crate::span::Span;
 
 #[derive(Debug, Clone)]
@@ -213,6 +213,7 @@ impl<'a> Interp<'a> {
         let mut struct_fields: HashMap<&str, Vec<&str>> = HashMap::new();
         let mut variants: HashMap<&str, (&str, Vec<&str>)> = HashMap::new();
         struct_fields.insert(DECODE_ERROR, vec!["message"]);
+        struct_fields.insert(ASSERT_FAILED, vec!["message"]);
         let mut tail_spans = std::collections::HashSet::new();
         for decl in &program.decls {
             match decl {
@@ -1122,6 +1123,45 @@ impl<'a> Interp<'a> {
                 Err(Failure::Fatal(e)) => Err(Failure::Fatal(e)),
                 Err(Failure::Error { .. }) => Ok(Value::Unit),
             },
+            "assert" if args.len() == 1 => match self.eval(args[0], scope) {
+                Ok(Value::Bool(true)) => Ok(Value::Unit),
+                Ok(Value::Bool(false)) => Err(self.make_error(
+                    ASSERT_FAILED,
+                    vec![(
+                        "message".to_string(),
+                        Value::Str(Rc::new("assert failed: condition was false".into())),
+                    )],
+                    span,
+                )),
+                Ok(_) => self.fatal(args[0].span, "`assert` needs a Bool"),
+                Err(e) => Err(e),
+            },
+            "assertEq" if args.len() == 2 => {
+                let a = match self.eval(args[0], scope) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+                let b = match self.eval(args[1], scope) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+                if values_equal(&a, &b) {
+                    Ok(Value::Unit)
+                } else {
+                    Err(self.make_error(
+                        ASSERT_FAILED,
+                        vec![(
+                            "message".to_string(),
+                            Value::Str(Rc::new(format!(
+                                "assertEq failed: {} != {}",
+                                show(&a),
+                                show(&b)
+                            ))),
+                        )],
+                        span,
+                    ))
+                }
+            }
             "spawn" if args.len() == 1 => match self.eval(args[0], scope) {
                 Ok(v) => Ok(Value::Task(Rc::new(v))),
                 Err(e) => Err(e),

@@ -17,6 +17,7 @@ Usage:
   inga build <file.inga> [-o out] [--emit-ir]
                                 compile to a native binary via LLVM (clang)
   inga check <file.inga>...     type-check and report diagnostics
+  inga test [file.inga...]      run test* functions (default: ./*.inga)
   inga fmt [--check] <file>...  format in place (--check: diff exit code only)
   inga highlight <file.inga>    print the file with ANSI syntax colors
   inga lsp                      run the language server over stdio
@@ -29,6 +30,7 @@ fn main() -> ExitCode {
         Some("run") => cmd_run(&args[1..]),
         Some("build") => cmd_build(&args[1..]),
         Some("check") => cmd_check(&args[1..]),
+        Some("test") => cmd_test(&args[1..]),
         Some("fmt") => cmd_fmt(&args[1..]),
         Some("highlight") => cmd_highlight(&args[1..]),
         Some("lsp") => {
@@ -211,6 +213,117 @@ fn cmd_build(args: &[String]) -> ExitCode {
             eprintln!("error: cannot run clang: {e} (install the Xcode command line tools or LLVM)");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Run every zero-parameter `test*` function of each file (interpreter).
+/// A test passes when it returns; any unhandled failure — usually
+/// `AssertFailed` from `assert`/`assertEq` — fails it.
+fn cmd_test(args: &[String]) -> ExitCode {
+    let files: Vec<String> = if args.is_empty() {
+        let mut found: Vec<String> = std::fs::read_dir(".")
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| e.path().to_str().map(str::to_string))
+                    .filter(|p| p.ends_with(".inga"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        found.sort();
+        found
+    } else {
+        args.to_vec()
+    };
+    if files.is_empty() {
+        eprintln!("no .inga files found (usage: inga test [file.inga...])");
+        return ExitCode::FAILURE;
+    }
+
+    // Same big interpreter stack as `inga run`.
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(1 << 29)
+            .spawn_scoped(scope, move || run_tests(&files))
+            .expect("spawn test thread")
+            .join()
+            .expect("test thread panicked")
+    })
+}
+
+fn run_tests(files: &[String]) -> ExitCode {
+    let (mut passed, mut failed) = (0usize, 0usize);
+    for path in files {
+        let loaded = match load_program(Path::new(path)) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("error: cannot read `{path}`: {e}");
+                failed += 1;
+                continue;
+            }
+        };
+        let (checked, mods) = check_loaded(loaded);
+        if print_diagnostics_modules(&mods, &checked.diagnostics) {
+            failed += 1;
+            continue;
+        }
+        // Only the entry file's own tests run — not its imports'.
+        let entry = std::fs::canonicalize(path).unwrap_or_else(|_| Path::new(path).to_path_buf());
+        let root = mods
+            .iter()
+            .find(|m| std::fs::canonicalize(&m.path).ok().as_deref() == Some(&entry));
+        let tests: Vec<&str> = checked
+            .program
+            .decls
+            .iter()
+            .filter_map(|d| match d {
+                inga_core::ast::Decl::Func(func)
+                    if func.name.starts_with("test")
+                        && func.name.len() > 4
+                        && func.sig.params.is_empty()
+                        && root.is_none_or(|m| {
+                            func.name_span.start >= m.base && func.name_span.start < m.end
+                        }) =>
+                {
+                    Some(func.name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        if tests.is_empty() {
+            continue;
+        }
+        println!("{path}");
+        for name in tests {
+            match interp::run_captured(&checked.program, name) {
+                Ok(_) => {
+                    println!("  \u{2713} {name}");
+                    passed += 1;
+                }
+                Err(err) => {
+                    let message =
+                        err.message.strip_prefix("unhandled error: ").unwrap_or(&err.message);
+                    match err.span {
+                        Some(span) => {
+                            println!("  \u{2717} {name}");
+                            print_diagnostics_modules(
+                                &mods,
+                                &[Diagnostic::error(span, message.to_string())],
+                            );
+                        }
+                        None => println!("  \u{2717} {name} \u{2014} {message}"),
+                    }
+                    failed += 1;
+                }
+            }
+        }
+    }
+    println!();
+    println!("{passed} passed, {failed} failed");
+    if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 

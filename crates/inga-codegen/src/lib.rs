@@ -148,8 +148,10 @@ impl<'a> Cg<'a> {
     fn collect_decls(&mut self) {
         // Fixed tag ids for the builtins, then one per struct/enum.
         self.struct_meta.insert("DecodeError".into(), vec!["message".into()]);
-        for (i, tag) in
-            ["DecodeError", "Int", "Float", "Bool", "String", "Duration"].iter().enumerate()
+        self.struct_meta.insert("AssertFailed".into(), vec!["message".into()]);
+        for (i, tag) in ["DecodeError", "AssertFailed", "Int", "Float", "Bool", "String", "Duration"]
+            .iter()
+            .enumerate()
         {
             self.tag_ids.insert(tag.to_string(), i as i64);
         }
@@ -2524,6 +2526,44 @@ impl<'a> Cg<'a> {
                 self.pool_value(f, &out, &CType::Str);
                 out
             }
+            "assert" if args.len() == 1 => {
+                let c = self.gen_expr(f, args[0]);
+                let (fail_l, ok_l) = (self.label("assert.fail"), self.label("assert.ok"));
+                let b = self.tmp();
+                f.line(format!("{b} = icmp ne i64 {c}, 0"));
+                f.line(format!("br i1 {b}, label %{ok_l}, label %{fail_l}"));
+                f.start_block(&fail_l);
+                let msg = self.str_const("assert failed: condition was false");
+                let err_ptr = self.gen_alloc(f, 1);
+                self.store_slot(f, &err_ptr, 0, &msg);
+                let err_val = self.ptr_to_int(f, &err_ptr);
+                self.emit_fail_value(f, &err_val, &CType::Struct("AssertFailed".to_string()), span);
+                f.start_block(&ok_l);
+                "0".to_string()
+            }
+            "assertEq" if args.len() == 2 => {
+                let cty = self.ctype_of(args[0]);
+                let a = self.gen_expr(f, args[0]);
+                let b = self.gen_expr(f, args[1]);
+                let desc = self.desc_const(&cty);
+                let eq = self.tmp();
+                f.line(format!("{eq} = call i64 @rt_eq_desc(i64 {a}, i64 {b}, i64 {desc})"));
+                let (fail_l, ok_l) = (self.label("asseq.fail"), self.label("asseq.ok"));
+                let c = self.tmp();
+                f.line(format!("{c} = icmp ne i64 {eq}, 0"));
+                f.line(format!("br i1 {c}, label %{ok_l}, label %{fail_l}"));
+                f.start_block(&fail_l);
+                let msg = self.tmp();
+                f.line(format!(
+                    "{msg} = call i64 @rt_assert_eq_msg(i64 {a}, i64 {b}, i64 {desc})"
+                ));
+                let err_ptr = self.gen_alloc(f, 1);
+                self.store_slot(f, &err_ptr, 0, &msg);
+                let err_val = self.ptr_to_int(f, &err_ptr);
+                self.emit_fail_value(f, &err_val, &CType::Struct("AssertFailed".to_string()), span);
+                f.start_block(&ok_l);
+                "0".to_string()
+            }
             "decode" if args.len() == 2 => {
                 let raw = self.gen_expr(f, args[0]);
                 let rcty = self.ctype_of_span(span);
@@ -3500,6 +3540,7 @@ declare void @rt_types_init(i64)
 declare i64 @rt_show_desc(i64, i64)
 declare i64 @rt_display_desc(i64, i64)
 declare i64 @rt_eq_desc(i64, i64, i64)
+declare i64 @rt_assert_eq_msg(i64, i64, i64)
 declare i64 @rt_copy_desc(i64, i64)
 declare i64 @rt_encode_desc(i64, i64)
 declare i64 @rt_decode_desc(i64, i64)

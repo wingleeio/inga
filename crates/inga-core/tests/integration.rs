@@ -1215,3 +1215,24 @@ fn arena_scopes_reject_uncopyable_values() {
         "got: {errs:?}"
     );
 }
+
+#[test]
+fn asserts_fail_with_assert_failed() {
+    let out = run(
+        "main :: () {\n    assertEq(2 + 2, 4) |> catch { AssertFailed(m) -> println(m) }\n    assertEq(\"a\", \"b\") |> catch { AssertFailed(m) -> println(\"caught:\", m) }\n    assert(false) |> catch { AssertFailed(m) -> println(\"caught:\", m) }\n}\n",
+    );
+    assert_eq!(
+        out,
+        "caught: assertEq failed: \"a\" != \"b\"\ncaught: assert failed: condition was false\n"
+    );
+}
+
+#[test]
+fn asserts_count_toward_the_error_row() {
+    // Unhandled in main -> the usual "main must handle" error.
+    let errs = check_errors("main :: () {\n    assert(true)\n}\n");
+    assert!(
+        errs.iter().any(|m| m.contains("AssertFailed")),
+        "got: {errs:?}"
+    );
+}

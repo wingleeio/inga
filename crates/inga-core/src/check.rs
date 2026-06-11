@@ -25,6 +25,7 @@ pub const SIZE_SUFFIXES: [(&str, i64); 3] =
 
 /// Builtin struct raised by `decode`.
 pub const DECODE_ERROR: &str = "DecodeError";
+pub const ASSERT_FAILED: &str = "AssertFailed";
 
 /// Surface names of primitive types that can appear in a `!` row.
 pub const PRIMITIVE_TAGS: [&str; 5] = ["Int", "Float", "Bool", "String", "Duration"];
@@ -273,16 +274,19 @@ impl<'a> Checker<'a> {
             scopes: Vec::new(),
             row_stack: Vec::new(),
         };
-        // Builtin struct available to every program (raised by `decode`).
-        checker.structs.insert(
-            DECODE_ERROR.to_string(),
-            StructInfo {
-                fields: vec![("message".into(), Type::Str)],
-                name_span: Span::default(),
-                module: CORE_MODULE,
-                is_pub: true,
-            },
-        );
+        // Builtin structs available to every program (raised by `decode`
+        // and by `assert`/`assertEq`).
+        for name in [DECODE_ERROR, ASSERT_FAILED] {
+            checker.structs.insert(
+                name.to_string(),
+                StructInfo {
+                    fields: vec![("message".into(), Type::Str)],
+                    name_span: Span::default(),
+                    module: CORE_MODULE,
+                    is_pub: true,
+                },
+            );
+        }
         checker
     }
 
@@ -2042,6 +2046,24 @@ impl<'a> Checker<'a> {
                 self.merge_rows(&Rows { errors: BTreeSet::new(), caps: rows.caps });
                 Type::Unit
             }
+            "assert" => {
+                if check_arity(self, 1) {
+                    let t = self.check_expr(args[0]);
+                    self.unify_at(&Type::Bool, &t, args[0].span, "assert condition");
+                }
+                self.add_error_row(ASSERT_FAILED);
+                Type::Unit
+            }
+            "assertEq" => {
+                if !check_arity(self, 2) {
+                    return Some(Type::Unit);
+                }
+                let a = self.check_expr(args[0]);
+                let b = self.check_expr(args[1]);
+                self.unify_at(&a, &b, args[1].span, "assertEq operands");
+                self.add_error_row(ASSERT_FAILED);
+                Type::Unit
+            }
             "spawn" => {
                 if !check_arity(self, 1) {
                     return Some(Type::Unknown);
@@ -3335,7 +3357,7 @@ pub fn builtin_doc(name: &str) -> Option<&'static str> {
     builtin_completions().into_iter().find(|(n, _)| *n == name).map(|(_, doc)| doc)
 }
 
-const BUILTIN_NAMES: [&str; 32] = [
+const BUILTIN_NAMES: [&str; 34] = [
     "println",
     "print",
     "show",
@@ -3349,6 +3371,8 @@ const BUILTIN_NAMES: [&str; 32] = [
     "sleep",
     "spawn",
     "await",
+    "assert",
+    "assertEq",
     "len",
     "filter",
     "fold",
@@ -3387,6 +3411,8 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("sleep", "sleep(duration) -> Unit"),
         ("spawn", "spawn(lazy action) -> Task<a> — run `action` on its own thread; it must be self-contained (no unhandled errors, no required capabilities)"),
         ("await", "await(task) -> a — wait for a task and take its result"),
+        ("assert", "assert(condition) -> Unit ! AssertFailed — for `inga test`"),
+        ("assertEq", "assertEq(actual, expected) -> Unit ! AssertFailed — for `inga test`"),
         ("len", "len(stringOrList) -> Int"),
         ("filter", "filter(list, predicate) -> [a]"),
         ("fold", "fold(list, init, f) -> b — f(acc, item) left to right"),

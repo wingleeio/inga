@@ -74,3 +74,23 @@ fn native_output_matches_interpreter() {
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn inga_test_runs_test_functions() {
+    let inga = Path::new(env!("CARGO_BIN_EXE_inga"));
+    let dir = std::env::temp_dir().join(format!("inga-test-cmd-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("sample_test.inga");
+    std::fs::write(
+        &file,
+        "double :: (Int n) -> Int {\n    n * 2\n}\n\ntestDouble :: () {\n    assertEq(double(4), 8)\n}\n\ntestBroken :: () {\n    assertEq(double(1), 3)\n}\n",
+    )
+    .unwrap();
+
+    let out = Command::new(inga).arg("test").arg(&file).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "a failing test must fail the run");
+    assert!(stdout.contains("testDouble"), "got: {stdout}");
+    assert!(stdout.contains("1 passed, 1 failed"), "got: {stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

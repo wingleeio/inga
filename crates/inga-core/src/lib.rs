@@ -8,7 +8,6 @@ pub mod ast;
 pub mod check;
 pub mod diag;
 pub mod fmt;
-pub mod interp;
 pub mod lexer;
 pub mod modules;
 pub mod parser;

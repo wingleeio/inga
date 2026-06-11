@@ -7,13 +7,13 @@ use inga_core::diag::{Diagnostic, Severity};
 use inga_core::span::LineIndex;
 use inga_core::token::{StrPart, Token, TokenKind};
 use inga_core::modules::{load_program, ModuleSrc};
-use inga_core::{check_loaded, fmt as inga_fmt, interp, lexer};
+use inga_core::{check_loaded, fmt as inga_fmt, lexer};
 
 const USAGE: &str = "\
 inga — the Inga language
 
 Usage:
-  inga run <file.inga>          type-check and run in the interpreter
+  inga run <file.inga>          compile (to a temp binary) and run
   inga build <file.inga> [-o out] [--emit-ir]
                                 compile to a native binary via LLVM (clang)
   inga check <file.inga>...     type-check and report diagnostics
@@ -72,42 +72,102 @@ fn cmd_run(args: &[String]) -> ExitCode {
     if print_diagnostics_modules(&mods, &checked.diagnostics) {
         return ExitCode::FAILURE;
     }
-    let program = &checked.program;
-    // Graphics programs must stay on the main thread: macOS AppKit windows
-    // can only be created there, and the Objective-C exception it throws
-    // otherwise cannot unwind through Rust (a hard abort). The frame loop
-    // keeps stacks shallow, so the big interpreter stack isn't needed.
-    let uses_graphics = program.decls.iter().any(|d| match d {
-        inga_core::ast::Decl::Use(u) => u.path == ["std", "graphics"],
-        _ => false,
-    });
-    let result = if uses_graphics {
-        interp::run(program, "main")
-    } else {
-        // The tree-walker's depth is bounded by the host stack; run it on a
-        // thread with a large one so deep recursion behaves like the native
-        // backend (which eliminates self-tail calls outright).
-        std::thread::scope(|scope| {
-            std::thread::Builder::new()
-                .stack_size(1 << 29)
-                .spawn_scoped(scope, move || interp::run(program, "main"))
-                .expect("spawn interpreter thread")
-                .join()
-                .expect("interpreter thread panicked")
-        })
+    let ir = match inga_codegen::compile(&checked.program, &checked.info) {
+        Ok(ir) => ir,
+        Err(diagnostics) => {
+            print_diagnostics_modules(&mods, &diagnostics);
+            return ExitCode::FAILURE;
+        }
     };
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            match err.span {
-                Some(span) => {
-                    let diag = Diagnostic::error(span, format!("runtime error: {}", err.message));
-                    print_diagnostics_modules(&mods, &[diag]);
-                }
-                None => eprintln!("runtime error: {}", err.message),
-            }
+    run_ir(&ir, path)
+}
+
+/// Link IR to a temp binary, execute it with inherited stdio, clean up,
+/// and forward the child's exit status.
+fn run_ir(ir: &str, src_path: &str) -> ExitCode {
+    let stem = Path::new(src_path).file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+    let dir = std::env::temp_dir().join(format!("inga-run-{}", std::process::id()));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("error: cannot create temp dir: {e}");
+        return ExitCode::FAILURE;
+    }
+    let bin = dir.join(stem);
+    if let Err(msg) = link_ir_keep(ir, &bin, false) {
+        eprintln!("{msg}");
+        return ExitCode::FAILURE;
+    }
+    let status = std::process::Command::new(&bin).status();
+    let _ = std::fs::remove_dir_all(&dir);
+    match status {
+        Ok(s) if s.success() => ExitCode::SUCCESS,
+        Ok(s) => ExitCode::from(s.code().unwrap_or(1).clamp(0, 255) as u8),
+        Err(e) => {
+            eprintln!("error: cannot run the compiled binary: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Write IR next to `out`, link against the runtime staticlib with clang,
+/// and remove the .ll on success (unless INGA_KEEP_LL is set).
+fn link_ir_keep(ir: &str, out: &Path, keep_ll: bool) -> Result<(), String> {
+    let ll_path = out.with_extension("ll");
+    std::fs::write(&ll_path, ir).map_err(|e| format!("error: cannot write IR: {e}"))?;
+
+    // The runtime staticlib is built next to this binary by cargo.
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_default();
+    let rt_lib = match std::env::var("INGA_RT_LIB") {
+        Ok(p) => std::path::PathBuf::from(p),
+        Err(_) => exe_dir.join("libinga_rt.a"),
+    };
+    if !rt_lib.exists() {
+        // Dev convenience: inside the repo, build it on demand (a plain
+        // `cargo run -p inga-cli` doesn't build inga-rt, which is not a
+        // dependency — the staticlib is only an artifact of its own build).
+        eprintln!("runtime library missing; running `cargo build -p inga-rt`...");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let mut build_rt = std::process::Command::new(cargo);
+        build_rt.args(["build", "-p", "inga-rt"]);
+        if exe_dir.file_name().is_some_and(|n| n == "release") {
+            build_rt.arg("--release");
+        }
+        let _ = build_rt.status();
+    }
+    if !rt_lib.exists() {
+        return Err(format!(
+            "error: runtime library not found at {} (build it with `cargo build -p inga-rt` from the Inga repo, or set INGA_RT_LIB to a built libinga_rt.a)",
+            rt_lib.display()
+        ));
+    }
+
+    let mut clang = std::process::Command::new("clang");
+    clang
+        .arg("-O2")
+        .arg("-Wno-override-module")
+        .arg(&ll_path)
+        .arg(&rt_lib)
+        .arg("-o")
+        .arg(out);
+    // The runtime's GL window layer (miniquad) needs the system frameworks.
+    if cfg!(target_os = "macos") {
+        for framework in ["Cocoa", "OpenGL", "QuartzCore", "Metal", "MetalKit"] {
+            clang.arg("-framework").arg(framework);
+        }
+    }
+    match clang.status() {
+        Ok(s) if s.success() => {
+            if !keep_ll && std::env::var("INGA_KEEP_LL").is_err() {
+                let _ = std::fs::remove_file(&ll_path);
+            }
+            Ok(())
+        }
+        Ok(s) => Err(format!("error: clang failed with {s} (IR kept at {})", ll_path.display())),
+        Err(e) => Err(format!(
+            "error: cannot run clang: {e} (install the Xcode command line tools or LLVM)"
+        )),
     }
 }
 
@@ -154,82 +214,24 @@ fn cmd_build(args: &[String]) -> ExitCode {
 
     let stem = Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("out");
     let out_path = output.unwrap_or_else(|| stem.to_string());
-    let ll_path = format!("{out_path}.ll");
-    if let Err(e) = std::fs::write(&ll_path, &ir) {
-        eprintln!("error: cannot write `{ll_path}`: {e}");
-        return ExitCode::FAILURE;
-    }
-
-    // The runtime staticlib is built next to this binary by cargo.
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_default();
-    let rt_lib = match std::env::var("INGA_RT_LIB") {
-        Ok(p) => std::path::PathBuf::from(p),
-        Err(_) => exe_dir.join("libinga_rt.a"),
-    };
-    if !rt_lib.exists() {
-        // Dev convenience: inside the repo, build it on demand (a plain
-        // `cargo run -p inga-cli` doesn't build inga-rt, which is not a
-        // dependency — the staticlib is only an artifact of its own build).
-        eprintln!("runtime library missing; running `cargo build -p inga-rt`...");
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let mut build_rt = std::process::Command::new(cargo);
-        build_rt.args(["build", "-p", "inga-rt"]);
-        if exe_dir.file_name().is_some_and(|n| n == "release") {
-            build_rt.arg("--release");
-        }
-        let _ = build_rt.status();
-    }
-    if !rt_lib.exists() {
-        eprintln!(
-            "error: runtime library not found at {} (build it with `cargo build -p inga-rt` from the Inga repo, or set INGA_RT_LIB to a built libinga_rt.a)",
-            rt_lib.display()
-        );
-        return ExitCode::FAILURE;
-    }
-
-    let mut clang = std::process::Command::new("clang");
-    clang
-        .arg("-O2")
-        .arg("-Wno-override-module")
-        .arg(&ll_path)
-        .arg(&rt_lib)
-        .arg("-o")
-        .arg(&out_path);
-    // The runtime's GL window layer (miniquad) needs the system frameworks.
-    if cfg!(target_os = "macos") {
-        for framework in ["Cocoa", "OpenGL", "QuartzCore", "Metal", "MetalKit"] {
-            clang.arg("-framework").arg(framework);
-        }
-    }
-    let status = clang.status();
-    match status {
-        Ok(s) if s.success() => {
-            if !emit_ir {
-                if std::env::var("INGA_KEEP_LL").is_err() {
-                    let _ = std::fs::remove_file(&ll_path);
-                }
-            } else {
-                println!("{ll_path}: LLVM IR");
+    match link_ir_keep(&ir, Path::new(&out_path), emit_ir) {
+        Ok(()) => {
+            if emit_ir {
+                println!("{out_path}.ll: LLVM IR");
             }
             println!("{out_path}: native binary");
             ExitCode::SUCCESS
         }
-        Ok(s) => {
-            eprintln!("error: clang failed with {s} (IR kept at {ll_path})");
-            ExitCode::FAILURE
-        }
-        Err(e) => {
-            eprintln!("error: cannot run clang: {e} (install the Xcode command line tools or LLVM)");
+        Err(msg) => {
+            eprintln!("{msg}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// Run every zero-parameter `test*` function of each file (interpreter).
-/// A test passes when it returns; any unhandled failure — usually
+/// Run every zero-parameter `test*` function of each file: the program is
+/// compiled with a generated test-runner `main` (one process per file). A
+/// test passes when it returns; any unhandled failure — usually
 /// `AssertFailed` from `assert`/`assertEq` — fails it.
 fn cmd_test(args: &[String]) -> ExitCode {
     let files: Vec<String> = if args.is_empty() {
@@ -252,19 +254,11 @@ fn cmd_test(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Same big interpreter stack as `inga run`.
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(1 << 29)
-            .spawn_scoped(scope, move || run_tests(&files))
-            .expect("spawn test thread")
-            .join()
-            .expect("test thread panicked")
-    })
+    run_tests(&files)
 }
 
 fn run_tests(files: &[String]) -> ExitCode {
-    let (mut passed, mut failed) = (0usize, 0usize);
+    let mut failed = 0usize;
     for path in files {
         let loaded = match load_program(Path::new(path)) {
             Ok(l) => l,
@@ -305,33 +299,62 @@ fn run_tests(files: &[String]) -> ExitCode {
         if tests.is_empty() {
             continue;
         }
-        println!("{path}");
-        for name in tests {
-            match interp::run_captured(&checked.program, name) {
-                Ok(_) => {
-                    println!("  \u{2713} {name}");
-                    passed += 1;
-                }
-                Err(err) => {
-                    let message =
-                        err.message.strip_prefix("unhandled error: ").unwrap_or(&err.message);
-                    match err.span {
-                        Some(span) => {
-                            println!("  \u{2717} {name}");
-                            print_diagnostics_modules(
-                                &mods,
-                                &[Diagnostic::error(span, message.to_string())],
-                            );
-                        }
-                        None => println!("  \u{2717} {name} \u{2014} {message}"),
-                    }
-                    failed += 1;
+        // A test runs without a `provide` context, so it must satisfy its
+        // own capabilities (errors are fine — a failure fails the test).
+        let mut blocked = false;
+        for name in &tests {
+            if let Some(rows) = checked.info.facts.funcs.get(*name) {
+                if !rows.caps.is_empty() {
+                    let caps = rows.caps.join(", ");
+                    eprintln!(
+                        "error: {path}: test `{name}` still needs `{caps}` — provide it inside the test"
+                    );
+                    blocked = true;
                 }
             }
         }
+        if blocked {
+            failed += 1;
+            continue;
+        }
+        let names: Vec<String> = tests.iter().map(|n| n.to_string()).collect();
+        let ir = match inga_codegen::compile_tests(&checked.program, &checked.info, &names) {
+            Ok(ir) => ir,
+            Err(diagnostics) => {
+                print_diagnostics_modules(&mods, &diagnostics);
+                failed += 1;
+                continue;
+            }
+        };
+        let dir = std::env::temp_dir().join(format!("inga-test-{}", std::process::id()));
+        if std::fs::create_dir_all(&dir).is_err() {
+            eprintln!("error: cannot create temp dir");
+            failed += 1;
+            continue;
+        }
+        let stem = Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("tests");
+        let bin = dir.join(stem);
+        if let Err(msg) = link_ir_keep(&ir, &bin, false) {
+            eprintln!("{msg}");
+            failed += 1;
+            continue;
+        }
+        println!("{path}");
+        let out = std::process::Command::new(&bin).output();
+        let _ = std::fs::remove_dir_all(&dir);
+        match out {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                print!("{stdout}");
+                eprint!("{}", String::from_utf8_lossy(&out.stderr));
+                failed += stdout.lines().filter(|l| l.starts_with("  \u{2717}")).count();
+            }
+            Err(e) => {
+                eprintln!("error: cannot run the test binary: {e}");
+                failed += 1;
+            }
+        }
     }
-    println!();
-    println!("{passed} passed, {failed} failed");
     if failed == 0 {
         ExitCode::SUCCESS
     } else {

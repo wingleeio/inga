@@ -2,8 +2,8 @@
 
 The same five workloads, written idiomatically in each language
 ([`bench.inga`](bench.inga), [`bench.js`](bench.js), [`bench.rs`](bench.rs)).
-The **same Inga source** runs two ways: compiled to native code by
-`inga build` (LLVM, via clang -O2) and interpreted by `inga run`.
+Inga is compiled to native code (LLVM, via clang -O2) — the only way Inga
+runs.
 
 | # | Workload | What it measures | Inga | JavaScript | Rust |
 |---|---|---|---|---|---|
@@ -18,19 +18,20 @@ depth). Each program times itself in-process — Inga with its `nowMicros()`
 builtin, JS with `performance.now()`, Rust with `Instant` — and runs two
 rounds; tables report round 2 (JS round 1 warms the JIT).
 
+
 ## Results
 
-Apple Silicon (Darwin 25.4.0), 2026-06-11, all four runs back-to-back in one
+Apple Silicon (Darwin 25.4.0), 2026-06-11, all runs back-to-back in one
 session. `inga build` / `rustc -O` 1.96.0 / clang 21 / node v24.16.0.
 Reproduce with `bench/run.sh`.
 
-| Workload | **Inga native** | JavaScript | Rust | Inga interp | native vs V8 |
-|---|---:|---:|---:|---:|---:|
-| `fib(27)` | **379 µs** | 1,018 µs | 527 µs | 147,397 µs | **2.7× faster** |
-| `fib_service(24)` | **149 µs** | 265 µs | 124 µs | 60,194 µs | **1.8× faster** |
-| `strings(24)` | **201 µs** | 456 µs | 3,770 µs | 41,807 µs | **2.3× faster** |
-| `errors(24)` | **733 µs** | 212,774 µs | 124 µs | 64,192 µs | **290× faster** |
-| `store(24)` | **727 µs** | 944 µs | 1,918 µs | 119,798 µs | **1.3× faster** |
+| Workload | **Inga** | JavaScript | Rust | Inga vs V8 |
+|---|---:|---:|---:|---:|
+| `fib(27)` | **379 µs** | 1,018 µs | 527 µs | **2.7× faster** |
+| `fib_service(24)` | **149 µs** | 265 µs | 124 µs | **1.8× faster** |
+| `strings(24)` | **201 µs** | 456 µs | 3,770 µs | **2.3× faster** |
+| `errors(24)` | **733 µs** | 212,774 µs | 124 µs | **290× faster** |
+| `store(24)` | **727 µs** | 944 µs | 1,918 µs | **1.3× faster** |
 
 **Compiled Inga beats V8 on all five workloads** — and beats the idiomatic
 Rust version on two (`strings`, where `format!` allocates per node, and
@@ -82,5 +83,5 @@ heavy lifting.
   ±10% noise. Sub-100 µs numbers are indicative.
 - `errors` in JS pays for stack capture because `Error` subclasses are the
   idiom; throwing a plain object would narrow (not close) the gap.
-- `inga build` covers the benchmarked subset of the language; `encode`/
-  `decode` (runtime JSON) still require the interpreter.
+- `inga build` covers the whole language (`encode`/`decode`, `show`,
+  tasks — everything compiles).

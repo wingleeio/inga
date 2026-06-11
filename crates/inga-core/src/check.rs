@@ -2650,11 +2650,17 @@ impl<'a> Checker<'a> {
                             );
                         }
                         PatternKind::Bind(bind_name) => {
+                            // A single possible failure type makes the binder
+                            // concrete (so field access compiles natively);
+                            // with several it stays unknown.
+                            let bound = if rows.errors.len() == 1 {
+                                let only = rows.errors.iter().next().unwrap().clone();
+                                self.tag_type(&only).unwrap_or(Type::Unknown)
+                            } else {
+                                Type::Unknown
+                            };
                             rows.errors.clear();
-                            self.scopes
-                                .last_mut()
-                                .unwrap()
-                                .insert(bind_name.clone(), Type::Unknown);
+                            self.scopes.last_mut().unwrap().insert(bind_name.clone(), bound);
                         }
                         PatternKind::Wildcard => {
                             rows.errors.clear();

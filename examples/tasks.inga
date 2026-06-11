@@ -8,8 +8,7 @@
 //     is shareable across threads (scalar-only state) — anything stateful
 //     must be provided fresh inside the spawn.
 //
-// `inga build` runs tasks on real OS threads (each with its own heap, so
-// there are no locks); `inga run` executes them at the spawn point.
+// Tasks run on real OS threads, each with its own heap — no locks.
 
 struct Report = { String label, Int total }
 struct TooBig = { String label }

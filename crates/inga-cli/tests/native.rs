@@ -1,5 +1,5 @@
 //! End-to-end native pipeline: `inga build` a program, run the binary, and
-//! require its stdout to match the interpreter byte-for-byte.
+//! require its stdout to match the expected golden output.
 //!
 //! Skips (with a note) when clang is unavailable.
 
@@ -32,7 +32,7 @@ fn ensure_rt_lib(exe: &Path) -> Option<std::path::PathBuf> {
 }
 
 #[test]
-fn native_output_matches_interpreter() {
+fn examples_build_and_run_with_expected_output() {
     if !clang_available() {
         eprintln!("skipping: clang not available");
         return;
@@ -45,7 +45,17 @@ fn native_output_matches_interpreter() {
     let tmp = std::env::temp_dir().join(format!("inga-native-test-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
 
-    for example in ["hello.inga", "retry.inga", "shapes.inga", "arena.inga", "tasks.inga"] {
+    let expected: &[(&str, &str)] = &[
+        ("hello.inga", "hello, world!\ndoubled: [2, 4, 6, 8], total items: 4\nthe answer is 42\n"),
+        ("retry.inga", "settled on 3 after retries\ngave up with -3\n"),
+        ("shapes.inga", "area 12.56636\nrejected: a dot has no area\ntoo big at 600.0\n1\n"),
+        ("arena.inga", "simulated 10000 particles in the region\n9000\n"),
+        (
+            "tasks.inga",
+            "huge refused the job\nsmall: 500500\nmedium: 5000050000\nhuge: -1\ngrand total: 5000550499\n",
+        ),
+    ];
+    for (example, want) in expected {
         let src_path = format!("{}/../../examples/{example}", env!("CARGO_MANIFEST_DIR"));
         let bin_path = tmp.join(example.trim_end_matches(".inga"));
 
@@ -62,14 +72,10 @@ fn native_output_matches_interpreter() {
 
         let native = Command::new(&bin_path).output().unwrap();
         assert!(native.status.success(), "{example}: native binary failed");
-
-        let interp = Command::new(inga).args(["run", &src_path]).output().unwrap();
-        assert!(interp.status.success(), "{example}: interpreter run failed");
-
         assert_eq!(
             String::from_utf8_lossy(&native.stdout),
-            String::from_utf8_lossy(&interp.stdout),
-            "{example}: native and interpreted output differ"
+            *want,
+            "{example}: unexpected output"
         );
     }
     let _ = std::fs::remove_dir_all(&tmp);

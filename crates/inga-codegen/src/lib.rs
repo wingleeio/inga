@@ -49,6 +49,25 @@ pub fn compile(program: &Program, info: &CheckInfo) -> Result<String, Vec<Diagno
     }
 }
 
+/// Compile a test runner: `main` calls each named zero-parameter function,
+/// prints a check/cross line per test (rendering the failed value on a
+/// failure), a summary, and exits non-zero when anything failed.
+pub fn compile_tests(
+    program: &Program,
+    info: &CheckInfo,
+    tests: &[String],
+) -> Result<String, Vec<Diagnostic>> {
+    let mut cg = Cg::new(program, info);
+    cg.test_main = Some(tests.to_vec());
+    cg.collect_decls();
+    cg.gen_all();
+    if cg.errors.is_empty() {
+        Ok(cg.finish())
+    } else {
+        Err(cg.errors)
+    }
+}
+
 const DURATION_SUFFIXES: [(&str, i64); 5] = [
     ("millis", 1),
     ("seconds", 1000),
@@ -112,6 +131,9 @@ struct Cg<'a> {
     tmp: u32,
     label: u32,
     errors: Vec<Diagnostic>,
+    /// When set, emit a test-runner `main` that calls these zero-parameter
+    /// functions and reports per-test results instead of calling `ing.fn.main`.
+    test_main: Option<Vec<String>>,
 }
 
 impl<'a> Cg<'a> {
@@ -135,6 +157,7 @@ impl<'a> Cg<'a> {
             tmp: 0,
             label: 0,
             errors: Vec::new(),
+            test_main: None,
         }
     }
 
@@ -295,12 +318,141 @@ impl<'a> Cg<'a> {
         // C entry point. The checker guarantees `main` has empty rows, so it
         // is infallible and takes no evidence. The type-descriptor table is
         // registered first (show/==/encode/copy interpret it).
+        let user_entry = match self.test_main.clone() {
+            Some(tests) => {
+                self.gen_test_main(&tests);
+                "@ing.testmain"
+            }
+            None => "@ing.fn.main",
+        };
         let table = self.type_descs.join("\n");
         let table_const = self.str_const(&table);
         let _ = write!(
             self.functions,
-            "define i32 @main() {{\nentry:\n  call void @rt_types_init(i64 {table_const})\n  call i64 @ing.fn.main()\n  ret i32 0\n}}\n\n"
+            "define i32 @main() {{\nentry:\n  call void @rt_types_init(i64 {table_const})\n  %r = call i64 {user_entry}()\n  %c = trunc i64 %r to i32\n  ret i32 %c\n}}\n\n"
         );
+    }
+
+    /// Render the value inside an error box `{tag, payload}` for the test
+    /// report: AssertFailed shows its bare message, everything else its
+    /// `show` form via the type descriptor for the tag.
+    fn gen_show_err_fn(&mut self) {
+        let mut f = FnCtx::new(false);
+        let tag = self.load_slot_from_int(&mut f, "%e", 0);
+        let payload = self.load_slot_from_int(&mut f, "%e", 1);
+        let out_slot = f.fresh_slot(self);
+        let done = self.label("err.done");
+        let mut tags: Vec<(String, i64)> =
+            self.tag_ids.iter().map(|(n, i)| (n.clone(), *i)).collect();
+        tags.sort_by_key(|(_, id)| *id);
+        for (name, id) in tags {
+            let (hit_l, next_l) = (self.label("err.hit"), self.label("err.next"));
+            let c = self.tmp();
+            f.line(format!("{c} = icmp eq i64 {tag}, {id}"));
+            f.line(format!("br i1 {c}, label %{hit_l}, label %{next_l}"));
+            f.start_block(&hit_l);
+            let shown = if name == "AssertFailed" {
+                // { message } — print the message itself.
+                self.load_slot_from_int(&mut f, &payload, 0)
+            } else {
+                let cty = self.ctype_of_tag(&name);
+                let desc = self.desc_const(&cty);
+                let s = self.tmp();
+                f.line(format!("{s} = call i64 @rt_show_desc(i64 {payload}, i64 {desc})"));
+                s
+            };
+            f.line(format!("store i64 {shown}, ptr {out_slot}"));
+            f.line(format!("br label %{done}"));
+            f.start_block(&next_l);
+        }
+        let unknown = self.str_const("<error>");
+        f.line(format!("store i64 {unknown}, ptr {out_slot}"));
+        f.line(format!("br label %{done}"));
+        f.start_block(&done);
+        let out = self.tmp();
+        f.line(format!("{out} = load i64, ptr {out_slot}"));
+        f.ret(self, &out, None);
+        self.emit_fn("@ing.showerr", &["i64 %e".to_string()], f);
+    }
+
+    /// The test-runner body: one line per test, a summary, and the failure
+    /// count as the exit code.
+    fn gen_test_main(&mut self, tests: &[String]) {
+        self.gen_show_err_fn();
+        let mut f = FnCtx::new(false);
+        let pass_slot = f.fresh_slot(self);
+        let fail_slot = f.fresh_slot(self);
+        f.line(format!("store i64 0, ptr {pass_slot}"));
+        f.line(format!("store i64 0, ptr {fail_slot}"));
+        let bump = |cg: &mut Self, f: &mut FnCtx, slot: &str| {
+            let cur = cg.tmp();
+            f.line(format!("{cur} = load i64, ptr {slot}"));
+            let next = cg.tmp();
+            f.line(format!("{next} = add i64 {cur}, 1"));
+            f.line(format!("store i64 {next}, ptr {slot}"));
+        };
+        for name in tests {
+            let fallible = self
+                .funcs
+                .get(name.as_str())
+                .copied()
+                .is_some_and(|d| self.func_fallible(d));
+            if fallible {
+                let r = self.tmp();
+                f.line(format!("{r} = call {{ i64, i64 }} @ing.fn.{name}()"));
+                let e = self.tmp();
+                f.line(format!("{e} = extractvalue {{ i64, i64 }} {r}, 1"));
+                let isok = self.tmp();
+                let (ok_l, fail_l, next_l) =
+                    (self.label("t.ok"), self.label("t.fail"), self.label("t.next"));
+                f.line(format!("{isok} = icmp eq i64 {e}, 0"));
+                f.line(format!("br i1 {isok}, label %{ok_l}, label %{fail_l}"));
+                f.start_block(&ok_l);
+                let line = self.str_const(&format!("  \u{2713} {name}"));
+                f.line(format!("call void @rt_println(i64 {line})"));
+                bump(self, &mut f, &pass_slot);
+                f.line(format!("br label %{next_l}"));
+                f.start_block(&fail_l);
+                let prefix = self.str_const(&format!("  \u{2717} {name} \u{2014} "));
+                f.line(format!("call void @rt_print(i64 {prefix})"));
+                let msg = self.tmp();
+                f.line(format!("{msg} = call i64 @ing.showerr(i64 {e})"));
+                f.line(format!("call void @rt_println(i64 {msg})"));
+                bump(self, &mut f, &fail_slot);
+                f.line(format!("br label %{next_l}"));
+                f.start_block(&next_l);
+            } else {
+                let r = self.tmp();
+                f.line(format!("{r} = call i64 @ing.fn.{name}()"));
+                let line = self.str_const(&format!("  \u{2713} {name}"));
+                f.line(format!("call void @rt_println(i64 {line})"));
+                bump(self, &mut f, &pass_slot);
+            }
+        }
+        // Blank line, then "N passed, M failed"; exit code 1 when any failed.
+        let blank = self.str_const("");
+        f.line(format!("call void @rt_println(i64 {blank})"));
+        let int_desc = self.desc_const(&CType::Int);
+        let p = self.tmp();
+        f.line(format!("{p} = load i64, ptr {pass_slot}"));
+        let ps = self.tmp();
+        f.line(format!("{ps} = call i64 @rt_show_desc(i64 {p}, i64 {int_desc})"));
+        f.line(format!("call void @rt_print(i64 {ps})"));
+        let mid = self.str_const(" passed, ");
+        f.line(format!("call void @rt_print(i64 {mid})"));
+        let n = self.tmp();
+        f.line(format!("{n} = load i64, ptr {fail_slot}"));
+        let ns = self.tmp();
+        f.line(format!("{ns} = call i64 @rt_show_desc(i64 {n}, i64 {int_desc})"));
+        f.line(format!("call void @rt_print(i64 {ns})"));
+        let tail = self.str_const(" failed");
+        f.line(format!("call void @rt_println(i64 {tail})"));
+        let any = self.tmp();
+        f.line(format!("{any} = icmp sgt i64 {n}, 0"));
+        let code = self.tmp();
+        f.line(format!("{code} = zext i1 {any} to i64"));
+        f.ret(self, &code, None);
+        self.emit_fn("@ing.testmain", &[], f);
     }
 
     fn finish(self) -> String {
@@ -3040,10 +3192,14 @@ impl<'a> Cg<'a> {
                 }
                 body.push_str(vname);
                 if !fctys.is_empty() {
+                    let fnames =
+                        self.variant_meta.get(vname).map(|m| m.fields.clone()).unwrap_or_default();
                     body.push('(');
                     for (j, fcty) in fctys.iter().enumerate() {
                         let desc = self.value_desc(&fcty.clone());
-                        body.push_str(&format!("f{j}:{desc};"));
+                        let fname =
+                            fnames.get(j).cloned().unwrap_or_else(|| format!("f{j}"));
+                        body.push_str(&format!("{fname}:{desc};"));
                     }
                     body.push(')');
                 }

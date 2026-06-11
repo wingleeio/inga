@@ -90,7 +90,7 @@ One binary, everything included:
 
 | Command | What it does |
 |---|---|
-| `inga run file.inga` | type-check + run (reference interpreter, full language) |
+| `inga run file.inga` | type-check, compile, and run (a temp native binary) |
 | `inga build file.inga [-o out]` | **compile to a native binary** (LLVM IR → clang -O2) |
 | `inga check files...` | diagnostics with source carets |
 | `inga test [files...]` | run `test*` functions; `assert`/`assertEq` failures point at the line |
@@ -168,7 +168,7 @@ inga build games/balatro.inga -o ingalatro && ./ingalatro
 ## Repository layout
 
 ```
-crates/inga-core      lexer, parser, type & effect inference, interpreter, formatter
+crates/inga-core      lexer, parser, type & effect inference, formatter
 crates/inga-codegen   LLVM backend (emits .ll; clang compiles and links)
 crates/inga-rt        native runtime staticlib (allocator, strings, maps, clock)
 crates/inga-cli       the `inga` binary
@@ -182,16 +182,15 @@ bench/                the same workloads in Inga, JavaScript, and Rust (see benc
 docs/SPEC.md          language design: semantics, effect rows, execution strategy
 ```
 
-`bench/run.sh` runs five identical workloads as native Inga, interpreted
-Inga, node, and `rustc -O` — compiled Inga wins every one against V8
-([results](bench/README.md)).
+`bench/run.sh` runs five identical workloads as Inga, node, and `rustc -O`
+— Inga wins every one against V8 ([results](bench/README.md)).
 
 ## How it runs
 
-Two backends, one front end. `inga run` interprets the typed AST (reference
-semantics, full language). `inga build` compiles to native code through LLVM
-— and because Inga's effects are static, **the effect system compiles
-away**: error rows become Rust-style `{value, err}` two-register returns,
+Inga is compiled, always: `inga build` produces a binary through LLVM, and
+`inga run` is the same pipeline to a temp binary, executed immediately —
+one backend, one semantics. Because Inga's effects are static, **the effect
+system compiles away**: error rows become Rust-style `{value, err}` two-register returns,
 capability rows become Koka-style evidence parameters, and a capability
 method call is the same machine code as a Rust `dyn` call. Memory is
 **Perceus-style ARC** (non-atomic refcounts + compiler-emitted drop glue,
@@ -210,9 +209,9 @@ on two of them.
 
 v0.3 — a complete, tested vertical slice: language (structs/enums/tuples,
 record update, generics, exhaustive `match`, typed errors over any value),
-inference, interpreter, **native LLVM backend with full parity**
-(`show`/`==`/`encode`/`decode`/functions-as-values all compile),
-Perceus-style ARC + arenas with copy-out, `spawn`/`await` tasks, a built-in
-test runner, formatter, LSP, editor tooling (`cargo test` covers all of
-it). Not yet: a package manager, per-implementation capability precision,
-resumable handlers.
+inference, a **native-only LLVM backend** (`show`/`==`/`encode`/`decode`/
+functions-as-values/tasks all compile; the reference interpreter served its
+purpose and was removed), Perceus-style ARC + arenas with copy-out,
+`spawn`/`await` tasks, a built-in test runner, formatter, LSP, editor
+tooling (`cargo test` covers all of it). Not yet: a package manager,
+per-implementation capability precision, resumable handlers.

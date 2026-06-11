@@ -287,9 +287,6 @@ dependencies = [
 [[package]]
 name = "inga-core"
 version = "0.1.0"
-dependencies = [
- "macroquad",
-]
 
 [[package]]
 name = "inga-lsp"

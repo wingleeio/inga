@@ -201,18 +201,12 @@ provides real implementations.
 
 ## 6. Execution: how Inga runs
 
-Inga has two execution modes sharing one front end (lexer → parser → type +
-effect inference):
-
-**`inga run` — the reference interpreter.** A tree-walking interpreter in
-Rust: errors are a `Result` channel, capabilities a dynamically scoped stack
-of provided instances, `retry`/`lazy` re-evaluate thunked AST. It covers the
-whole language and is the semantics of record.
-
-**`inga build` — the LLVM backend (v0.2).** `crates/inga-codegen` lowers the
-checked AST to textual LLVM IR; `clang -O2` (which embeds LLVM — no other
-toolchain dependency) compiles and links it against a small Rust runtime
-staticlib (`crates/inga-rt`: bump allocator, strings, hash map, clock).
+Inga is **compiled, always**. `crates/inga-codegen` lowers the checked AST
+to textual LLVM IR; `clang -O2` (which embeds LLVM — no other toolchain
+dependency) compiles and links it against a small Rust runtime staticlib
+(`crates/inga-rt`: allocator, strings, maps, tasks, clock, GL). `inga build`
+produces a binary; `inga run` is the same pipeline to a temp binary,
+executed immediately. There is no interpreter — one backend, one semantics.
 Because Inga's effects are deliberately *static* — error rows and capability
 rows are name-sets known at compile time — **the effect system compiles
 away**:
@@ -236,10 +230,9 @@ away**:
 - The optimizer exploits staticness: `len("n=${n}")` folds to
   `2 + digits(n)` with no string materialized; `map.get(k) |> getOrElse(d)`
   fuses into a direct probe with no `Option` box.
-- **Self-tail calls become loops** in both backends (the interpreter uses a
-  trampoline, the native backend a branch to the function head), so the
-  idiomatic accumulator-recursion style is iteration — `sumTo(10_000_000)`
-  runs in constant stack.
+- **Self-tail calls become loops** (a branch back to the function head),
+  so the idiomatic accumulator-recursion style is iteration —
+  `sumTo(10_000_000)` runs in constant stack.
 - **Runtime type descriptors** make data-generic operations native: the
   compiler serializes each type's shape into a compact string; a small
   interpreter in the runtime walks value + descriptor to implement `show`,
@@ -247,8 +240,8 @@ away**:
   freezing (task captures) — one mechanism instead of per-type glue.
 
 Measured result (bench/README.md): the compiled benchmarks beat Node/V8 on
-all five workloads — about 2× on calls, dispatch, and strings, ~860× on
-typed-error control flow — and run ~300× faster than the interpreter.
+all five workloads — 2–3× on calls, dispatch, and strings, ~290× on
+typed-error control flow.
 
 **Memory.** Compiled Inga uses Perceus-style ARC plus optional region
 arenas:
@@ -310,9 +303,8 @@ total = await(t) + (await(u) |> catch { Timeout -> cached() })
   captures are copied out first. Heap chunks are never returned to the OS,
   so a task's result (or its error box) outlives its thread, and after the
   join the parent owns it exclusively.
-- `inga run` executes the action at the spawn point (same results,
-  sequential); `inga build` runs it in parallel — four spawned workers are
-  ~4× on a 4-core machine.
+- Tasks run on real OS threads — four spawned workers are ~4× on a
+  4-core machine.
 
 **Current limits of the backend:** function values, maps, and tasks cannot
 be captured by `spawn` (not copyable/freezable). Full delimited-continuation
@@ -354,7 +346,7 @@ main :: () { println(area(Circle(2.0))) }
   uppercase identifiers are types; `graphics.rect(...)` can never be
   mistaken for a constructor or a service.
 - Internally, every module lexes at a disjoint base offset into one global
-  span space, so inference, the interpreter, the LLVM backend, and
+  span space, so inference, the LLVM backend, and
   diagnostics (mapped back to file + line) all operate on one merged
   program.
 
@@ -367,8 +359,7 @@ honest — a package that needs the network *says so in its types*
 
 The `std/graphics` module (imported with `use std/graphics`) provides
 GL-backed 2D graphics, implemented on OpenGL through miniquad/macroquad in
-both the interpreter (cargo feature `gfx`, enabled by the CLI) and the
-native runtime:
+the native runtime:
 
 ```
 graphics.run(width, height, title, frame)   // runtime-owned loop; frame: () -> a, once per frame
@@ -392,7 +383,7 @@ tests). See `games/balatro.inga` for a complete game.
 
 | Tool | Where | Notes |
 |---|---|---|
-| `inga run / check` | `crates/inga-cli` | caret diagnostics, warnings |
+| `inga run / build / check` | `crates/inga-cli` | compile via LLVM/clang; caret diagnostics, warnings |
 | `inga test` | `crates/inga-cli` | runs every zero-parameter `test*` function; `assert`/`assertEq` failures point at the failing line; exit code for CI |
 | `inga fmt` | `crates/inga-core/src/fmt.rs` | canonical style, idempotent, comment-preserving, `--check` mode |
 | `inga highlight` | `crates/inga-cli` | ANSI terminal highlighting from the real lexer (lossless) |

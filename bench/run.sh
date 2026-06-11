@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cross-language benchmark runner: Inga (native + interpreter) vs JavaScript vs Rust.
+# Cross-language benchmark runner: Inga (native) vs JavaScript vs Rust.
 # Usage: bench/run.sh   (from the repository root)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -16,10 +16,6 @@ rustc -O bench/bench.rs -o target/bench-rs
 echo
 echo "=== INGA (native, inga build → LLVM via clang -O2) ==="
 ./target/bench-inga
-
-echo
-echo "=== INGA (tree-walking interpreter, inga run) ==="
-./target/release/inga run bench/bench.inga
 
 echo
 echo "=== JAVASCRIPT (node $(node --version)) ==="

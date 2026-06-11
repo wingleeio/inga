@@ -1,15 +1,8 @@
 [package]
 name = "inga-core"
-description = "Lexer, parser, type/effect inference, interpreter, and formatter for the Inga language"
+description = "Lexer, parser, type/effect inference, and formatter for the Inga language"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-macroquad = { version = "0.4", default-features = false, optional = true }
-
-[features]
-# Graphics support for the interpreter (`Gfx.*` builtins). The native backend
-# always has graphics via inga-rt; this gates the interpreter's copy so the
-# LSP and tests build lean.
-gfx = ["dep:macroquad"]

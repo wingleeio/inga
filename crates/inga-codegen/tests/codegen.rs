@@ -10,7 +10,7 @@ fn example(name: &str) -> String {
 
 #[test]
 fn compileable_examples_produce_ir() {
-    for name in ["hello.inga", "retry.inga", "shapes.inga"] {
+    for name in ["hello.inga", "retry.inga", "shapes.inga", "arena.inga"] {
         let src = example(name);
         let checked = check_source(&src);
         let ir = inga_codegen::compile(&checked.program, &checked.info)

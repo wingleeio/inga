@@ -131,7 +131,7 @@ crates/inga-lsp       language server (lsp-server / lsp-types)
 editors/vscode        VS Code extension + TextMate grammar
 editors/zed           Zed extension (tree-sitter highlighting + LSP)
 tree-sitter-inga      tree-sitter grammar (used by the Zed extension)
-examples/             hello.inga, retry.inga, shapes.inga, modules.inga (+ geometry.inga), user_service.inga
+examples/             hello.inga, retry.inga, shapes.inga, arena.inga, modules.inga (+ geometry.inga), user_service.inga
 games/                balatro.inga — a Balatro-style deckbuilder on the Gfx module
 bench/                the same workloads in Inga, JavaScript, and Rust (see bench/README.md)
 docs/SPEC.md          language design: semantics, effect rows, execution strategy

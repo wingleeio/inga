@@ -1,0 +1,37 @@
+// Region allocation: `provide Arena(n)` makes a scope allocate from a
+// region that is freed wholesale when the scope ends — bump-allocator
+// speed for allocation-heavy code, no refcount traffic inside.
+// Run with: inga run examples/arena.inga (or inga build)
+
+struct Particle = { Float x, Float y, Float vx, Float vy }
+
+step :: (Particle p) -> Particle {
+    Particle(p.x + p.vx, p.y + p.vy, p.vx, p.vy * 0.99)
+}
+
+// Hot path: every iteration builds fresh particles and strings. Inside an
+// arena scope all of it lands in the region.
+simulate :: (Int n) -> Int {
+    traces = map(range(n), (i) -> {
+        p = Particle(0.0, 0.0, 1.0, 2.0)
+            |> step
+            |> step
+            |> step
+        len("p${i}: ${p.x}")
+    })
+    len(traces)
+}
+
+main :: () {
+    // Braceless: the region covers the rest of `main` (and everything it
+    // calls), freed when `main` ends.
+    provide Arena(1.mb)
+    println("simulated ${simulate(10000)} particles in the region")
+
+    // Braced: a nested region freed at the closing brace. Its value must
+    // be a scalar — heap values must not escape a freed region.
+    total = provide Arena(256.kb) {
+        len("scratch ${1 + 2}") * simulate(1000)
+    }
+    println(total)
+}

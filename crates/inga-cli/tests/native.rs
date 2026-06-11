@@ -45,7 +45,7 @@ fn native_output_matches_interpreter() {
     let tmp = std::env::temp_dir().join(format!("inga-native-test-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
 
-    for example in ["hello.inga", "retry.inga", "shapes.inga"] {
+    for example in ["hello.inga", "retry.inga", "shapes.inga", "arena.inga"] {
         let src_path = format!("{}/../../examples/{example}", env!("CARGO_MANIFEST_DIR"));
         let bin_path = tmp.join(example.trim_end_matches(".inga"));
 

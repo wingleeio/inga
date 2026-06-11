@@ -1910,6 +1910,17 @@ impl<'a> Cg<'a> {
     }
 
     fn gen_closure_from(&mut self, f: &mut FnCtx, params: &[Param], body: &Expr) -> String {
+        self.gen_closure_parts(f, params, body).0
+    }
+
+    /// Build a closure and also report its environment pointer and capture
+    /// types (slot `1 + i` holds capture `i`) — `spawn` freezes them.
+    fn gen_closure_parts(
+        &mut self,
+        f: &mut FnCtx,
+        params: &[Param],
+        body: &Expr,
+    ) -> (String, String, Vec<CType>) {
         // Capture every local the body references plus all current evidence.
         let mut captured: Vec<String> = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -1992,7 +2003,7 @@ impl<'a> Cg<'a> {
         }
         let out = self.ptr_to_int(f, &ptr);
         self.pool_value(f, &out, &CType::Func);
-        out
+        (out, ptr, capture_ctys)
     }
 
     fn gen_closure_call(
@@ -2272,6 +2283,53 @@ impl<'a> Cg<'a> {
                 "0".to_string()
             }
             "retry" if args.len() == 2 => return Some(self.gen_retry(f, args[0], args[1])),
+            "spawn" if args.len() == 1 => {
+                // Build a thunk for the action, freeze its captures (two
+                // threads must not race on refcounts; arena captures are
+                // copied out first), and hand it to a runtime thread.
+                let (thunk, env, capture_ctys) = self.gen_closure_parts(f, &[], args[0]);
+                for (i, cty) in capture_ctys.iter().enumerate() {
+                    match cty {
+                        CType::Int
+                        | CType::Float
+                        | CType::Bool
+                        | CType::Unit
+                        | CType::Duration
+                        | CType::Tag(_) => {}
+                        CType::Func | CType::MutMap(..) | CType::Service(_) | CType::Task(_) => {
+                            self.unsupported(
+                                args[0].span,
+                                "capturing a function value, map, or task in `spawn`",
+                            );
+                        }
+                        _ => {
+                            let desc = self.desc_const(&cty.clone());
+                            let gep = self.tmp();
+                            f.line(format!(
+                                "{gep} = getelementptr i64, ptr {env}, i64 {}",
+                                1 + i
+                            ));
+                            let gep_i = self.tmp();
+                            f.line(format!("{gep_i} = ptrtoint ptr {gep} to i64"));
+                            f.line(format!(
+                                "call void @rt_freeze_slot(i64 {gep_i}, i64 {desc})"
+                            ));
+                        }
+                    }
+                }
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_task_spawn(i64 {thunk})"));
+                out
+            }
+            "await" if args.len() == 1 => {
+                let t = self.gen_expr(f, args[0]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_task_await(i64 {t})"));
+                // The parent owns the task's result exclusively after the join.
+                let rcty = self.ctype_of_span(span);
+                self.pool_value(f, &out, &rcty);
+                out
+            }
             "sleep" if args.len() == 1 => {
                 let v = self.gen_expr(f, args[0]);
                 f.line(format!("call void @rt_sleep_millis(i64 {v})"));
@@ -2847,7 +2905,7 @@ impl<'a> Cg<'a> {
             CType::Unit => "u".into(),
             CType::Duration => "d".into(),
             CType::Schedule => "h".into(),
-            CType::Func | CType::Tag(_) | CType::Service(_) => "F".into(),
+            CType::Func | CType::Tag(_) | CType::Service(_) | CType::Task(_) => "F".into(),
             CType::MutMap(..) => "M".into(),
             CType::Option(t) => format!("O{}", self.value_desc(t)),
             CType::List(t) => format!("L{}", self.value_desc(t)),
@@ -2942,6 +3000,7 @@ impl<'a> Cg<'a> {
             CType::Tag(n) => format!("T{n}"),
             CType::MutMap(..) => "M".into(),
             CType::Func => "F".into(),
+            CType::Task(t) => format!("k{}", Self::ckey(t)),
         }
     }
 
@@ -2981,6 +3040,7 @@ impl<'a> Cg<'a> {
             | CType::Duration
             | CType::Tag(_)
             | CType::Service(_)
+            | CType::Task(_)
             | CType::MutMap(..) => None,
             CType::Enum(n) if self.enum_simple.get(n).copied().unwrap_or(true) => None,
             CType::Str | CType::Schedule | CType::Func => Some(self.leaf_drop()),
@@ -3402,6 +3462,9 @@ declare i64 @rt_eq_desc(i64, i64, i64)
 declare i64 @rt_copy_desc(i64, i64)
 declare i64 @rt_encode_desc(i64, i64)
 declare i64 @rt_decode_desc(i64, i64)
+declare void @rt_freeze_slot(i64, i64)
+declare i64 @rt_task_spawn(i64)
+declare i64 @rt_task_await(i64)
 declare i64 @rt_random(i64)
 declare void @rt_gfx_run(i64, i64, i64, i64)
 declare void @rt_gfx_clear(i64, i64, i64)

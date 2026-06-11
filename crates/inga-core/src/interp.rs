@@ -53,6 +53,9 @@ pub enum Value<'a> {
     Service(Rc<ServiceInstance<'a>>),
     /// Unevaluated `lazy` argument.
     Thunk(Rc<ThunkVal<'a>>),
+    /// A finished task (`inga run` executes tasks at the spawn point; only
+    /// `inga build` runs them on real threads).
+    Task(Rc<Value<'a>>),
     /// Internal: a self-tail-call's arguments, unwound to `call_func`'s
     /// trampoline (never observable by programs).
     TailArgs(&'a FuncDecl, Vec<Value<'a>>),
@@ -1119,6 +1122,16 @@ impl<'a> Interp<'a> {
                 Err(Failure::Fatal(e)) => Err(Failure::Fatal(e)),
                 Err(Failure::Error { .. }) => Ok(Value::Unit),
             },
+            "spawn" if args.len() == 1 => match self.eval(args[0], scope) {
+                Ok(v) => Ok(Value::Task(Rc::new(v))),
+                Err(e) => Err(e),
+            },
+            "await" if args.len() == 1 => match self.eval(args[0], scope) {
+                Ok(Value::Task(v)) => Ok((*v).clone()),
+                Ok(other) => self
+                    .fatal(args[0].span, format!("`await` works on tasks, found {}", show(&other))),
+                Err(e) => Err(e),
+            },
             "sleep" if args.len() == 1 => match self.eval(args[0], scope) {
                 Ok(Value::Duration(ms)) => {
                     std::thread::sleep(std::time::Duration::from_millis(ms.max(0) as u64));
@@ -1795,6 +1808,7 @@ pub fn show(value: &Value) -> String {
         Value::Closure { .. } => "<lambda>".to_string(),
         Value::Service(instance) => format!("<service {}>", instance.service),
         Value::Thunk(_) => "<lazy>".to_string(),
+        Value::Task(_) => "<task>".to_string(),
         Value::TailArgs(..) => "<tail-call>".to_string(),
     }
 }

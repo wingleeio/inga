@@ -76,6 +76,7 @@ pub enum CType {
     Option(Box<CType>),
     List(Box<CType>),
     Tuple(Vec<CType>),
+    Task(Box<CType>),
     Struct(String),
     Enum(String),
     Service(String),
@@ -1102,6 +1103,7 @@ impl<'a> Checker<'a> {
             Type::Option(t) => CType::Option(Box::new(self.ctype(&t))),
             Type::List(t) => CType::List(Box::new(self.ctype(&t))),
             Type::Tuple(ts) => CType::Tuple(ts.iter().map(|t| self.ctype(t)).collect()),
+            Type::Task(t) => CType::Task(Box::new(self.ctype(&t))),
             Type::Named(n) => CType::Struct(n),
             Type::Enum(n) => CType::Enum(n),
             Type::Service(n) => CType::Service(n),
@@ -2039,6 +2041,49 @@ impl<'a> Checker<'a> {
                 });
                 self.merge_rows(&Rows { errors: BTreeSet::new(), caps: rows.caps });
                 Type::Unit
+            }
+            "spawn" => {
+                if !check_arity(self, 1) {
+                    return Some(Type::Unknown);
+                }
+                // By-name: the action runs on its own thread. It must be
+                // self-contained — its rows do not merge into the caller's.
+                let (action_ty, rows) = self.with_rows(|s| s.check_expr(args[0]));
+                if !rows.errors.is_empty() {
+                    let list = rows.errors.iter().cloned().collect::<Vec<_>>().join(", ");
+                    self.error(
+                        args[0].span,
+                        format!(
+                            "a spawned task must be self-contained: handle `{list}` \
+                             (e.g. with `|> catch`) before spawning"
+                        ),
+                    );
+                }
+                if !rows.caps.is_empty() {
+                    let list = rows.caps.iter().cloned().collect::<Vec<_>>().join(", ");
+                    self.error(
+                        args[0].span,
+                        format!(
+                            "a spawned task must be self-contained: it still needs \
+                             `{list}` — provide it inside the spawned expression"
+                        ),
+                    );
+                }
+                Type::Task(Box::new(action_ty))
+            }
+            "await" => {
+                if !check_arity(self, 1) {
+                    return Some(Type::Unknown);
+                }
+                let task_ty = self.check_expr(args[0]);
+                let a = self.ctx.fresh();
+                self.unify_at(
+                    &Type::Task(Box::new(a.clone())),
+                    &task_ty,
+                    args[0].span,
+                    "await input",
+                );
+                a
             }
             "sleep" => {
                 if check_arity(self, 1) {
@@ -3258,7 +3303,7 @@ pub fn builtin_doc(name: &str) -> Option<&'static str> {
     builtin_completions().into_iter().find(|(n, _)| *n == name).map(|(_, doc)| doc)
 }
 
-const BUILTIN_NAMES: [&str; 30] = [
+const BUILTIN_NAMES: [&str; 32] = [
     "println",
     "print",
     "show",
@@ -3270,6 +3315,8 @@ const BUILTIN_NAMES: [&str; 30] = [
     "retry",
     "ignoreFailure",
     "sleep",
+    "spawn",
+    "await",
     "len",
     "filter",
     "fold",
@@ -3306,6 +3353,8 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("schedule.upTo", "schedule.upTo(schedule, times) -> Schedule — cap the retry count"),
         ("ignoreFailure", "ignoreFailure(lazy action) -> Unit — swallow the error channel"),
         ("sleep", "sleep(duration) -> Unit"),
+        ("spawn", "spawn(lazy action) -> Task<a> — run `action` on its own thread; it must be self-contained (no unhandled errors, no required capabilities)"),
+        ("await", "await(task) -> a — wait for a task and take its result"),
         ("len", "len(stringOrList) -> Int"),
         ("filter", "filter(list, predicate) -> [a]"),
         ("fold", "fold(list, init, f) -> b — f(acc, item) left to right"),

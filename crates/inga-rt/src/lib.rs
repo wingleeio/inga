@@ -45,12 +45,8 @@ struct Region {
     end: *mut u8,
 }
 
-static mut REGIONS: Vec<Region> = Vec::new();
-
-#[allow(static_mut_refs)]
 fn regions() -> &'static mut Vec<Region> {
-    // Single-threaded by construction (compiled Inga has no threads).
-    unsafe { &mut REGIONS }
+    &mut rt().regions
 }
 
 unsafe fn raw_chunk(cap: usize) -> *mut u8 {
@@ -105,35 +101,74 @@ const MAX_CLASS: usize = 16; // up to 16 slots = 120 payload bytes
 const HUGE: usize = 0;
 const HEAP_CHUNK: usize = 1 << 20;
 
-static mut FREE_LISTS: [*mut u8; MAX_CLASS + 1] = [std::ptr::null_mut(); MAX_CLASS + 1];
-static mut HEAP_PTR: *mut u8 = std::ptr::null_mut();
-static mut HEAP_END: *mut u8 = std::ptr::null_mut();
+struct Heap {
+    free_lists: [*mut u8; MAX_CLASS + 1],
+    ptr: *mut u8,
+    end: *mut u8,
+}
+
+/// Per-thread allocator state. Each thread (the main program and every
+/// spawned task) owns its own regions and RC heap — allocation stays
+/// lock-free. Heap chunks are never returned to the OS, so a task's result
+/// outlives its thread and the parent (exclusive owner after `await`)
+/// reads and frees it safely.
+struct RtState {
+    regions: Vec<Region>,
+    heap: Heap,
+}
+
+thread_local! {
+    static RT: std::cell::UnsafeCell<RtState> = const {
+        std::cell::UnsafeCell::new(RtState {
+            regions: Vec::new(),
+            heap: Heap {
+                free_lists: [std::ptr::null_mut(); MAX_CLASS + 1],
+                ptr: std::ptr::null_mut(),
+                end: std::ptr::null_mut(),
+            },
+        })
+    };
+}
+
+fn rt() -> &'static mut RtState {
+    // One mutable reference at a time by construction: the runtime never
+    // re-enters the allocator while a `&mut` is live on this thread.
+    RT.with(|r| unsafe { &mut *r.get() })
+}
+
+fn heap() -> &'static mut Heap {
+    &mut rt().heap
+}
 
 #[cold]
-unsafe fn heap_refill() {
+unsafe fn heap_refill(heap: &mut Heap) {
     // Chunks are permanent; their blocks recycle through the free lists.
-    HEAP_PTR = malloc(HEAP_CHUNK);
-    HEAP_END = HEAP_PTR.add(HEAP_CHUNK);
+    heap.ptr = malloc(HEAP_CHUNK);
+    heap.end = heap.ptr.add(HEAP_CHUNK);
 }
 
 /// Allocate from the RC heap, bypassing any active arena (error boxes must
 /// survive region pops). Refcount starts at 1.
 #[no_mangle]
 pub extern "C" fn rt_alloc_global(size: i64) -> *mut u8 {
+    alloc_global_in(heap(), size)
+}
+
+fn alloc_global_in(heap: &mut Heap, size: i64) -> *mut u8 {
     let slots = 1 + (((size.max(0) as usize) + 7) >> 3); // header + payload
     unsafe {
         if slots <= MAX_CLASS {
-            let head = FREE_LISTS[slots];
+            let head = heap.free_lists[slots];
             let p = if !head.is_null() {
-                FREE_LISTS[slots] = *(head as *mut *mut u8);
+                heap.free_lists[slots] = *(head as *mut *mut u8);
                 head
             } else {
                 let bytes = slots * 8;
-                if HEAP_PTR.is_null() || HEAP_PTR.add(bytes) > HEAP_END {
-                    heap_refill();
+                if heap.ptr.is_null() || heap.ptr.add(bytes) > heap.end {
+                    heap_refill(heap);
                 }
-                let p = HEAP_PTR;
-                HEAP_PTR = HEAP_PTR.add(bytes);
+                let p = heap.ptr;
+                heap.ptr = heap.ptr.add(bytes);
                 p
             };
             *(p as *mut i64) = ((slots as i64) << CLASS_SHIFT) | 1;
@@ -151,8 +186,9 @@ pub extern "C" fn rt_alloc_global(size: i64) -> *mut u8 {
 /// otherwise from the RC heap.
 #[no_mangle]
 pub extern "C" fn rt_alloc(size: i64) -> *mut u8 {
+    let rt = rt();
     unsafe {
-        if let Some(region) = regions().last_mut() {
+        if let Some(region) = rt.regions.last_mut() {
             let size = ((size.max(0) as usize) + 7) & !7;
             let need = 8 + size;
             if region.cursor.add(need) > region.end {
@@ -163,7 +199,7 @@ pub extern "C" fn rt_alloc(size: i64) -> *mut u8 {
             *(p as *mut i64) = META_ARENA;
             return p.add(8);
         }
-        rt_alloc_global(size)
+        alloc_global_in(&mut rt.heap, size)
     }
 }
 
@@ -204,14 +240,15 @@ pub extern "C" fn rt_release(v: i64) -> i64 {
 /// system allocator.
 #[no_mangle]
 pub extern "C" fn rt_free(v: i64) {
+    let heap = heap();
     unsafe {
         let base = (v as *mut u8).sub(8);
         let class = (*(base as *mut i64) >> CLASS_SHIFT) as usize;
         if class == HUGE {
             free(base);
         } else {
-            *(base as *mut *mut u8) = FREE_LISTS[class];
-            FREE_LISTS[class] = base;
+            *(base as *mut *mut u8) = heap.free_lists[class];
+            heap.free_lists[class] = base;
         }
     }
 }
@@ -1454,6 +1491,197 @@ fn copy_desc(v: i64, d: &mut Desc) -> i64 {
 pub extern "C" fn rt_copy_desc(v: i64, desc: i64) -> i64 {
     let d = unsafe { std::str::from_utf8_unchecked(str_bytes(desc)) }.to_string();
     copy_desc(v, &mut Desc::new(&d))
+}
+
+// ---- tasks (spawn / await) -------------------------------------------------------
+//
+// `spawn(action)` runs the action on its own OS thread. The checker
+// guarantees the action is self-contained (empty error and capability
+// rows), so a task only touches its captured values. Captures are frozen
+// (made `META_STATIC`) before the thread starts: refcount traffic from two
+// threads would race, so both sides simply stop counting — frozen values
+// leak, a bounded cost per spawn. Arena-allocated captures are deep-copied
+// out first (the parent might pop the region while the task runs).
+
+/// Recursively mark every block reachable from `v` as static. Returns the
+/// (possibly copied) value: arena blocks are copied to the RC heap first.
+fn freeze_desc(v: i64, d: &mut Desc) -> i64 {
+    fn meta_of(v: i64) -> i64 {
+        unsafe { *(v as *const i64).sub(1) }
+    }
+    fn set_static(v: i64) {
+        unsafe {
+            let m = (v as *mut i64).sub(1);
+            // Already-static blocks may live in read-only data (literals).
+            if *m >= 1 {
+                *m = META_STATIC;
+            }
+        }
+    }
+    match d.peek() {
+        b'i' | b'b' | b'u' | b'd' | b'f' | b'F' | b'M' => {
+            d.skip();
+            v
+        }
+        _ => {
+            // Arena blocks: deep-copy the whole tree to the heap, then
+            // freeze the copy (children of an arena block are arena/static).
+            if v != 0 && meta_of(v) == META_ARENA {
+                let start = d.pos;
+                let mut cd = Desc { bytes: d.bytes, pos: start };
+                let copied = copy_desc(v, &mut cd);
+                d.pos = start;
+                return freeze_desc(copied, d);
+            }
+            match d.bump() {
+                b's' | b'h' => {
+                    if v != 0 {
+                        set_static(v);
+                    }
+                    v
+                }
+                b'O' => {
+                    if v == 0 {
+                        d.skip();
+                        return 0;
+                    }
+                    let inner = unsafe { *(v as *const i64) };
+                    let frozen = freeze_desc(inner, d);
+                    unsafe { *(v as *mut i64) = frozen };
+                    set_static(v);
+                    v
+                }
+                b'L' => {
+                    let start = d.pos;
+                    let p = v as *mut i64;
+                    let n = unsafe { *p } as usize;
+                    for i in 0..n {
+                        d.pos = start;
+                        let item = unsafe { *p.add(1 + i) };
+                        let frozen = freeze_desc(item, d);
+                        unsafe { *p.add(1 + i) = frozen };
+                    }
+                    d.pos = start;
+                    d.skip();
+                    set_static(v);
+                    v
+                }
+                b'T' => {
+                    let n = (d.bump() - b'0') as usize;
+                    let p = v as *mut i64;
+                    for i in 0..n {
+                        let elem = unsafe { *p.add(i) };
+                        let frozen = freeze_desc(elem, d);
+                        unsafe { *p.add(i) = frozen };
+                    }
+                    set_static(v);
+                    v
+                }
+                b'#' => {
+                    let idx: usize = d.until(b';').parse().unwrap_or(0);
+                    let line = registry_line(idx).to_string();
+                    let mut rd = Desc::new(&line);
+                    match rd.bump() {
+                        b'S' => {
+                            let _ = rd.until(b'{');
+                            let p = v as *mut i64;
+                            let mut i = 0;
+                            while rd.peek() != b'}' && rd.peek() != b'?' {
+                                let _ = rd.until(b':');
+                                let fv = unsafe { *p.add(i) };
+                                let frozen = freeze_desc(fv, &mut rd);
+                                unsafe { *p.add(i) = frozen };
+                                rd.bump();
+                                i += 1;
+                            }
+                            set_static(v);
+                            v
+                        }
+                        b'E' => {
+                            let body = unsafe {
+                                std::str::from_utf8_unchecked(&rd.bytes[rd.pos..rd.bytes.len() - 1])
+                            }
+                            .to_string();
+                            let variants = split_variants(&body);
+                            if variants.iter().all(|var| !var.contains('(')) {
+                                return v; // simple enums are plain ints
+                            }
+                            let p = v as *mut i64;
+                            let vid = unsafe { *p } as usize;
+                            if let Some(var) = variants.get(vid) {
+                                if let Some(paren) = var.find('(') {
+                                    let fields = &var[paren + 1..var.len() - 1];
+                                    let mut fd = Desc::new(fields);
+                                    let mut i = 1;
+                                    while fd.pos < fd.bytes.len() {
+                                        let _ = fd.until(b':');
+                                        let fv = unsafe { *p.add(i) };
+                                        let frozen = freeze_desc(fv, &mut fd);
+                                        unsafe { *p.add(i) = frozen };
+                                        fd.bump();
+                                        i += 1;
+                                    }
+                                }
+                            }
+                            set_static(v);
+                            v
+                        }
+                        _ => v,
+                    }
+                }
+                _ => v,
+            }
+        }
+    }
+}
+
+/// Freeze the value stored in a closure-environment slot (writes back the
+/// copied pointer when the value had to leave an arena).
+#[no_mangle]
+pub extern "C" fn rt_freeze_slot(slot: i64, desc: i64) {
+    let d = unsafe { std::str::from_utf8_unchecked(str_bytes(desc)) }.to_string();
+    unsafe {
+        let p = slot as *mut i64;
+        *p = freeze_desc(*p, &mut Desc::new(&d));
+    }
+}
+
+#[repr(C)]
+struct RtPair {
+    v: i64,
+    e: i64,
+}
+
+/// Run a thunk closure `{ fnptr, captures... }` on a new thread; returns a
+/// handle for `rt_task_await`. The closure record itself is frozen so
+/// neither thread frees it under the other.
+#[no_mangle]
+pub extern "C" fn rt_task_spawn(closure: i64) -> i64 {
+    unsafe {
+        let meta = (closure as *mut i64).sub(1);
+        if *meta >= 1 {
+            *meta = META_STATIC;
+        }
+    }
+    let env = closure as usize;
+    let handle = std::thread::Builder::new()
+        .stack_size(16 << 20)
+        .spawn(move || {
+            let f: extern "C" fn(*const i64) -> RtPair =
+                unsafe { std::mem::transmute(*(env as *const i64)) };
+            f(env as *const i64).v
+        })
+        .expect("spawn task thread");
+    Box::into_raw(Box::new(handle)) as i64
+}
+
+/// Join a task and take its result. The result was allocated on the task's
+/// heap; heap chunks are never unmapped, and after the join the parent is
+/// its exclusive owner, so normal RC drops apply.
+#[no_mangle]
+pub extern "C" fn rt_task_await(handle: i64) -> i64 {
+    let handle = unsafe { Box::from_raw(handle as *mut std::thread::JoinHandle<i64>) };
+    handle.join().unwrap_or(0)
 }
 
 // ---- JSON encode/decode over descriptors ----------------------------------------

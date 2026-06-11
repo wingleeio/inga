@@ -1156,3 +1156,44 @@ main :: () {
         "got: {errors:?}"
     );
 }
+
+#[test]
+fn tasks_spawn_await_round_trip() {
+    let out = run(
+        "double :: (Int n) -> Int {\n    n * 2\n}\n\nmain :: () {\n    xs = [1, 2, 3]\n    t = spawn(map(xs, double))\n    u = spawn(\"ready\")\n    println(await(t), await(u))\n}\n",
+    );
+    assert_eq!(out, "[2, 4, 6] ready\n");
+}
+
+#[test]
+fn spawned_tasks_must_be_self_contained() {
+    // Unhandled error row.
+    let errs = check_errors(
+        "struct Boom = { Int n }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(1)\n}\n\nmain :: () {\n    t = spawn(risky())\n    println(await(t))\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("self-contained") && m.contains("Boom")),
+        "got: {errs:?}"
+    );
+
+    // Unprovided capability.
+    let errs = check_errors(
+        "service Log {\n    say :: (String s)\n}\n\nshout :: () uses Log {\n    Log log\n    log.say(\"hi\")\n}\n\nmain :: () {\n    t = spawn(shout())\n    await(t)\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("self-contained") && m.contains("Log")),
+        "got: {errs:?}"
+    );
+
+    // Handling the error inside the spawned expression makes it fine.
+    let out = run(
+        "struct Boom = { Int n }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(7)\n}\n\nmain :: () {\n    t = spawn(risky() |> catch { Boom(n) -> n })\n    println(await(t))\n}\n",
+    );
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn await_requires_a_task() {
+    let errs = check_errors("main :: () {\n    println(await(3))\n}\n");
+    assert!(errs.iter().any(|m| m.contains("Task")), "got: {errs:?}");
+}

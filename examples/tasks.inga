@@ -1,0 +1,34 @@
+// Tasks: `spawn(action)` runs the action on its own thread and returns a
+// Task; `await(task)` waits and takes the result. A spawned action must be
+// self-contained — the checker rejects it if it can still fail or still
+// needs a capability, so a task can never observe a torn-down scope.
+//
+// `inga build` runs tasks on real OS threads (each with its own heap, so
+// there are no locks); `inga run` executes them at the spawn point.
+
+struct Report = { String label, Int total }
+
+sumTo :: (Int n, Int acc) -> Int {
+    if n == 0 {
+        acc
+    } else {
+        sumTo(n - 1, acc + n)
+    }
+}
+
+crunch :: (String label, Int n) -> Report {
+    Report(label, sumTo(n, 0))
+}
+
+main :: () {
+    // Three independent chunks of work, in flight at once.
+    a = spawn(crunch("small", 1000))
+    b = spawn(crunch("medium", 100000))
+    c = spawn(crunch("large", 10000000))
+
+    reports = [await(a), await(b), await(c)]
+    grand = fold(reports, 0, (acc, r) -> acc + r.total)
+
+    map(reports, (r) -> println("${r.label}: ${r.total}"))
+    println("grand total: ${grand}")
+}

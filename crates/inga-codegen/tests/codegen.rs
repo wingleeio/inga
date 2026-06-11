@@ -49,15 +49,14 @@ fn balatro_game_produces_ir() {
 }
 
 #[test]
-fn unsupported_constructs_are_clear_errors() {
+fn user_service_compiles_natively() {
+    // encode/decode/show all have native lowerings now (the runtime
+    // type-descriptor interpreter); the flagship example is fully native.
     let src = example("user_service.inga");
     let checked = check_source(&src);
-    let err = inga_codegen::compile(&checked.program, &checked.info)
-        .expect_err("user_service uses decode/encode and must be rejected");
-    assert!(
-        err.iter().any(|d| d.message.contains("not supported by `inga build`")),
-        "got: {err:?}"
-    );
+    let ir = inga_codegen::compile(&checked.program, &checked.info)
+        .expect("user_service compiles natively");
+    assert!(ir.contains("@rt_decode_desc"), "decode should lower to the descriptor runtime");
 }
 
 #[test]

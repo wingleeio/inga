@@ -671,8 +671,27 @@ impl<'a> Cg<'a> {
             self.unsupported(span, "using a constructor as a value");
             return "0".to_string();
         }
-        if self.funcs.contains_key(name) || name == "Some" || self.struct_meta.contains_key(name) {
-            self.unsupported(span, "using a function or constructor as a value");
+        // Top-level functions as values: wrap in a closure record carrying
+        // the current evidence for the function's `uses` row.
+        if let Some(decl) = self.funcs.get(name).copied() {
+            if decl.sig.params.iter().any(|p| p.lazy) {
+                self.unsupported(span, "using a function with `lazy` parameters as a value");
+                return "0".to_string();
+            }
+            let wrapper = self.fn_wrapper(decl);
+            let row = self.func_row(&decl.name);
+            let ptr = self.gen_alloc(f, (1 + row.caps.len()) as i64);
+            self.store_slot(f, &ptr, 0, &format!("ptrtoint (ptr {wrapper} to i64)"));
+            for (i, cap) in row.caps.iter().enumerate() {
+                let ev = f.evidence.get(cap).cloned().unwrap_or_else(|| "0".to_string());
+                self.store_slot(f, &ptr, 1 + i as i64, &ev);
+            }
+            let out = self.ptr_to_int(f, &ptr);
+            self.pool_value(f, &out, &CType::Func);
+            return out;
+        }
+        if name == "Some" || self.struct_meta.contains_key(name) {
+            self.unsupported(span, "using a constructor as a value");
             return "0".to_string();
         }
         self.unsupported(span, &format!("the name `{name}` here"));
@@ -725,6 +744,58 @@ impl<'a> Cg<'a> {
         self.store_slot(f, &ptr, 1, v);
         let err = self.ptr_to_int(f, &ptr);
         self.emit_failure(f, &err);
+    }
+
+    /// A closure-ABI wrapper for a top-level function, so it can be passed
+    /// as a value: env = { fnptr, evidence... }; wrapper(env, args) calls
+    /// through and normalizes to the fallible {value, err} shape.
+    fn fn_wrapper(&mut self, decl: &'a FuncDecl) -> String {
+        let sym = format!("@ing.fnw.{}", decl.name);
+        if self.drop_syms.contains_key(&sym) {
+            return sym;
+        }
+        self.drop_syms.insert(sym.clone(), sym.clone());
+        let row = self.func_row(&decl.name);
+        let fallible = self.func_fallible(decl);
+        let n = decl.sig.params.len();
+        let mut params = vec!["ptr %env".to_string()];
+        for i in 0..n {
+            params.push(format!("i64 %a{i}"));
+        }
+        let mut body = String::new();
+        let mut call_args = Vec::new();
+        for (i, _cap) in row.caps.iter().enumerate() {
+            let _ = writeln!(
+                body,
+                "  %ev{i}.p = getelementptr i64, ptr %env, i64 {}\n  %ev{i} = load i64, ptr %ev{i}.p",
+                1 + i
+            );
+            call_args.push(format!("i64 %ev{i}"));
+        }
+        for i in 0..n {
+            call_args.push(format!("i64 %a{i}"));
+        }
+        if fallible {
+            let _ = writeln!(
+                body,
+                "  %r = call {{ i64, i64 }} @ing.fn.{}({})\n  ret {{ i64, i64 }} %r",
+                decl.name,
+                call_args.join(", ")
+            );
+        } else {
+            let _ = writeln!(
+                body,
+                "  %v = call i64 @ing.fn.{}({})\n  %a = insertvalue {{ i64, i64 }} undef, i64 %v, 0\n  %b = insertvalue {{ i64, i64 }} %a, i64 0, 1\n  ret {{ i64, i64 }} %b",
+                decl.name,
+                call_args.join(", ")
+            );
+        }
+        let _ = writeln!(
+            self.functions,
+            "define {{ i64, i64 }} {sym}({}) {{\nentry:\n{body}}}\n",
+            params.join(", ")
+        );
+        sym
     }
 
     /// Force a lazy value: thunk = { fnptr, captures... }, fnptr(env) -> {v, err}.
@@ -2350,9 +2421,41 @@ impl<'a> Cg<'a> {
                 f.line(format!("{out} = fptosi double {fl} to i64"));
                 out
             }
-            "encode" | "decode" => {
-                self.unsupported(span, &format!("`{name}` (runtime JSON)"));
-                "0".to_string()
+            "encode" if args.len() == 1 => {
+                let cty = self.ctype_of(args[0]);
+                let v = self.gen_expr(f, args[0]);
+                let desc = self.desc_const(&cty);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_encode_desc(i64 {v}, i64 {desc})"));
+                self.pool_value(f, &out, &CType::Str);
+                out
+            }
+            "decode" if args.len() == 2 => {
+                let raw = self.gen_expr(f, args[0]);
+                let rcty = self.ctype_of_span(span);
+                let desc = self.desc_const(&rcty);
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @rt_decode_desc(i64 {raw}, i64 {desc})"));
+                let ok = self.load_slot_from_int(f, &boxed, 0);
+                let payload = self.load_slot_from_int(f, &boxed, 1);
+                let (fail_l, ok_l) = (self.label("dec.fail"), self.label("dec.ok"));
+                let c = self.tmp();
+                f.line(format!("{c} = icmp eq i64 {ok}, 0"));
+                f.line(format!("br i1 {c}, label %{fail_l}, label %{ok_l}"));
+                f.start_block(&fail_l);
+                // Build DecodeError { message } and raise it.
+                let err_ptr = self.gen_alloc(f, 1);
+                self.store_slot(f, &err_ptr, 0, &payload);
+                let err_val = self.ptr_to_int(f, &err_ptr);
+                self.emit_fail_value(
+                    f,
+                    &err_val,
+                    &CType::Struct("DecodeError".to_string()),
+                    span,
+                );
+                f.start_block(&ok_l);
+                self.pool_value(f, &payload, &rcty);
+                payload
             }
             _ => return None,
         };
@@ -3297,6 +3400,8 @@ declare i64 @rt_show_desc(i64, i64)
 declare i64 @rt_display_desc(i64, i64)
 declare i64 @rt_eq_desc(i64, i64, i64)
 declare i64 @rt_copy_desc(i64, i64)
+declare i64 @rt_encode_desc(i64, i64)
+declare i64 @rt_decode_desc(i64, i64)
 declare i64 @rt_random(i64)
 declare void @rt_gfx_run(i64, i64, i64, i64)
 declare void @rt_gfx_clear(i64, i64, i64)

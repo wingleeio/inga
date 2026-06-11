@@ -1455,3 +1455,362 @@ pub extern "C" fn rt_copy_desc(v: i64, desc: i64) -> i64 {
     let d = unsafe { std::str::from_utf8_unchecked(str_bytes(desc)) }.to_string();
     copy_desc(v, &mut Desc::new(&d))
 }
+
+// ---- JSON encode/decode over descriptors ----------------------------------------
+
+fn encode_desc(v: i64, d: &mut Desc, out: &mut String) {
+    match d.bump() {
+        b'i' | b'd' => out.push_str(&v.to_string()),
+        b'f' => out.push_str(&f64::from_bits(v as u64).to_string()),
+        b'b' => out.push_str(if v != 0 { "true" } else { "false" }),
+        b'u' => out.push_str("null"),
+        b's' => {
+            let s = unsafe { std::str::from_utf8_unchecked(str_bytes(v)) };
+            encode_json_str(s, out);
+        }
+        b'O' => {
+            if v == 0 {
+                d.skip();
+                out.push_str("null");
+            } else {
+                let inner = unsafe { *(v as *const i64) };
+                encode_desc(inner, d, out);
+            }
+        }
+        b'L' => {
+            out.push('[');
+            let start = d.pos;
+            let items = unsafe { list_items(v) };
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                d.pos = start;
+                encode_desc(*item, d, out);
+            }
+            if items.is_empty() {
+                d.pos = start;
+            }
+            d.pos = start;
+            d.skip();
+            out.push(']');
+        }
+        b'T' => {
+            let n = (d.bump() - b'0') as usize;
+            let p = v as *const i64;
+            out.push('[');
+            for i in 0..n {
+                if i > 0 {
+                    out.push(',');
+                }
+                encode_desc(unsafe { *p.add(i) }, d, out);
+            }
+            out.push(']');
+        }
+        b'#' => {
+            let idx: usize = d.until(b';').parse().unwrap_or(0);
+            let line = registry_line(idx);
+            let mut rd = Desc::new(line);
+            match rd.bump() {
+                b'S' => {
+                    let _ = rd.until(b'{');
+                    let p = v as *const i64;
+                    out.push('{');
+                    let mut i = 0;
+                    while rd.peek() != b'}' && rd.peek() != b'?' {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        let fname = rd.until(b':');
+                        encode_json_str(fname, out);
+                        out.push(':');
+                        encode_desc(unsafe { *p.add(i) }, &mut rd, out);
+                        rd.bump();
+                        i += 1;
+                    }
+                    out.push('}');
+                }
+                _ => {
+                    // Enums encode as their show form, quoted.
+                    let shown = show_desc(v, &mut Desc::new(&format!("#{idx};")), true);
+                    encode_json_str(&shown, out);
+                }
+            }
+        }
+        _ => out.push_str("null"),
+    }
+    fn encode_json_str(s: &str, out: &mut String) {
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\t' => out.push_str("\\t"),
+                '\r' => out.push_str("\\r"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_encode_desc(v: i64, desc: i64) -> i64 {
+    let d = unsafe { std::str::from_utf8_unchecked(str_bytes(desc)) };
+    let mut out = String::new();
+    encode_desc(v, &mut Desc::new(d), &mut out);
+    make_str(out.as_bytes())
+}
+
+// Minimal JSON value for decoding.
+enum Jv {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+    Arr(Vec<Jv>),
+    Obj(Vec<(String, Jv)>),
+}
+
+fn jparse(b: &[u8], p: &mut usize) -> Result<Jv, String> {
+    fn ws(b: &[u8], p: &mut usize) {
+        while matches!(b.get(*p), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            *p += 1;
+        }
+    }
+    ws(b, p);
+    match b.get(*p) {
+        Some(b'n') => {
+            *p += 4;
+            Ok(Jv::Null)
+        }
+        Some(b't') => {
+            *p += 4;
+            Ok(Jv::Bool(true))
+        }
+        Some(b'f') => {
+            *p += 5;
+            Ok(Jv::Bool(false))
+        }
+        Some(b'"') => {
+            *p += 1;
+            let mut s = String::new();
+            loop {
+                match b.get(*p) {
+                    None => return Err("unterminated string".into()),
+                    Some(b'"') => {
+                        *p += 1;
+                        return Ok(Jv::Str(s));
+                    }
+                    Some(b'\\') => {
+                        *p += 1;
+                        match b.get(*p) {
+                            Some(b'n') => s.push('\n'),
+                            Some(b't') => s.push('\t'),
+                            Some(b'r') => s.push('\r'),
+                            Some(b'"') => s.push('"'),
+                            Some(b'\\') => s.push('\\'),
+                            Some(b'/') => s.push('/'),
+                            Some(b'u') => {
+                                let hex = b
+                                    .get(*p + 1..*p + 5)
+                                    .and_then(|h| std::str::from_utf8(h).ok())
+                                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+                                    .and_then(char::from_u32)
+                                    .ok_or("bad \\u escape")?;
+                                s.push(hex);
+                                *p += 4;
+                            }
+                            _ => return Err("bad escape".into()),
+                        }
+                        *p += 1;
+                    }
+                    Some(_) => {
+                        let start = *p;
+                        *p += 1;
+                        while b.get(*p).is_some_and(|c| (c & 0xC0) == 0x80) {
+                            *p += 1;
+                        }
+                        s.push_str(&String::from_utf8_lossy(&b[start..*p]));
+                    }
+                }
+            }
+        }
+        Some(b'[') => {
+            *p += 1;
+            let mut items = Vec::new();
+            ws(b, p);
+            if b.get(*p) == Some(&b']') {
+                *p += 1;
+                return Ok(Jv::Arr(items));
+            }
+            loop {
+                items.push(jparse(b, p)?);
+                ws(b, p);
+                match b.get(*p) {
+                    Some(b',') => *p += 1,
+                    Some(b']') => {
+                        *p += 1;
+                        return Ok(Jv::Arr(items));
+                    }
+                    _ => return Err("expected , or ]".into()),
+                }
+            }
+        }
+        Some(b'{') => {
+            *p += 1;
+            let mut entries = Vec::new();
+            ws(b, p);
+            if b.get(*p) == Some(&b'}') {
+                *p += 1;
+                return Ok(Jv::Obj(entries));
+            }
+            loop {
+                ws(b, p);
+                let Jv::Str(key) = jparse(b, p)? else { return Err("expected key".into()) };
+                ws(b, p);
+                if b.get(*p) != Some(&b':') {
+                    return Err("expected :".into());
+                }
+                *p += 1;
+                let value = jparse(b, p)?;
+                entries.push((key, value));
+                ws(b, p);
+                match b.get(*p) {
+                    Some(b',') => *p += 1,
+                    Some(b'}') => {
+                        *p += 1;
+                        return Ok(Jv::Obj(entries));
+                    }
+                    _ => return Err("expected , or }".into()),
+                }
+            }
+        }
+        Some(c) if c.is_ascii_digit() || *c == b'-' => {
+            let start = *p;
+            let mut float = false;
+            while let Some(c) = b.get(*p) {
+                match c {
+                    b'0'..=b'9' | b'-' | b'+' => *p += 1,
+                    b'.' | b'e' | b'E' => {
+                        float = true;
+                        *p += 1;
+                    }
+                    _ => break,
+                }
+            }
+            let text = std::str::from_utf8(&b[start..*p]).map_err(|_| "bad number")?;
+            if float {
+                text.parse().map(Jv::Float).map_err(|_| "bad number".into())
+            } else {
+                text.parse().map(Jv::Int).map_err(|_| "bad number".into())
+            }
+        }
+        _ => Err("unexpected character".into()),
+    }
+}
+
+fn decode_value(jv: &Jv, d: &mut Desc) -> Result<i64, String> {
+    match d.bump() {
+        b'i' | b'd' => match jv {
+            Jv::Int(n) => Ok(*n),
+            _ => Err("expected a number".into()),
+        },
+        b'f' => match jv {
+            Jv::Float(x) => Ok(x.to_bits() as i64),
+            Jv::Int(n) => Ok((*n as f64).to_bits() as i64),
+            _ => Err("expected a number".into()),
+        },
+        b'b' => match jv {
+            Jv::Bool(x) => Ok(*x as i64),
+            _ => Err("expected a boolean".into()),
+        },
+        b's' => match jv {
+            Jv::Str(s) => Ok(make_str(s.as_bytes())),
+            _ => Err("expected a string".into()),
+        },
+        b'O' => match jv {
+            Jv::Null => {
+                d.skip();
+                Ok(0)
+            }
+            other => {
+                let inner = decode_value(other, d)?;
+                let q = rt_alloc(8) as *mut i64;
+                unsafe { *q = inner };
+                Ok(q as i64)
+            }
+        },
+        b'L' => match jv {
+            Jv::Arr(items) => {
+                let start = d.pos;
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    d.pos = start;
+                    out.push(decode_value(item, d)?);
+                }
+                d.pos = start;
+                d.skip();
+                Ok(make_list(&out))
+            }
+            _ => Err("expected an array".into()),
+        },
+        b'#' => {
+            let idx: usize = d.until(b';').parse().unwrap_or(0);
+            let line = registry_line(idx).to_string();
+            let mut rd = Desc::new(&line);
+            match rd.bump() {
+                b'S' => {
+                    let name = rd.until(b'{').to_string();
+                    let Jv::Obj(entries) = jv else {
+                        return Err(format!("expected a JSON object for `{name}`"));
+                    };
+                    let mut fields = Vec::new();
+                    while rd.peek() != b'}' && rd.peek() != b'?' {
+                        let fname = rd.until(b':');
+                        match entries.iter().find(|(k, _)| k == fname) {
+                            Some((_, v)) => fields.push(decode_value(v, &mut rd)?),
+                            None => return Err(format!("missing field `{fname}` for `{name}`")),
+                        }
+                        rd.bump();
+                    }
+                    let q = rt_alloc(8 * fields.len().max(1) as i64) as *mut i64;
+                    for (i, fv) in fields.iter().enumerate() {
+                        unsafe { *q.add(i) = *fv };
+                    }
+                    Ok(q as i64)
+                }
+                _ => Err("cannot decode into this type".into()),
+            }
+        }
+        _ => Err("cannot decode into this type".into()),
+    }
+}
+
+/// Decode JSON into a value of the described type. Returns a 2-slot box
+/// `{ ok, value-or-error-message }`.
+#[no_mangle]
+pub extern "C" fn rt_decode_desc(json: i64, desc: i64) -> i64 {
+    let text = unsafe { std::str::from_utf8_unchecked(str_bytes(json)) };
+    let d = unsafe { std::str::from_utf8_unchecked(str_bytes(desc)) }.to_string();
+    let mut pos = 0;
+    let result = jparse(text.as_bytes(), &mut pos)
+        .and_then(|jv| decode_value(&jv, &mut Desc::new(&d)));
+    let q = rt_alloc(16) as *mut i64;
+    unsafe {
+        match result {
+            Ok(v) => {
+                *q = 1;
+                *q.add(1) = v;
+            }
+            Err(msg) => {
+                *q = 0;
+                *q.add(1) = make_str(msg.as_bytes());
+            }
+        }
+    }
+    q as i64
+}

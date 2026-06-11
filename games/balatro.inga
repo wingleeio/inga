@@ -11,11 +11,16 @@
 // is a GLSL fragment shader compiled at runtime through graphics.shaderNew.
 
 use std/graphics
-use util { brighten, button, cap255, centerText, dim, drawBackground, gn, gv, hit, rgb, roundRect, textC }
+use util {
+    brighten, button, cap255, centerText, dim, drawBackground, gn, gv, hit, rgb, roundRect, textC,
+}
 use cards { chipsOf, rankName, suitCol, suitName }
 use jokers { jokerDesc, jokerName, jokerPrice }
 use poker { handTypeName, scoreSelected }
-use state { blindName, discardSelected, finishPlay, nextBlind, playHand, restart, rollShop, selCount, sortHand }
+use state {
+    blindName, discardSelected, finishPlay, nextBlind, playHand, restart, rollShop, selCount,
+    sortHand,
+}
 
 // Animation slots in `av`: 0..7 card lift, 10..17 deal slide (both x1000),
 // 20..27 stage progress (x1000), 30..37 card flash + 40..47 its popup value,

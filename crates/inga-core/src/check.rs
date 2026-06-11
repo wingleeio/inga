@@ -1517,6 +1517,25 @@ impl<'a> Checker<'a> {
         span: Span,
     ) -> Type {
         match name {
+            "upTo" => {
+                if args.len() != 2 {
+                    self.error(span, "`schedule.upTo` takes (schedule, times)");
+                }
+                if let Some(arg) = args.first() {
+                    let ty = self.check_expr(arg);
+                    self.unify_at(&Type::Schedule, &ty, arg.span, "upTo input");
+                }
+                if let Some(arg) = args.get(1) {
+                    let ty = self.check_expr(arg);
+                    self.unify_at(&Type::Int, &ty, arg.span, "upTo count");
+                }
+                if self.record_info {
+                    if let Some(doc) = builtin_doc("schedule.upTo") {
+                        self.info.hovers.push((name_span, doc.to_string()));
+                    }
+                }
+                Type::Schedule
+            }
             "exponential" | "fixed" => {
                 if args.len() != 1 {
                     self.error(span, format!("`schedule.{name}` takes one Duration argument"));
@@ -1535,7 +1554,7 @@ impl<'a> Checker<'a> {
             _ => {
                 self.error(
                     name_span,
-                    format!("unknown schedule `schedule.{name}` (try `exponential` or `fixed`)"),
+                    format!("unknown schedule `schedule.{name}` (try `exponential`, `fixed`, or `upTo`)"),
                 );
                 for arg in args {
                     self.check_expr(arg);
@@ -1751,16 +1770,6 @@ impl<'a> Checker<'a> {
                 let schedule_ty = self.check_expr(args[1]);
                 self.unify_at(&Type::Schedule, &schedule_ty, args[1].span, "retry schedule");
                 action_ty
-            }
-            "upTo" => {
-                if !check_arity(self, 2) {
-                    return Some(Type::Unknown);
-                }
-                let schedule_ty = self.check_expr(args[0]);
-                self.unify_at(&Type::Schedule, &schedule_ty, args[0].span, "upTo input");
-                let n_ty = self.check_expr(args[1]);
-                self.unify_at(&Type::Int, &n_ty, args[1].span, "upTo count");
-                Type::Schedule
             }
             "ignoreFailure" => {
                 if !check_arity(self, 1) {
@@ -2516,6 +2525,10 @@ impl<'a> Checker<'a> {
             return;
         }
         for decl in &self.program.decls {
+            if let Decl::Use(u) = decl {
+                self.record_use_info(u);
+                continue;
+            }
             let def = match decl {
                 Decl::Use(_) => continue,
                 Decl::Struct(d) => DefInfo {
@@ -2569,6 +2582,111 @@ impl<'a> Checker<'a> {
                     self.info.hovers.push((d.name_span, detail));
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// Hover + go-to-definition for `use` lines: the path hovers with the
+    /// module's exports (and jumps to the file); selected names hover with
+    /// their signatures and jump to their declarations.
+    fn record_use_info(&mut self, u: &UseDecl) {
+        let joined = u.path.join("/");
+        match joined.as_str() {
+            "std/graphics" => {
+                self.info.hovers.push((
+                    u.path_span,
+                    "std/graphics — GL-backed 2D graphics: graphics.run/clear/rect/rectLines/circle/text/textWidth/mouseX/mouseY/mousePressed/shaderNew/shaderUse/shaderOff".to_string(),
+                ));
+                return;
+            }
+            "std/schedule" => {
+                self.info.hovers.push((
+                    u.path_span,
+                    "std/schedule — retry schedules: schedule.exponential(base), schedule.fixed(interval), schedule.upTo(schedule, times)".to_string(),
+                ));
+                return;
+            }
+            _ => {}
+        }
+        let ref_module = self.module_of(u.path_span);
+        let Some(import) = self.modules[ref_module]
+            .imports
+            .iter()
+            .find(|i| i.span == u.path_span)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(target) = self.modules.iter().position(|m| m.key == import.target) else {
+            return;
+        };
+        // The module's exports, for the path hover.
+        let mut exports: Vec<String> = Vec::new();
+        for (name, info) in &self.funcs {
+            if info.module == target && info.is_pub {
+                exports.push(name.clone());
+            }
+        }
+        for (name, info) in &self.structs {
+            if info.module == target && info.is_pub {
+                exports.push(name.clone());
+            }
+        }
+        for (name, info) in &self.enums {
+            if info.module == target && info.is_pub {
+                exports.push(name.clone());
+            }
+        }
+        for (name, info) in &self.services {
+            if info.module == target && info.is_pub {
+                exports.push(name.clone());
+            }
+        }
+        for (name, info) in &self.impls {
+            if info.module == target && info.is_pub {
+                exports.push(name.clone());
+            }
+        }
+        exports.sort();
+        let listing = if exports.is_empty() {
+            "no pub declarations".to_string()
+        } else {
+            format!("pub: {}", exports.join(", "))
+        };
+        let module = &self.modules[target];
+        self.info
+            .hovers
+            .push((u.path_span, format!("module {} ({}) — {listing}", module.name, module.path.display())));
+        // Jump from the path to the top of the file.
+        let file_start = Span::new(module.base, module.base);
+        self.info.refs.push((u.path_span, file_start));
+        // Selected names jump to (and hover as) their declarations.
+        for (name, nspan) in u.names.as_deref().unwrap_or(&[]) {
+            if let Some(info) = self.funcs.get(name) {
+                if info.module == target {
+                    self.info.refs.push((*nspan, info.name_span));
+                    let sig = self.render_func_signature(name);
+                    self.info.hovers.push((*nspan, sig));
+                }
+                continue;
+            }
+            let def_span = self
+                .structs
+                .get(name)
+                .map(|i| i.name_span)
+                .or_else(|| self.enums.get(name).map(|i| i.name_span))
+                .or_else(|| {
+                    self.variant_owner
+                        .get(name)
+                        .and_then(|owner| self.enums.get(owner))
+                        .map(|i| i.name_span)
+                })
+                .or_else(|| self.services.get(name).map(|i| i.name_span))
+                .or_else(|| self.impls.get(name).map(|i| i.name_span));
+            if let Some(def_span) = def_span {
+                self.info.refs.push((*nspan, def_span));
+            } else {
+                self.warn(*nspan, format!("module `{}` has no pub `{name}`", self.modules[target].name));
             }
         }
     }
@@ -2632,7 +2750,7 @@ pub fn builtin_doc(name: &str) -> Option<&'static str> {
     builtin_completions().into_iter().find(|(n, _)| *n == name).map(|(_, doc)| doc)
 }
 
-const BUILTIN_NAMES: [&str; 19] = [
+const BUILTIN_NAMES: [&str; 18] = [
     "println",
     "print",
     "show",
@@ -2642,7 +2760,6 @@ const BUILTIN_NAMES: [&str; 19] = [
     "getOrElse",
     "orFail",
     "retry",
-    "upTo",
     "ignoreFailure",
     "sleep",
     "len",
@@ -2666,7 +2783,7 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("getOrElse", "getOrElse(option, default) -> a"),
         ("orFail", "orFail(option, error) -> a — unwrap Some, or fail with `error`"),
         ("retry", "retry(lazy action, schedule) -> a — re-run per the Schedule; the error row is kept (a retried action can still fail)"),
-        ("upTo", "upTo(schedule, times) -> Schedule — cap the retry count"),
+        ("schedule.upTo", "schedule.upTo(schedule, times) -> Schedule — cap the retry count"),
         ("ignoreFailure", "ignoreFailure(lazy action) -> Unit — swallow the error channel"),
         ("sleep", "sleep(duration) -> Unit"),
         ("len", "len(stringOrList) -> Int"),

@@ -1796,6 +1796,23 @@ impl<'a> Cg<'a> {
     // ---- builtins -----------------------------------------------------------------------------
 
     fn gen_schedule(&mut self, f: &mut FnCtx, name: &str, args: &[&Expr], span: Span) -> String {
+        if name == "upTo" {
+            if args.len() != 2 {
+                self.unsupported(span, "this `schedule.upTo` call shape");
+                return "0".to_string();
+            }
+            let sched = self.gen_expr(f, args[0]);
+            let n = self.gen_expr(f, args[1]);
+            let kind = self.load_slot_from_int(f, &sched, 0);
+            let base = self.load_slot_from_int(f, &sched, 1);
+            let ptr = self.gen_alloc(f, 3);
+            self.store_slot(f, &ptr, 0, &kind);
+            self.store_slot(f, &ptr, 1, &base);
+            self.store_slot(f, &ptr, 2, &n);
+            let out = self.ptr_to_int(f, &ptr);
+            self.pool_value(f, &out, &CType::Schedule);
+            return out;
+        }
         let kind = match name {
             "exponential" => 0,
             "fixed" => 1,
@@ -2019,19 +2036,6 @@ impl<'a> Cg<'a> {
                 "0".to_string()
             }
             "retry" if args.len() == 2 => return Some(self.gen_retry(f, args[0], args[1])),
-            "upTo" if args.len() == 2 => {
-                let sched = self.gen_expr(f, args[0]);
-                let n = self.gen_expr(f, args[1]);
-                let kind = self.load_slot_from_int(f, &sched, 0);
-                let base = self.load_slot_from_int(f, &sched, 1);
-                let ptr = self.gen_alloc(f, 3);
-                self.store_slot(f, &ptr, 0, &kind);
-                self.store_slot(f, &ptr, 1, &base);
-                self.store_slot(f, &ptr, 2, &n);
-                let out = self.ptr_to_int(f, &ptr);
-                self.pool_value(f, &out, &CType::Schedule);
-                out
-            }
             "sleep" if args.len() == 1 => {
                 let v = self.gen_expr(f, args[0]);
                 f.line(format!("call void @rt_sleep_millis(i64 {v})"));

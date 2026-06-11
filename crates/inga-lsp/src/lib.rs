@@ -32,8 +32,12 @@ use inga_core::Checked;
 /// resolved relative to it (open documents win over the disk copy); the
 /// entry module is always first, so its spans start at 0 and positions in
 /// the open file map 1:1.
-fn check_document(uri: &lsp_types::Url, src: &str, docs: &HashMap<Url, String>) -> Checked {
-    let Ok(path) = uri.to_file_path() else { return check_single(src) };
+fn check_document(
+    uri: &lsp_types::Url,
+    src: &str,
+    docs: &HashMap<Url, String>,
+) -> (Checked, Vec<inga_core::modules::ModuleSrc>, u32) {
+    let Ok(path) = uri.to_file_path() else { return (check_single(src), Vec::new(), 0) };
     // A library module (no `main`) is checked in the context of the sibling
     // program that imports it.
     let entry = inga_core::modules::resolve_entry_for(&path, src).unwrap_or_else(|| path.clone());
@@ -54,8 +58,9 @@ fn check_document(uri: &lsp_types::Url, src: &str, docs: &HashMap<Url, String>) 
             .or_else(|| std::fs::read_to_string(p).ok())
     });
     let (checked, modules) = inga_core::check_loaded(loaded);
-    // Surface only results that live in the open file, shifted back to its
-    // local span coordinates.
+    // Diagnostics/hovers/defs surface only for the open file, shifted back
+    // to its local coordinates. Refs stay GLOBAL so go-to-definition can
+    // jump across modules.
     let module = modules
         .iter()
         .find(|m| std::fs::canonicalize(&m.path).unwrap_or_else(|_| m.path.clone()) == this);
@@ -76,12 +81,7 @@ fn check_document(uri: &lsp_types::Url, src: &str, docs: &HashMap<Url, String>) 
     for d in &mut checked.info.defs {
         d.span = shift(d.span);
     }
-    checked.info.refs.retain(|(u, d)| inside(*u) && inside(*d));
-    for (u, d) in &mut checked.info.refs {
-        *u = shift(*u);
-        *d = shift(*d);
-    }
-    checked
+    (checked, modules, base)
 }
 use inga_core::diag::Severity;
 use inga_core::span::{LineIndex, Span};
@@ -184,7 +184,7 @@ impl Server {
 
     fn compute_diagnostics(&self, uri: &Url) -> Vec<Diagnostic> {
         let Some(src) = self.documents.get(uri) else { return Vec::new() };
-        let checked = check_document(uri, src, &self.documents);
+        let (checked, _mods, _base) = check_document(uri, src, &self.documents);
         let lines = LineIndex::new(src);
         checked
             .diagnostics
@@ -242,7 +242,7 @@ impl Server {
         let src = self.documents.get(&uri)?;
         let lines = LineIndex::new(src);
         let offset = lines.offset_utf16(src, position.line, position.character);
-        let checked = check_document(&uri, src, &self.documents);
+        let (checked, _mods, _base) = check_document(&uri, src, &self.documents);
         // Innermost hover span containing the offset.
         let best = checked
             .info
@@ -264,16 +264,35 @@ impl Server {
         let src = self.documents.get(&uri)?;
         let lines = LineIndex::new(src);
         let offset = lines.offset_utf16(src, position.line, position.character);
-        let checked = check_document(&uri, src, &self.documents);
+        let (checked, modules, base) = check_document(&uri, src, &self.documents);
+        // Refs are in the program's global span space; the definition may
+        // live in another module's file.
+        let global = offset + base;
         let (_, def_span) = checked
             .info
             .refs
             .iter()
-            .find(|(use_span, _)| use_span.contains(offset))?;
-        Some(GotoDefinitionResponse::Scalar(Location {
-            uri,
-            range: span_range(src, &lines, *def_span),
-        }))
+            .find(|(use_span, _)| use_span.contains(global))?;
+        let target = modules.iter().find(|m| m.contains(*def_span));
+        match target {
+            Some(m) if m.base != base => {
+                let abs = m.path.canonicalize().unwrap_or_else(|_| m.path.clone());
+                let target_uri = Url::from_file_path(&abs).ok()?;
+                let local = Span::new(def_span.start - m.base, def_span.end - m.base);
+                let target_lines = LineIndex::new(&m.src);
+                Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: target_uri,
+                    range: span_range(&m.src, &target_lines, local),
+                }))
+            }
+            _ => {
+                let local = Span::new(def_span.start - base, def_span.end - base);
+                Some(GotoDefinitionResponse::Scalar(Location {
+                    uri,
+                    range: span_range(src, &lines, local),
+                }))
+            }
+        }
     }
 
     fn format(&self, params: lsp_types::DocumentFormattingParams) -> Option<Vec<TextEdit>> {
@@ -326,7 +345,7 @@ impl Server {
     fn completion(&self, params: lsp_types::CompletionParams) -> Option<CompletionResponse> {
         let uri = params.text_document_position.text_document.uri;
         let src = self.documents.get(&uri)?;
-        let checked = check_document(&uri, src, &self.documents);
+        let (checked, _mods, _base) = check_document(&uri, src, &self.documents);
         let mut items: Vec<CompletionItem> = Vec::new();
         for def in &checked.info.defs {
             items.push(CompletionItem {

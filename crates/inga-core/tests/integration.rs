@@ -109,10 +109,10 @@ use std/schedule
 main :: () {
     d = 2.minutes + 30.seconds
     println(d)
-    println(schedule.exponential(100.millis) |> upTo(3))
+    println(schedule.exponential(100.millis) |> schedule.upTo(3))
 }
 "#);
-    assert_eq!(out, "150.seconds\nschedule.exponential(100.millis) |> upTo(3)\n");
+    assert_eq!(out, "150.seconds\nschedule.exponential(100.millis) |> schedule.upTo(3)\n");
 }
 
 // ---- errors as effects ---------------------------------------------------------
@@ -516,7 +516,7 @@ main :: () {
         // retry does not clear the error row — a retried action can still
         // fail — so main still has to catch.
         n = attempt()
-            |> retry(schedule.fixed(1.millis) |> upTo(5))
+            |> retry(schedule.fixed(1.millis) |> schedule.upTo(5))
             |> catch { Flaky -> -1 }
         println(n)
     }
@@ -911,5 +911,65 @@ main :: () {
         checked.diagnostics.iter().any(|d| d.message.contains("private to module `lib`")),
         "got: {:?}",
         checked.diagnostics
+    );
+}
+
+#[test]
+fn pipe_feeds_first_argument_of_builtins_too() {
+    let out = run(r#"
+main :: () {
+    n = [1, 2, 3]
+        |> map((x) -> x * 10)
+        |> len
+    println(n)
+    println([4, 5] |> map((x) -> x + 1))
+}
+"#);
+    assert_eq!(out, "3\n[5, 6]\n");
+}
+
+#[test]
+fn use_lines_hover_and_resolve_cross_module() {
+    use std::path::Path;
+    let lib = r#"
+pub yell :: (String s) -> String {
+    "${s}!"
+}
+"#;
+    let main_src = r#"
+use lib { yell }
+
+main :: () {
+    println(yell("hey"))
+}
+"#;
+    let loaded = inga_core::modules::load_program_with(
+        Path::new("/virtual/main.inga"),
+        main_src.to_string(),
+        &mut |p| (p == Path::new("/virtual/lib.inga")).then(|| lib.to_string()),
+    );
+    let (checked, mods) = inga_core::check_loaded(loaded);
+    let entry_end = mods[0].end;
+    // The use path hovers with the module's exports.
+    assert!(
+        checked.info.hovers.iter().any(|(_, t)| t.starts_with("module lib") && t.contains("yell")),
+        "no module hover: {:?}",
+        checked.info.hovers
+    );
+    // The selected name hovers with its signature.
+    assert!(
+        checked.info.hovers.iter().any(|(_, t)| t.starts_with("yell ::")),
+        "no signature hover for the selected name"
+    );
+    // And go-to-definition refs cross the module boundary: a use inside the
+    // entry resolves to a definition span inside lib's range.
+    assert!(
+        checked
+            .info
+            .refs
+            .iter()
+            .any(|(u, d)| u.start <= entry_end && d.start > entry_end),
+        "no cross-module ref: {:?}",
+        checked.info.refs
     );
 }

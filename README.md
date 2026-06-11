@@ -28,7 +28,7 @@ fetchAndCache :: (id) {
     Logger logger
 
     user = db.findUser(id)
-        |> retry(schedule.exponential(100.millis) |> upTo(3))
+        |> retry(schedule.exponential(100.millis) |> schedule.upTo(3))
         |> orFail(UserNotFound(id))
         |> catch {
             DbError(cause) -> {

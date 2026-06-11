@@ -107,7 +107,7 @@ the expression cannot fail with is an *unreachable-arm warning*. Helpers:
 `orFail(option, err)` unwraps or fails;
 `ignoreFailure(action)` swallows the error channel and returns `Unit`;
 `retry(action, schedule)` re-runs the action per a `Schedule`
-(`schedule.exponential(100.millis) |> upTo(3)`, `schedule.fixed(...)` — from
+(`schedule.exponential(100.millis) |> schedule.upTo(3)`, `schedule.fixed(...)` — from
 `use std/schedule`).
 `retry` deliberately does **not** clear the row — a retried action can still
 fail.

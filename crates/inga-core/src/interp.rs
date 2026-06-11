@@ -745,6 +745,20 @@ impl<'a> Interp<'a> {
         span: Span,
         scope: &Scope<'a>,
     ) -> EvalResult<'a> {
+        if name == "upTo" {
+            if args.len() != 2 {
+                return self.fatal(span, "`schedule.upTo` takes (schedule, times)");
+            }
+            let sched = self.eval(args[0], scope)?;
+            let n = self.eval(args[1], scope)?;
+            return match (sched, n) {
+                (Value::Schedule(mut sched), Value::Int(times)) => {
+                    sched.max_retries = Some(times);
+                    Ok(Value::Schedule(sched))
+                }
+                _ => self.fatal(span, "`schedule.upTo` adjusts a Schedule by an Int"),
+            };
+        }
         let kind = match name {
             "exponential" => ScheduleKind::Exponential,
             "fixed" => ScheduleKind::Fixed,
@@ -1025,23 +1039,6 @@ impl<'a> Interp<'a> {
                 Err(e) => Err(e),
             },
             "retry" if args.len() == 2 => self.builtin_retry(args, scope),
-            "upTo" if args.len() == 2 => {
-                let schedule = match self.eval(args[0], scope) {
-                    Ok(v) => v,
-                    Err(e) => return Some(Err(e)),
-                };
-                let n = match self.eval(args[1], scope) {
-                    Ok(v) => v,
-                    Err(e) => return Some(Err(e)),
-                };
-                match (schedule, n) {
-                    (Value::Schedule(mut sched), Value::Int(times)) => {
-                        sched.max_retries = Some(times);
-                        Ok(Value::Schedule(sched))
-                    }
-                    _ => self.fatal(span, "`upTo` adjusts a Schedule by an Int"),
-                }
-            }
             "ignoreFailure" if args.len() == 1 => match self.eval(args[0], scope) {
                 Ok(_) => Ok(Value::Unit),
                 Err(Failure::Fatal(e)) => Err(Failure::Fatal(e)),
@@ -1553,7 +1550,7 @@ pub fn show(value: &Value) -> String {
             };
             match s.max_retries {
                 Some(n) => {
-                    format!("schedule.{kind}({}) |> upTo({n})", format_duration(s.base_ms))
+                    format!("schedule.{kind}({}) |> schedule.upTo({n})", format_duration(s.base_ms))
                 }
                 None => format!("schedule.{kind}({})", format_duration(s.base_ms)),
             }

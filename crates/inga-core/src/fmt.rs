@@ -141,11 +141,44 @@ impl Printer {
                 Decl::Use(d) => {
                     self.flush_comments_before(d.span.start, 0);
                     self.blank_line_if_gap(self.lines.line(d.span.start));
-                    self.out.push_str(&format!("use {}", d.path.join("/")));
-                    if let Some(names) = &d.names {
-                        let inner: Vec<String> =
-                            names.iter().map(|(n, _)| n.clone()).collect();
-                        self.out.push_str(&format!(" {{ {} }}", inner.join(", ")));
+                    let head = format!("use {}", d.path.join("/"));
+                    match &d.names {
+                        None => self.out.push_str(&head),
+                        Some(names) => {
+                            let inner: Vec<String> =
+                                names.iter().map(|(n, _)| n.clone()).collect();
+                            let inline = format!("{head} {{ {} }}", inner.join(", "));
+                            if inline.len() <= MAX_WIDTH {
+                                self.out.push_str(&inline);
+                            } else {
+                                // Fill-wrap the name list at the line width.
+                                self.out.push_str(&head);
+                                self.out.push_str(" {\n");
+                                let mut line = String::new();
+                                for (i, name) in inner.iter().enumerate() {
+                                    let piece = if i + 1 == inner.len() {
+                                        format!("{name},")
+                                    } else {
+                                        format!("{name}, ")
+                                    };
+                                    if !line.is_empty()
+                                        && INDENT.len() + line.len() + piece.len() > MAX_WIDTH
+                                    {
+                                        self.out.push_str(INDENT);
+                                        self.out.push_str(line.trim_end());
+                                        self.out.push('\n');
+                                        line.clear();
+                                    }
+                                    line.push_str(&piece);
+                                }
+                                if !line.is_empty() {
+                                    self.out.push_str(INDENT);
+                                    self.out.push_str(line.trim_end());
+                                    self.out.push('\n');
+                                }
+                                self.out.push('}');
+                            }
+                        }
                     }
                     self.attach_trailing_comment(d.span.end);
                     self.out.push('\n');

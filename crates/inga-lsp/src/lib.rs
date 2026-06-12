@@ -97,7 +97,10 @@ pub fn run_server() {
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
-        completion_provider: Some(CompletionOptions::default()),
+        completion_provider: Some(CompletionOptions {
+            trigger_characters: Some(vec![".".to_string()]),
+            ..Default::default()
+        }),
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
             SemanticTokensOptions {
@@ -353,6 +356,12 @@ impl Server {
     fn completion(&self, params: lsp_types::CompletionParams) -> Option<CompletionResponse> {
         let uri = params.text_document_position.text_document.uri;
         let src = self.documents.get(&uri)?;
+        let position = params.text_document_position.position;
+        let lines = LineIndex::new(src);
+        let offset = lines.offset_utf16(src, position.line, position.character);
+        if let Some(items) = self.member_completion(&uri, src, offset) {
+            return Some(CompletionResponse::Array(items));
+        }
         let (checked, _mods, _base) = check_document(&uri, src, &self.documents);
         let mut items: Vec<CompletionItem> = Vec::new();
         for def in &checked.info.defs {
@@ -427,6 +436,114 @@ impl Server {
             }
         }
         Some(CompletionResponse::Array(items))
+    }
+
+    /// Completions after a `.`: module members for `schedule.`/`fiber.`/
+    /// `graphics.`/file-module aliases, and value members (struct fields,
+    /// service methods, map ops, tuple indexes, Int suffixes) by checked
+    /// type. Returns None when the cursor is not in a member position.
+    fn member_completion(
+        &self,
+        uri: &Url,
+        src: &str,
+        offset: u32,
+    ) -> Option<Vec<CompletionItem>> {
+        // Token scan: cursor right after `recv.` or `recv.partial`.
+        let mut diags = Vec::new();
+        let tokens = inga_core::lexer::lex(src, &mut diags);
+        let significant: Vec<&Token> = tokens
+            .iter()
+            .filter(|t| !matches!(t.kind, TokenKind::Newline | TokenKind::Comment(_) | TokenKind::Eof))
+            .collect();
+        let at = significant.iter().rposition(|t| t.span.end <= offset && t.span.start < offset)?;
+        let (dot_idx, partial) = match &significant[at].kind {
+            TokenKind::Dot => (at, false),
+            TokenKind::Ident(_) | TokenKind::Int(_)
+                if at > 0
+                    && matches!(significant[at - 1].kind, TokenKind::Dot)
+                    && significant[at].span.end >= offset =>
+            {
+                (at - 1, true)
+            }
+            _ => return None,
+        };
+        let recv = *significant.get(dot_idx.checked_sub(1)?)?;
+
+        // A module alias receiver: list the module's members.
+        if let TokenKind::Ident(name) = &recv.kind {
+            for (alias, target) in STD_ALIASES {
+                if name == alias {
+                    // Members complete even before the module is imported —
+                    // accepting one brings the `use` line along.
+                    let mut items = std_member_items(target);
+                    if let ImportState::Needs(edit) = import_state(src, target, None) {
+                        for item in &mut items {
+                            item.additional_text_edits = Some(vec![edit.clone()]);
+                        }
+                    }
+                    return Some(items);
+                }
+            }
+            for (target, names, _) in current_imports(src) {
+                let alias = target.rsplit('/').next().unwrap_or(&target);
+                if names.is_none() && name == alias && !target.starts_with("std/") {
+                    return Some(self.module_member_items(uri, &target));
+                }
+            }
+        }
+
+        // A value receiver: type it by re-checking with a placeholder member
+        // name when nothing is typed after the dot yet (so the file parses).
+        let dot_end = significant[dot_idx].span.end;
+        let patched: String = if partial {
+            src.to_string()
+        } else {
+            format!("{}zz{}", &src[..dot_end as usize], &src[dot_end as usize..])
+        };
+        let (checked, _mods, base) = check_document(uri, &patched, &self.documents);
+        // The receiver expression ends exactly at the dot; among recorded
+        // expressions ending there, the longest is the whole receiver.
+        let recv_end = significant[dot_idx].span.start + base;
+        let cty = checked
+            .info
+            .expr_types
+            .iter()
+            .filter(|((_, end), _)| *end == recv_end)
+            .min_by_key(|((start, _), _)| *start)
+            .map(|(_, cty)| cty.clone())?;
+        Some(value_member_items(&cty, &checked.program))
+    }
+
+    /// `pub` members of a file module (for `alias.` completion).
+    fn module_member_items(&self, uri: &Url, target: &str) -> Vec<CompletionItem> {
+        use inga_core::ast::Decl;
+        let mut items = Vec::new();
+        // `target` is the use-path text (`cards`, `lib/helpers`), resolved
+        // relative to the open file like the module loader does.
+        let Ok(this) = uri.to_file_path() else { return items };
+        let Some(dir) = this.parent() else { return items };
+        let mut p = dir.to_path_buf();
+        for seg in target.split('/') {
+            p.push(seg);
+        }
+        p.set_extension("inga");
+        let src = Url::from_file_path(&p)
+            .ok()
+            .and_then(|u| self.documents.get(&u).cloned())
+            .or_else(|| std::fs::read_to_string(&p).ok());
+        let Some(src) = src else { return items };
+        for decl in &parse_loose(&src).decls {
+            let (name, kind) = match decl {
+                Decl::Func(d) if d.is_pub => (d.name.clone(), CompletionItemKind::FUNCTION),
+                Decl::Struct(d) if d.is_pub => (d.name.clone(), CompletionItemKind::STRUCT),
+                Decl::Enum(d) if d.is_pub => (d.name.clone(), CompletionItemKind::ENUM),
+                Decl::Service(d) if d.is_pub => (d.name.clone(), CompletionItemKind::INTERFACE),
+                Decl::Impl(d) if d.is_pub => (d.name.clone(), CompletionItemKind::MODULE),
+                _ => continue,
+            };
+            items.push(CompletionItem { label: name, kind: Some(kind), ..Default::default() });
+        }
+        items
     }
 
     /// Quick fixes (cmd+.): on an unknown-name family diagnostic, offer the
@@ -677,6 +794,131 @@ fn import_state(src: &str, module: &str, selective: Option<&str>) -> ImportState
         range: Range { start: insert_at, end: insert_at },
         new_text: line_text,
     })
+}
+
+/// Member lists for the std modules, with the same docs hover shows.
+fn std_member_items(target: &str) -> Vec<CompletionItem> {
+    let members: &[(&str, &str)] = match target {
+        "std/schedule" => &[
+            ("exponential", "schedule.exponential(base) -> Schedule — delay doubles per attempt"),
+            ("fixed", "schedule.fixed(interval) -> Schedule"),
+            ("upTo", "schedule.upTo(schedule, times) -> Schedule — cap the retry count"),
+        ],
+        "std/fiber" => &[
+            ("fork", "fiber.fork(lazy action) -> Fiber<a ! E> — start now, return immediately"),
+            ("join", "fiber.join(fiber | tuple | list) — park, re-raise the error channel"),
+            ("poll", "fiber.poll(fiber) -> a? ! E — non-blocking probe (frame loops)"),
+            ("interrupt", "fiber.interrupt(fiber) — request cooperative cancellation"),
+            ("settle", "fiber.settle(lazy action) -> Outcome<a ! E> — the error channel as data"),
+            ("unsettle", "fiber.unsettle(outcome) -> a ! E — put the error back in the channel"),
+            ("par", "fiber.par(lazy a, lazy b, ...) -> (a, b, ...) — fork all + join"),
+            ("parMap", "fiber.parMap(xs, f) -> [b] ! E — one fiber per element"),
+            ("race", "fiber.race(lazy a, lazy b) -> a — first completion wins, loser interrupted"),
+            ("within", "fiber.within(lazy action, deadline) -> a ! E, Timeout"),
+            ("partition", "fiber.partition(outcomes) -> ([a], [Outcome<a ! E>])"),
+        ],
+        "std/graphics" => &[
+            ("run", "graphics.run(width, height, title, frame) — runtime-owned loop"),
+            ("clear", "graphics.clear(r, g, b)"),
+            ("rect", "graphics.rect(x, y, w, h, r, g, b, a)"),
+            ("rectLines", "graphics.rectLines(x, y, w, h, thick, r, g, b, a)"),
+            ("circle", "graphics.circle(x, y, radius, r, g, b, a)"),
+            ("text", "graphics.text(s, x, y, size, r, g, b)"),
+            ("textWidth", "graphics.textWidth(s, size) -> Int"),
+            ("mouseX", "graphics.mouseX() -> Int"),
+            ("mouseY", "graphics.mouseY() -> Int"),
+            ("mousePressed", "graphics.mousePressed() -> Bool"),
+            ("shaderNew", "graphics.shaderNew(fragGlsl) -> Int — uniforms iTime, iRes"),
+            ("shaderUse", "graphics.shaderUse(handle)"),
+            ("shaderOff", "graphics.shaderOff()"),
+        ],
+        _ => &[],
+    };
+    members
+        .iter()
+        .map(|(name, detail)| CompletionItem {
+            label: name.to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            detail: Some(detail.to_string()),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Members of a VALUE by its checked type: struct fields, service methods,
+/// map operations, tuple indexes, Int duration/size suffixes.
+fn value_member_items(
+    cty: &inga_core::check::CType,
+    program: &inga_core::ast::Program,
+) -> Vec<CompletionItem> {
+    use inga_core::ast::Decl;
+    use inga_core::check::CType;
+    let mut items = Vec::new();
+    let field = |name: &str, detail: String| CompletionItem {
+        label: name.to_string(),
+        kind: Some(CompletionItemKind::FIELD),
+        detail: Some(detail),
+        ..Default::default()
+    };
+    match cty {
+        CType::Struct(n) => {
+            for decl in &program.decls {
+                if let Decl::Struct(d) = decl {
+                    if &d.name == n {
+                        for f in &d.fields {
+                            items.push(field(&f.name, format!("field of {n}")));
+                        }
+                    }
+                }
+            }
+        }
+        CType::Service(n) => {
+            for decl in &program.decls {
+                if let Decl::Service(d) = decl {
+                    if &d.name == n {
+                        for m in &d.methods {
+                            items.push(CompletionItem {
+                                label: m.name.clone(),
+                                kind: Some(CompletionItemKind::METHOD),
+                                detail: Some(format!("method of {n}")),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        CType::MutMap(..) => {
+            for (name, detail) in [
+                ("get", "get(key) -> value?"),
+                ("set", "set(key, value)"),
+                ("delete", "delete(key)"),
+                ("size", "size() -> Int"),
+            ] {
+                items.push(CompletionItem {
+                    label: name.to_string(),
+                    kind: Some(CompletionItemKind::METHOD),
+                    detail: Some(detail.to_string()),
+                    ..Default::default()
+                });
+            }
+        }
+        CType::Tuple(ts) => {
+            for i in 0..ts.len() {
+                items.push(field(&i.to_string(), format!("tuple slot {i}")));
+            }
+        }
+        CType::Int => {
+            for (suffix, _) in inga_core::check::DURATION_SUFFIXES {
+                items.push(field(suffix, "Duration".to_string()));
+            }
+            for (suffix, _) in inga_core::check::SIZE_SUFFIXES {
+                items.push(field(suffix, "Int (bytes)".to_string()));
+            }
+        }
+        _ => {}
+    }
+    items
 }
 
 fn cast<R: lsp_types::request::Request>(req: Request) -> Option<(RequestId, R::Params)> {
@@ -994,6 +1236,98 @@ mod tests {
         assert_eq!(edits[0].new_text, "use geometry { area }\n\n");
         let sched = items.iter().find(|i| i.label == "schedule").expect("schedule completion");
         assert!(sched.additional_text_edits.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod member_tests {
+    use super::*;
+
+    fn server_with(path: &std::path::Path, src: &str) -> (Server, Url) {
+        std::fs::write(path, src).unwrap();
+        let uri = Url::from_file_path(path).unwrap();
+        let mut docs = HashMap::new();
+        docs.insert(uri.clone(), src.to_string());
+        (Server { documents: docs }, uri)
+    }
+
+    fn labels(items: &[CompletionItem]) -> Vec<String> {
+        items.iter().map(|i| i.label.clone()).collect()
+    }
+
+    fn offset_of(src: &str, needle: &str) -> u32 {
+        (src.find(needle).unwrap() + needle.len()) as u32
+    }
+
+    #[test]
+    fn dot_members_by_kind() {
+        let dir = std::env::temp_dir().join(format!("inga-member-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "struct Report = { String label, Int total }\n\nservice Log {\n    note :: (String s)\n}\n\nstderrLog :: Log {\n    note :: (s) {\n        println(s)\n    }\n}\n\nmain :: () {\n    provide stderrLog\n    Log log\n    r = Report(\"x\", 1)\n    m = MutMap()\n    m.set(1, 2)\n    pair = (1, \"two\")\n    n = 5\n    println(r.label, pair.0, n)\n    log.note(\"hi\")\n}\n";
+        let (server, uri) = server_with(&dir.join("members.inga"), src);
+
+        // Struct fields after `r.`
+        let items = server.member_completion(&uri, src, offset_of(src, "println(r.")).unwrap();
+        assert_eq!(labels(&items), vec!["label", "total"]);
+
+        // Service methods after `log.`
+        let items = server.member_completion(&uri, src, offset_of(src, "log.")).unwrap();
+        assert!(labels(&items).contains(&"note".to_string()));
+
+        // Map ops after `m.` (partial `se` already typed)
+        let items = server.member_completion(&uri, src, offset_of(src, "m.se")).unwrap();
+        assert_eq!(labels(&items), vec!["get", "set", "delete", "size"]);
+
+        // Tuple indexes after `pair.` (numeric partial)
+        let items = server.member_completion(&uri, src, offset_of(src, "pair.0")).unwrap();
+        assert_eq!(labels(&items), vec!["0", "1"]);
+
+        // Duration/size suffixes after an Int
+        let items = server.member_completion(&uri, src, offset_of(src, "n") + 1).unwrap_or_default();
+        let _ = items; // `n` alone isn't a member position; check `5.` style below
+        let src2 = "main :: () {\n    sleep(5.)\n}\n";
+        let (server2, uri2) = server_with(&dir.join("suffix.inga"), src2);
+        let items = server2.member_completion(&uri2, src2, offset_of(src2, "5.")).unwrap();
+        assert!(labels(&items).contains(&"millis".to_string()));
+        assert!(labels(&items).contains(&"kb".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dot_members_for_modules() {
+        let dir =
+            std::env::temp_dir().join(format!("inga-member-mod-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cards.inga"),
+            "pub rankName :: (Int r) -> String {\n    \"x\"\n}\n\nhidden :: () -> Int {\n    1\n}\n",
+        )
+        .unwrap();
+
+        // std module, not yet imported: members complete AND carry the
+        // auto-import edit.
+        let src = "main :: () {\n    schedule.\n}\n";
+        let (server, uri) = server_with(&dir.join("m1.inga"), src);
+        let items = server.member_completion(&uri, src, offset_of(src, "schedule.")).unwrap();
+        assert_eq!(labels(&items), vec!["exponential", "fixed", "upTo"]);
+        assert!(items[0].additional_text_edits.is_some(), "auto-import edit expected");
+
+        // std module already imported: no edit attached.
+        let src = "use std/fiber\n\nmain :: () {\n    provide Runtime(1)\n    fiber.\n}\n";
+        let (server, uri) = server_with(&dir.join("m2.inga"), src);
+        let items = server.member_completion(&uri, src, offset_of(src, "fiber.")).unwrap();
+        assert!(labels(&items).contains(&"fork".to_string()));
+        assert!(labels(&items).contains(&"parMap".to_string()));
+        assert!(items[0].additional_text_edits.is_none());
+
+        // file module alias: pub members only.
+        let src = "use cards\n\nmain :: () {\n    cards.\n}\n";
+        let (server, uri) = server_with(&dir.join("m3.inga"), src);
+        let items = server.member_completion(&uri, src, offset_of(src, "cards.")).unwrap();
+        assert_eq!(labels(&items), vec!["rankName"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

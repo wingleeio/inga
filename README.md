@@ -103,26 +103,30 @@ Editor support lives in [`editors/vscode`](editors/vscode) (TextMate grammar
 
 ## Concurrency without a manual
 
-`spawn(action)` runs the action on its own OS thread; `await(task)` takes
-the result. The effect system is the whole safety story — and it does the
-bookkeeping for you:
+Concurrency is a standard module, `std/fiber`, and the effect system does
+the bookkeeping. One `provide Runtime(4)` in `main`, then:
 
 ```inga
-a = crunch("medium", 100000) |> spawn   // crunch :: ... -> Report ! TooBig uses Adder
-b = crunch("large", 10000000) |> spawn  // both in flight; ~Nx on N cores, zero locks
-println(await(a) |> catch { TooBig -> fallback })
-println((await(b) |> catch { TooBig -> fallback }).total)
+use std/fiber
+
+a = crunch("medium", 100000) |> fiber.fork    // crunch :: ... -> Report ! TooBig
+b = crunch("large", 10000000) |> fiber.fork   // both in flight; zero locks
+pair = fiber.join((a, b)) |> catch { TooBig -> (fallback, fallback) }
+
+totals = fiber.parMap(urls, (u) -> fetch(u) |> fiber.settle)   // [Outcome<...>]
 ```
 
-The action's errors travel in the task's type (`Task<Report ! TooBig>`) and
-**re-raise at the `await`** — catch them where you collect the result, or
-the compiler reminds you the same way it guards `main`. The action can use
-services in scope too, as long as every implementation is shareable across
-threads (scalar-only state); anything stateful gets a checker error telling
-you to provide a fresh one inside the spawn. Each task gets its own heap
-(allocation stays lock-free); captured values are frozen before the thread
-starts so refcounts never race. Try it:
-`inga build examples/tasks.inga -o tasks && ./tasks`.
+Errors travel in the fiber's type (`Fiber<Report ! TooBig>`, visible on
+hover) and **re-raise at the join** — catch them where the result lands, or
+the compiler reminds you the same way it guards `main`. `join` is
+structural (a fiber, a tuple of fibers, or a list), `settle` turns the
+error channel into data (`Outcome` — match `Ok`/`Failed` per element), and
+`race`/`within` give deadlines. Services cross into fibers only when
+declared `shared service` (scalar-only state, checked at every impl);
+captured values are frozen so refcounts never race; an unjoined fiber is
+interrupted when its handle drops — no leaks, no daemons. Parallelism shows
+up in the row (`uses Fibers`), so a library that forks says so in its
+types. Try it: `inga run examples/fibers.inga`.
 
 ## Tests are built in
 
@@ -176,7 +180,7 @@ crates/inga-lsp       language server (lsp-server / lsp-types)
 editors/vscode        VS Code extension + TextMate grammar
 editors/zed           Zed extension (tree-sitter highlighting + LSP)
 tree-sitter-inga      tree-sitter grammar (used by the Zed extension)
-examples/             hello.inga, retry.inga, shapes.inga, arena.inga, tasks.inga, modules.inga (+ geometry.inga), user_service.inga
+examples/             hello.inga, retry.inga, shapes.inga, arena.inga, fibers.inga, modules.inga (+ geometry.inga), user_service.inga
 games/                balatro.inga (+ game, util, cards, jokers, poker, state, logic_test) — a Balatro-style deckbuilder
 bench/                the same workloads in Inga, JavaScript, and Rust (see bench/README.md)
 docs/SPEC.md          language design: semantics, effect rows, execution strategy
@@ -194,7 +198,7 @@ system compiles away**: error rows become Rust-style `{value, err}` two-register
 capability rows become Koka-style evidence parameters, and a capability
 method call is the same machine code as a Rust `dyn` call. Memory is
 **Perceus-style ARC** (non-atomic refcounts + compiler-emitted drop glue,
-small objects recycled through free lists, one heap per thread so `spawn`
+small objects recycled through free lists, one heap per fiber so forking
 never locks) with opt-in region arenas: `provide Arena(256.kb)` makes a
 scope allocate from a region freed wholesale at scope end, deep-copying the
 scope's result out as it dies. Details in
@@ -210,8 +214,11 @@ on two of them.
 v0.3 — a complete, tested vertical slice: language (structs/enums/tuples,
 record update, generics, exhaustive `match`, typed errors over any value),
 inference, a **native-only LLVM backend** (`show`/`==`/`encode`/`decode`/
-functions-as-values/tasks all compile; the reference interpreter served its
+functions-as-values all compile; the reference interpreter served its
 purpose and was removed), Perceus-style ARC + arenas with copy-out,
-`spawn`/`await` tasks, a built-in test runner, formatter, LSP, editor
-tooling (`cargo test` covers all of it). Not yet: a package manager,
+**`std/fiber` concurrency** (fork / structural join / settle / race /
+within, `shared` services, drop-is-supervision), a built-in test runner,
+formatter, LSP, editor tooling (`cargo test` covers all of it). Not yet: a
+package manager, the M:N fiber scheduler (fibers run thread-per-fiber
+today — same semantics, that's the point of the `Runtime` promise),
 per-implementation capability precision, resumable handlers.

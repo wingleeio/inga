@@ -265,7 +265,8 @@ impl Printer {
     fn print_service(&mut self, d: &ServiceDecl) {
         self.flush_comments_before(d.span.start, 0);
         self.blank_line_if_gap(self.lines.line(d.span.start));
-        self.out.push_str(&format!("{}service {} {{\n", pub_prefix(d.is_pub), d.name));
+        let shared = if d.is_shared { "shared " } else { "" };
+        self.out.push_str(&format!("{}{shared}service {} {{\n", pub_prefix(d.is_pub), d.name));
         self.prev_end_line = Some(self.lines.line(d.span.start));
         for m in &d.methods {
             self.flush_comments_before(m.span.start, 1);
@@ -739,9 +740,14 @@ fn render_type(ty: &TypeExpr) -> String {
             }
         }
         TypeExpr::List(inner, _) => format!("[{}]", render_type(inner)),
-        TypeExpr::Apply { name, args, .. } => {
+        TypeExpr::Apply { name, args, row, .. } => {
             let args: Vec<String> = args.iter().map(render_type).collect();
-            format!("{name}<{}>", args.join(", "))
+            if row.is_empty() {
+                format!("{name}<{}>", args.join(", "))
+            } else {
+                let row: Vec<&str> = row.iter().map(|(n, _)| n.as_str()).collect();
+                format!("{name}<{} ! {}>", args.join(", "), row.join(", "))
+            }
         }
         TypeExpr::Tuple(items, _) => {
             let inner: Vec<String> = items.iter().map(render_type).collect();

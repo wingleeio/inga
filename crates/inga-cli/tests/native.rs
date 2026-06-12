@@ -51,8 +51,8 @@ fn examples_build_and_run_with_expected_output() {
         ("shapes.inga", "area 12.56636\nrejected: a dot has no area\ntoo big at 600.0\n1\n"),
         ("arena.inga", "simulated 10000 particles in the region\n9000\n"),
         (
-            "tasks.inga",
-            "huge refused the job\nsmall: 500500\nmedium: 5000050000\nhuge: -1\ngrand total: 5000550499\n",
+            "fibers.inga",
+            "huge refused the job\nsmall: 500500\nmedium: 5000050000\nhuge: -1\ngrand total: 5000550499\ndone: 500500\nskipped: n=99999999\n",
         ),
     ];
     for (example, want) in expected {

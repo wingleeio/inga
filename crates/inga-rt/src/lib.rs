@@ -1683,39 +1683,181 @@ pub struct RtPair {
     pub e: i64,
 }
 
-/// Run a thunk closure `{ fnptr, captures... }` on a new thread; returns a
-/// handle for `rt_task_await`. The closure record itself is frozen so
-/// neither thread frees it under the other.
+// ---- fibers ----------------------------------------------------------------------
+//
+// Phase 1 of std/fiber: one OS thread per fiber, full API. The fiber VALUE
+// is an ordinary RC heap box holding a raw Arc pointer to the record, so
+// dup/release and the per-function pools work unchanged — and the drop glue
+// doubles as supervision: a fiber abandoned by its forking function (pool
+// drain at return) is interrupted. `Runtime(n)`'s worker count is honored
+// in phase 2 (M:N); the §2 promise — identical behavior under any n except
+// speed — holds trivially here.
+
+enum FiberState {
+    Pending,
+    Done(i64, i64),
+}
+
+struct FiberRecord {
+    state: std::sync::Mutex<FiberState>,
+    cv: std::sync::Condvar,
+    interrupted: std::sync::atomic::AtomicBool,
+}
+
+/// Global completion pulse for `race`: bump + notify on every completion.
+static COMPLETIONS: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+static COMPLETIONS_CV: std::sync::Condvar = std::sync::Condvar::new();
+
+fn fiber_record(boxed: i64) -> &'static FiberRecord {
+    unsafe {
+        let arc_raw = *(boxed as *const i64) as *const FiberRecord;
+        &*arc_raw
+    }
+}
+
+/// Freeze a single block header (its refcount stops; it is never freed) —
+/// used for closure records crossing fiber boundaries.
 #[no_mangle]
-pub extern "C" fn rt_task_spawn(closure: i64) -> i64 {
+pub extern "C" fn rt_freeze_header(v: i64) {
+    if v != 0 {
+        unsafe {
+            let m = (v as *mut i64).sub(1);
+            if *m >= 1 {
+                *m = META_STATIC;
+            }
+        }
+    }
+}
+
+/// Build an error box `{tag, payload}` (RC-heap; error boxes are never
+/// freed, so they may cross fibers freely).
+#[no_mangle]
+pub extern "C" fn rt_make_errbox(tag: i64, payload: i64) -> i64 {
+    let p = rt_alloc_global(16) as *mut i64;
+    unsafe {
+        *p = tag;
+        *p.add(1) = payload;
+    }
+    p as i64
+}
+
+/// Fork: run the thunk closure `{ fnptr, captures... }` on its own thread.
+/// Returns an RC'd fiber handle box. The closure record is frozen so
+/// neither side frees it under the other.
+#[no_mangle]
+pub extern "C" fn rt_fiber_fork(closure: i64) -> i64 {
     unsafe {
         let meta = (closure as *mut i64).sub(1);
         if *meta >= 1 {
             *meta = META_STATIC;
         }
     }
+    let record = std::sync::Arc::new(FiberRecord {
+        state: std::sync::Mutex::new(FiberState::Pending),
+        cv: std::sync::Condvar::new(),
+        interrupted: std::sync::atomic::AtomicBool::new(false),
+    });
+    let for_thread = record.clone();
     let env = closure as usize;
-    let handle = std::thread::Builder::new()
+    std::thread::Builder::new()
         .stack_size(16 << 20)
         .spawn(move || {
             let f: extern "C" fn(*const i64) -> RtPair =
                 unsafe { std::mem::transmute(*(env as *const i64)) };
             let pair = f(env as *const i64);
-            (pair.v, pair.e)
+            *for_thread.state.lock().unwrap() = FiberState::Done(pair.v, pair.e);
+            for_thread.cv.notify_all();
+            *COMPLETIONS.lock().unwrap() += 1;
+            COMPLETIONS_CV.notify_all();
         })
-        .expect("spawn task thread");
-    Box::into_raw(Box::new(handle)) as i64
+        .expect("fork fiber thread");
+    let boxed = rt_alloc_global(8) as *mut i64;
+    unsafe { *boxed = std::sync::Arc::into_raw(record) as i64 };
+    boxed as i64
 }
 
-/// Join a task and take its `{value, err}` pair — a failed action's error
-/// box re-raises at the await site. Either half was allocated on the
-/// task's heap; heap chunks are never unmapped, and after the join the
-/// parent is its exclusive owner, so normal RC drops apply.
+/// Park until the fiber completes; returns its `{value, err}` pair. A
+/// pending fiber that has been interrupted yields an `Interrupted` error
+/// (tag passed in by the compiler); a completed fiber's result wins —
+/// interruption after completion is a no-op, and joins are idempotent.
 #[no_mangle]
-pub extern "C" fn rt_task_await(handle: i64) -> RtPair {
-    let handle = unsafe { Box::from_raw(handle as *mut std::thread::JoinHandle<(i64, i64)>) };
-    let (v, e) = handle.join().unwrap_or((0, 0));
-    RtPair { v, e }
+pub extern "C" fn rt_fiber_join(boxed: i64, interrupted_tag: i64) -> RtPair {
+    let rec = fiber_record(boxed);
+    let mut state = rec.state.lock().unwrap();
+    loop {
+        if let FiberState::Done(v, e) = *state {
+            return RtPair { v, e };
+        }
+        if rec.interrupted.load(std::sync::atomic::Ordering::Acquire) {
+            return RtPair { v: 0, e: rt_make_errbox(interrupted_tag, 0) };
+        }
+        state = rec.cv.wait(state).unwrap();
+    }
+}
+
+/// Non-blocking probe: `{some_box_or_0, err}` — `Some(value)` when done,
+/// `0` (None) when still running, the error when it failed.
+#[no_mangle]
+pub extern "C" fn rt_fiber_poll(boxed: i64, interrupted_tag: i64) -> RtPair {
+    let rec = fiber_record(boxed);
+    let state = rec.state.lock().unwrap();
+    match *state {
+        FiberState::Done(v, e) => {
+            if e != 0 {
+                RtPair { v: 0, e }
+            } else {
+                let some = rt_alloc_global(8) as *mut i64;
+                unsafe { *some = v };
+                RtPair { v: some as i64, e: 0 }
+            }
+        }
+        FiberState::Pending => {
+            if rec.interrupted.load(std::sync::atomic::Ordering::Acquire) {
+                RtPair { v: 0, e: rt_make_errbox(interrupted_tag, 0) }
+            } else {
+                RtPair { v: 0, e: 0 }
+            }
+        }
+    }
+}
+
+/// Request cooperative cancellation; idempotent, no-op once completed.
+#[no_mangle]
+pub extern "C" fn rt_fiber_interrupt(boxed: i64) {
+    let rec = fiber_record(boxed);
+    rec.interrupted.store(true, std::sync::atomic::Ordering::Release);
+    rec.cv.notify_all();
+    COMPLETIONS_CV.notify_all();
+}
+
+/// Drop glue: the handle's refcount hit zero — supervision interrupts the
+/// fiber (its forker is gone) and releases the record reference.
+#[no_mangle]
+pub extern "C" fn rt_fiber_abandon(boxed: i64) {
+    let rec = fiber_record(boxed);
+    rec.interrupted.store(true, std::sync::atomic::Ordering::Release);
+    rec.cv.notify_all();
+    unsafe {
+        let arc_raw = *(boxed as *const i64) as *const FiberRecord;
+        drop(std::sync::Arc::from_raw(arc_raw));
+    }
+}
+
+/// Wait until either fiber completes; returns 0 or 1 (ties go left).
+#[no_mangle]
+pub extern "C" fn rt_fiber_race(a: i64, b: i64) -> i64 {
+    let (ra, rb) = (fiber_record(a), fiber_record(b));
+    let done = |r: &FiberRecord| matches!(*r.state.lock().unwrap(), FiberState::Done(..));
+    let mut seen = COMPLETIONS.lock().unwrap();
+    loop {
+        if done(ra) {
+            return 0;
+        }
+        if done(rb) {
+            return 1;
+        }
+        seen = COMPLETIONS_CV.wait(seen).unwrap();
+    }
 }
 
 // ---- JSON encode/decode over descriptors ----------------------------------------

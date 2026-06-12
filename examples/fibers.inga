@@ -1,0 +1,75 @@
+// Fibers: `fiber.fork(action)` starts the action on its own fiber and
+// returns a Fiber; `fiber.join` waits and takes the result.
+//
+// The effect system is the whole safety story:
+//   - the action's errors travel in the Fiber type and re-raise at the
+//     join, so you catch them where you collect the result;
+//   - the action may use services in scope, as long as they are declared
+//     `shared` (scalar-only state) — anything stateful must be provided
+//     fresh inside the fork;
+//   - every operation carries `uses Fibers`, satisfied by one line in
+//     main: `provide Runtime(n)`.
+
+use std/fiber
+
+struct Report = { String label, Int total }
+struct TooBig = { String label }
+
+shared service Adder {
+    add :: (Int a, Int b) -> Int
+}
+
+plainAdder :: Adder {
+    add :: (a, b) {
+        a + b
+    }
+}
+
+sumTo :: (Int n, Int acc) -> Int uses Adder {
+    Adder adder
+    if n == 0 {
+        acc
+    } else {
+        sumTo(n - 1, adder.add(acc, n))
+    }
+}
+
+crunch :: (String label, Int n) -> Report ! TooBig uses Adder {
+    if n > 50000000 {
+        fail TooBig(label)
+    }
+    Report(label, sumTo(n, 0))
+}
+
+main :: () {
+    provide Runtime(4), plainAdder
+
+    // Fork first, join after — all three run at once.
+    a = crunch("small", 1000) |> fiber.fork
+    b = crunch("medium", 100000) |> fiber.fork
+    c = crunch("huge", 100000000) |> fiber.fork
+
+    // Failures re-raise at the join, caught right where the result lands.
+    fallback = Report("huge", -1)
+    small = fiber.join(a) |> catch { TooBig -> fallback }
+    medium = fiber.join(b) |> catch { TooBig -> fallback }
+    huge = fiber.join(c)
+        |> catch {
+            TooBig(label) -> {
+                println("${label} refused the job")
+                fallback
+            }
+        }
+
+    reports = [small, medium, huge]
+    grand = fold(reports, 0, (acc, r) -> acc + r.total)
+    map(reports, (r) -> println("${r.label}: ${r.total}"))
+    println("grand total: ${grand}")
+
+    // The error channel as data: settle each element, then act per fate.
+    outcomes = fiber.parMap([1000, 99999999], (n) -> crunch("n=${n}", n) |> fiber.settle)
+    map(outcomes, (o) -> match o {
+        Ok(r)                 -> println("done:", r.total)
+        Failed(TooBig(label)) -> println("skipped:", label)
+    })
+}

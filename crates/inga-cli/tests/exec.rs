@@ -672,67 +672,6 @@ main :: () {
 }
 
 #[test]
-fn tasks_spawn_await_round_trip() {
-    let out = run(
-        "double :: (Int n) -> Int {\n    n * 2\n}\n\nmain :: () {\n    xs = [1, 2, 3]\n    t = spawn(map(xs, double))\n    u = spawn(\"ready\")\n    println(await(t), await(u))\n}\n",
-    );
-    assert_eq!(out, "[2, 4, 6] ready\n");
-}
-
-#[test]
-fn task_errors_reraise_at_await() {
-    // A failing action's error travels in the Task type and surfaces at
-    // the await, where the normal catch machinery applies.
-    let out = run(
-        "struct Boom = { Int n }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(7)\n}\n\nmain :: () {\n    t = risky() |> spawn\n    println(await(t) |> catch { Boom(n) -> n * 10 })\n}\n",
-    );
-    assert_eq!(out, "70\n");
-
-    // Left unhandled, it reaches `main`'s row like any other error.
-    let errs = check_errors(
-        "struct Boom = { Int n }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(1)\n}\n\nmain :: () {\n    t = spawn(risky())\n    println(await(t))\n}\n",
-    );
-    assert!(
-        errs.iter().any(|m| m.contains("`main` does not handle the error `Boom`")),
-        "got: {errs:?}"
-    );
-
-    // Tasks aliased through a list union their error rows.
-    let errs = check_errors(
-        "struct A = { Int n }\nstruct B = { Int n }\n\nfa :: () -> Int ! A {\n    fail A(1)\n}\n\nfb :: () -> Int ! B {\n    fail B(2)\n}\n\nmain :: () {\n    ts = [spawn(fa()), spawn(fb())]\n    map(ts, (t) -> await(t) |> catch { A -> 0 })\n}\n",
-    );
-    assert!(
-        errs.iter().any(|m| m.contains("`main` does not handle the error `B`")),
-        "got: {errs:?}"
-    );
-}
-
-#[test]
-fn spawned_tasks_share_only_stateless_services() {
-    // A scalar-state service crosses into the task; spawn captures the
-    // evidence in scope like a call would.
-    let out = run(
-        "service Adder {\n    add :: (Int a, Int b) -> Int\n}\n\nplainAdder :: Adder {\n    add :: (a, b) {\n        a + b\n    }\n}\n\ndouble :: (Int n) -> Int uses Adder {\n    Adder adder\n    adder.add(n, n)\n}\n\nmain :: () {\n    provide plainAdder\n    t = double(21) |> spawn\n    println(await(t))\n}\n",
-    );
-    assert_eq!(out, "42\n");
-
-    // A MutMap-backed implementation is rejected with guidance.
-    let errs = check_errors(
-        "service Store {\n    put :: (Int k, Int v)\n}\n\nmemStore :: Store {\n    m = MutMap()\n\n    put :: (k, v) {\n        m.set(k, v)\n    }\n}\n\nuseStore :: () uses Store {\n    Store store\n    store.put(1, 2)\n}\n\nmain :: () {\n    provide memStore\n    t = spawn(useStore())\n    await(t)\n}\n",
-    );
-    assert!(
-        errs.iter().any(|m| m.contains("shareable") && m.contains("memStore")),
-        "got: {errs:?}"
-    );
-
-    // Handling everything inside the spawn still works, of course.
-    let out = run(
-        "struct Boom = { Int n }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(7)\n}\n\nmain :: () {\n    t = spawn(risky() |> catch { Boom(n) -> n })\n    println(await(t))\n}\n",
-    );
-    assert_eq!(out, "7\n");
-}
-
-#[test]
 fn arena_scopes_copy_their_value_out() {
     let out = run(
         "struct Stats = { Int count, [Int] kept }\n\nsummarize :: ([Int] xs) -> Stats {\n    provide Arena(64.kb)\n    evens = filter(xs, (x) -> x % 2 == 0)\n    Stats(len(evens), evens)\n}\n\nmain :: () {\n    println(summarize(range(6)))\n}\n",
@@ -755,7 +694,7 @@ fn asserts_fail_with_assert_failed() {
 fn mutmap_and_task_have_surface_types() {
     // The forms hover renders are writable: MutMap<K, V> and Task<T>.
     let out = run(
-        "service Stats {\n    counts :: () -> MutMap<String, Int>\n}\n\nmemStats :: Stats {\n    m = MutMap()\n\n    counts :: () {\n        m\n    }\n}\n\nbump :: (String k) -> Int uses Stats {\n    Stats stats\n    n = stats.counts().get(k) |> getOrElse(0)\n    stats.counts().set(k, n + 1)\n    n + 1\n}\n\nslowDouble :: (Int n) -> Int {\n    n * 2\n}\n\nstartDouble :: (Int n) -> Task<Int> {\n    slowDouble(n) |> spawn\n}\n\nmain :: () {\n    provide memStats\n    bump(\"a\")\n    println(bump(\"a\"), await(startDouble(21)))\n}\n",
+        "use std/fiber\n\nservice Stats {\n    counts :: () -> MutMap<String, Int>\n}\n\nmemStats :: Stats {\n    m = MutMap()\n\n    counts :: () {\n        m\n    }\n}\n\nbump :: (String k) -> Int uses Stats {\n    Stats stats\n    n = stats.counts().get(k) |> getOrElse(0)\n    stats.counts().set(k, n + 1)\n    n + 1\n}\n\nslowDouble :: (Int n) -> Int {\n    n * 2\n}\n\nstartDouble :: (Int n) -> Fiber<Int> uses Fibers {\n    slowDouble(n) |> fiber.fork\n}\n\nmain :: () {\n    provide Runtime(1), memStats\n    bump(\"a\")\n    println(bump(\"a\"), fiber.join(startDouble(21)))\n}\n",
     );
     assert_eq!(out, "2 42\n");
 
@@ -821,4 +760,99 @@ fn modules_import_pub_and_hide_private() {
     assert!(!out.status.success(), "private access must be rejected");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("private"), "got: {stderr}");
+}
+
+#[test]
+fn fibers_fork_join_round_trip() {
+    let out = run(
+        "use std/fiber\n\ndouble :: (Int n) -> Int {\n    n * 2\n}\n\nmain :: () {\n    provide Runtime(2)\n    t = map([1, 2, 3], double) |> fiber.fork\n    u = \"ready\" |> fiber.fork\n    println(fiber.join(t), fiber.join(u))\n}\n",
+    );
+    assert_eq!(out, "[2, 4, 6] ready\n");
+}
+
+#[test]
+fn fiber_errors_reraise_at_join() {
+    let out = run(
+        "use std/fiber\n\nstruct Boom = { Int n }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(7)\n}\n\nmain :: () {\n    provide Runtime(1)\n    t = risky() |> fiber.fork\n    println(fiber.join(t) |> catch { Boom(n) -> n * 10 })\n}\n",
+    );
+    assert_eq!(out, "70\n");
+
+    // Left unhandled, the row reaches main like any other error.
+    let errs = check_errors(
+        "use std/fiber\n\nstruct Boom = { Int n }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(1)\n}\n\nmain :: () {\n    provide Runtime(1)\n    println(fiber.join(risky() |> fiber.fork))\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("`main` does not handle the error `Boom`")),
+        "got: {errs:?}"
+    );
+
+    // No Runtime provided -> the Fibers capability diagnostic teaches it.
+    let errs = check_errors(
+        "use std/fiber\n\nmain :: () {\n    println(fiber.join((1 + 1) |> fiber.fork))\n}\n",
+    );
+    assert!(errs.iter().any(|m| m.contains("provide Runtime")), "got: {errs:?}");
+}
+
+#[test]
+fn structural_join_tuples_and_lists() {
+    let out = run(
+        "use std/fiber\n\nsq :: (Int n) -> Int {\n    n * n\n}\n\nmain :: () {\n    provide Runtime(2)\n    pair = fiber.join((sq(3) |> fiber.fork, sq(4) |> fiber.fork))\n    println(pair.0 + pair.1)\n    println(fiber.join([sq(2) |> fiber.fork, sq(5) |> fiber.fork]))\n    both = fiber.par(sq(6), sq(7))\n    println(both.0, both.1)\n}\n",
+    );
+    assert_eq!(out, "25\n[4, 25]\n36 49\n");
+}
+
+#[test]
+fn settle_outcome_and_partition() {
+    let out = run(
+        "use std/fiber\n\nstruct TooBig = { Int n }\n\ncheck :: (Int n) -> Int ! TooBig {\n    if n > 10 {\n        fail TooBig(n)\n    }\n    n * 2\n}\n\nmain :: () {\n    provide Runtime(1)\n    outcomes = map([1, 50, 3], (n) -> check(n) |> fiber.settle)\n    parts = fiber.partition(outcomes)\n    println(len(parts.0), len(parts.1))\n    map(outcomes, (o) -> match o {\n        Ok(v) -> println(\"ok\", v)\n        Failed(TooBig(n)) -> println(\"big\", n)\n    })\n    println(check(4) |> fiber.settle |> fiber.unsettle |> catch { TooBig -> -1 })\n}\n",
+    );
+    assert_eq!(out, "2 1\nok 2\nbig 50\nok 6\n8\n");
+
+    // settle is row-free: no Runtime needed for sequential batches.
+    let out = run(
+        "use std/fiber\n\nstruct Nope = { Int n }\n\nf :: (Int n) -> Int ! Nope {\n    if n < 0 {\n        fail Nope(n)\n    }\n    n\n}\n\nmain :: () {\n    o = f(-1) |> fiber.settle\n    match o {\n        Ok(v) -> println(v)\n        Failed(Nope(n)) -> println(\"nope\", n)\n    }\n}\n",
+    );
+    assert_eq!(out, "nope -1\n");
+}
+
+#[test]
+fn parmap_race_and_within() {
+    let out = run(
+        "use std/fiber\n\nslow :: () -> Int {\n    sleep(2.seconds)\n    99\n}\n\nmain :: () {\n    provide Runtime(4)\n    println(fiber.parMap([1, 2, 3], (n) -> n * 10))\n    fast = fiber.within(40 + 2, 1.seconds) |> catch { Timeout -> -1 }\n    println(fast)\n    timed = fiber.within(slow(), 50.millis) |> catch { Timeout -> -1 }\n    println(timed)\n    won = fiber.race(7, slow())\n    println(won)\n}\n",
+    );
+    assert_eq!(out, "[10, 20, 30]\n42\n-1\n7\n");
+}
+
+#[test]
+fn shared_services_cross_fibers() {
+    let out = run(
+        "use std/fiber\n\nshared service Adder {\n    add :: (Int a, Int b) -> Int\n}\n\nplainAdder :: Adder {\n    add :: (a, b) {\n        a + b\n    }\n}\n\ndouble :: (Int n) -> Int uses Adder {\n    Adder adder\n    adder.add(n, n)\n}\n\nmain :: () {\n    provide Runtime(2), plainAdder\n    println(fiber.join(double(21) |> fiber.fork))\n}\n",
+    );
+    assert_eq!(out, "42\n");
+
+    // Unshared services are rejected with guidance...
+    let errs = check_errors(
+        "use std/fiber\n\nservice Store {\n    put :: (Int k, Int v)\n}\n\nmemStore :: Store {\n    m = MutMap()\n\n    put :: (k, v) {\n        m.set(k, v)\n    }\n}\n\nuseStore :: () uses Store {\n    Store store\n    store.put(1, 2)\n}\n\nmain :: () {\n    provide Runtime(1), memStore\n    fiber.join(useStore() |> fiber.fork)\n}\n",
+    );
+    assert!(errs.iter().any(|m| m.contains("only `shared` services")), "got: {errs:?}");
+
+    // ...and a shared declaration is enforced at every impl.
+    let errs = check_errors(
+        "shared service Store {\n    put :: (Int k, Int v)\n}\n\nmemStore :: Store {\n    m = MutMap()\n\n    put :: (k, v) {\n        m.set(k, v)\n    }\n}\n\nmain :: () {\n    provide memStore\n    Store store\n    store.put(1, 1)\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("shared services may carry only scalar state")),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn catch_after_fork_is_guided() {
+    let errs = check_errors(
+        "use std/fiber\n\nstruct Boom = { Int n }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(1)\n}\n\nmain :: () {\n    provide Runtime(1)\n    t = risky() |> fiber.fork |> catch { Boom -> 0 }\n    fiber.join(t) |> catch { Boom -> -1 }\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("surface at `fiber.join`")),
+        "got: {errs:?}"
+    );
 }

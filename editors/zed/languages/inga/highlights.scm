@@ -19,6 +19,7 @@
   "struct"
   "enum"
   "service"
+  "shared"
   "match"
   "catch"
   "fail"

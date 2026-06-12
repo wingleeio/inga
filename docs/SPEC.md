@@ -61,6 +61,8 @@ struct User      = { Int id, String name }
 enum   Shape     = Circle { Float radius }   // a sum type: variants separated by `|`,
        | Rect { Float w, Float h } | Dot     //   each with optional struct-style fields
 service Cache {                              // a capability interface
+                                             //   (`shared service` additionally allows
+                                             //    instances to cross fibers — §6.5)
     get :: (String key) -> String ! CacheMiss
     set :: (String key, String value, Duration ttl)
 }
@@ -78,7 +80,7 @@ fetchAndCache :: (id) { ... }                // a function
 - `Name?` is an option type, `[Name]` a list type, `(Int, String)` a
   tuple type, `(Int) -> Bool` a function type (for callbacks), and the two
   builtin generic types are written the way hover renders them:
-  `MutMap<String, Int>` and `Task<Int>`. A plain
+  `MutMap<String, Int>`, `Fiber<Int ! Boom>`, `Outcome<a ! E>`. A plain
   arrow type is a *pure* contract;
   `(Int) -> User ! DbError uses Logger` accepts effectful callbacks, and a
   function with effects the annotation doesn't declare is rejected. An
@@ -195,8 +197,9 @@ provides real implementations.
   `println print show encode decode len map filter fold at concat reverse
   range` (lists), `split slice indexOf trim parseInt toFloat floor`
   (strings/numbers), `getOrElse orFail` (options), `retry ignoreFailure
-  sleep` (effects), `spawn await` (tasks, §6.5), `assert assertEq` (tests),
-  `MutMap Some nowMillis nowMicros random`. Editors show each one's
+  sleep` (effects), `assert assertEq` (tests),
+  `MutMap Some nowMillis nowMicros random`. Concurrency is **not** in the
+  prelude — it lives in `std/fiber` (§6.5). Editors show each builtin's
   signature on hover.
 
 ## 6. Execution: how Inga runs
@@ -266,51 +269,119 @@ arenas:
   whole render path does no refcount work (see `games/balatro.inga`).
 - Known leaks, by design (all bounded by program shape, not input size):
   closures and service instances free their record but not their captures;
-  MutMap contents; values captured by `spawn` (frozen, below); results of
+  MutMap contents; values captured at a fork (frozen, §6.5); results of
   generic functions (uniform representation has no per-instance drop glue).
 
-### 6.5 Concurrency: tasks
+### 6.5 Concurrency: `std/fiber`
 
-`spawn(action)` runs `action` on its own OS thread and returns a
-`Task<a ! E>`; `await(task)` joins it and yields the result. There is no
-new syntax — `spawn` is a by-name builtin like `retry`, so it pipes
-(`crunch(n) |> spawn`) — and no locks, channels, or `Send` bounds to
-learn. The safety rules are the effect system:
+Concurrency lives in a standard module, imported and used like
+`std/graphics` — qualified-only, so `fiber.` is the visual marker that
+concurrency is happening on a line. The unit is the **fiber**. Two types
+are global builtins in the type grammar (writable as hover renders them):
+`Fiber<a ! E>` — a running fiber whose error row rides inside the type —
+and `Outcome<a ! E>` — a settled result, `Ok(value)` or `Failed(error)`.
 
 ```inga
-t = crunch("big", 10000000) |> spawn   // runs now, on another thread
-u = fetch(url) |> spawn                // fetch :: ... ! Timeout
-total = await(t) + (await(u) |> catch { Timeout -> cached() })
+use std/fiber
+
+main :: () {
+    provide Runtime(4)                    // the fiber runtime: 4 workers
+    a = crunch("medium", 100000) |> fiber.fork
+    b = crunch("large", 10000000) |> fiber.fork
+    println(fiber.join(a).total + fiber.join(b).total)
+}
 ```
 
-- **Errors re-raise at the `await`.** The action's error row travels in
-  the task's type (`Task<Report ! TooBig>` — visible on hover) and joins
-  the awaiting function's row, so you catch where you collect the result.
-  Tasks aliased through a list or a variable union their rows. Note the
-  pipeline `work() |> spawn |> await` is *sequential* (it waits before the
-  next spawn); spawn everything first, then await.
-- **Capabilities cross when they are shareable.** `spawn` captures the
-  evidence in scope like a call would, so the action may use any service
-  whose implementations carry only scalar state (`Int`/`Float`/`Bool`/
-  `Duration` fields — instance records are immutable and never freed, so
-  two threads can share them without racing). A `MutMap`- or string-state
-  implementation is rejected with guidance: provide a fresh one *inside*
-  the spawned expression.
-- Each thread has its **own heap and regions** (allocation is lock-free;
-  the random generator is per-thread too). Captured values are **frozen**
-  before the thread starts — marked static, recursively, by type
-  descriptor — so two threads never race on a refcount; arena-allocated
-  captures are copied out first. Heap chunks are never returned to the OS,
-  so a task's result (or its error box) outlives its thread, and after the
-  join the parent owns it exclusively.
-- Tasks run on real OS threads — four spawned workers are ~4× on a
-  4-core machine.
+**The `Fibers` capability.** Every scheduling operation carries
+`uses Fibers`, satisfied only by the builtin resource `provide Runtime(n)`
+(in the same grammar slot as `Arena(256.kb)`; `n` = OS workers). So a
+library that parallelizes says so in its types, `main` without a `Runtime`
+gets a teaching diagnostic, and a function whose rows lack `Fibers` is
+proven non-forking. The semantic promise: *programs behave identically
+under any `n ≥ 1` except for speed and the interleaving of observable side
+effects* — with one caveat: a fiber that computes without yielding can
+starve siblings under small `n` (cooperative scheduling; interruption and
+timers are observed at park points).
 
-**Current limits of the backend:** function values, maps, and tasks cannot
-be captured by `spawn` (not copyable/freezable). Full delimited-continuation
-effects (resumable handlers, generators, async) remain out of scope;
-handlers are syntax (`catch`, `provide`) rather than first-class values
-precisely so that evidence passing stays sufficient.
+**Core operations** (`lazy` = by-name, so `expr |> fiber.fork` works):
+
+```
+fiber.fork      (lazy action) -> Fiber<a ! E>      uses Fibers   start now, return immediately
+fiber.join      structural — see below             uses Fibers   park, re-raise the error channel
+fiber.poll      (Fiber<a ! E>) -> a? ! E           uses Fibers   non-blocking probe (frame loops)
+fiber.interrupt (Fiber<a ! E>)                     uses Fibers   request cooperative cancellation
+fiber.settle    (lazy action) -> Outcome<a ! E>    row-free      the error channel as data
+fiber.unsettle  (Outcome<a ! E>) -> a ! E          row-free      put it back in the channel
+fiber.par       (lazy a, lazy b, …) -> (a, b, …)   uses Fibers   fork all + join
+fiber.parMap    ([a], (a) -> b ! E) -> [b] ! E     uses Fibers   one fiber per element
+fiber.race      (lazy a, lazy a) -> a ! Ea, Eb     uses Fibers   first completion wins, loser interrupted
+fiber.within    (lazy a, Duration) -> a ! E, Timeout             race against a deadline
+fiber.partition ([Outcome<a ! E>]) -> ([a], [Outcome<a ! E>])    split successes from failures
+```
+
+**Structural `join`.** `join` accepts a fiber, a tuple of fibers, or a
+list of fibers, and returns the same shape with the fibers stripped; the
+joined error row is the union of the element rows. On failure the **first
+error in shape order** wins (deterministic under any `Runtime(n)`): the
+remaining fibers in the shape are interrupted and the error re-raises.
+`Interrupted` and `Timeout` are fieldless builtin structs — ordinary
+catchable errors.
+
+**Error placement** — one sentence to teach: *errors live in the fiber's
+type until the join; the join puts them back in the channel; then it's
+ordinary `catch`.* Decide per branch at the fork (inline `catch` inside
+the forked expression), sweep up the remainder at the join. The joined
+row forgets which branch contributed an error, so when branches differ in
+recovery policy, handle per branch — or use `settle` when the failure
+itself is data you will act on:
+
+```inga
+outcomes = urls |> fiber.parMap((u) -> fetch(u) |> fiber.settle)
+map(outcomes, (o) -> match o {
+    Ok(body)          -> store(body)
+    Failed(Timeout)   -> queueRetry()
+    Failed(HttpError e) -> logger.warn("${e.status}")
+})
+```
+
+`Failed` arms reuse `catch`'s pattern language (typed binds,
+destructuring), and `match` over an `Outcome` is exhaustiveness-checked
+against the row in its type. `settle`/`unsettle` carry no `Fibers` row —
+they are error-channel operators, useful in sequential code too.
+
+**Capture and sharing.** Captured values are frozen before the fiber
+starts (marked static recursively by type descriptor; arena captures are
+copied out first); function values, maps, fibers, and outcomes are
+rejected as captures. Capability evidence crosses **iff the service is
+declared `shared`** — `shared service Adder { … }` is the contract, and
+the checker enforces scalar-only instance state (`Int`/`Float`/`Bool`/
+`Duration`) at every implementation, so adding a `MutMap` field errors at
+the impl, not at a distant fork site. Non-shared services are provided
+fresh inside the forked expression.
+
+**Supervision (the no-leak rule).** A fiber whose handle is dropped —
+including when its forking function returns without joining — is
+interrupted: handles are ordinary RC values whose drop glue is the
+abandon. Returning or storing the handle keeps it alive, like any value.
+There is no daemon escape hatch; if one is ever needed it arrives as a
+capability.
+
+**Phase 1 implementation note.** The runtime currently backs each fiber
+with one OS thread (the worker count of `Runtime(n)` is honored when the
+M:N scheduler lands, co-designed with the IO layer); the API and every
+rule above are final, and the §6.5 promise means programs written today
+keep their meaning then. `sleep` and `retry` backoff keep **empty rows**:
+they park when a scheduler can park them and block a worker otherwise —
+an unobservable difference, by design. Deferred to the scheduler phase:
+`fiber.recover` (its fallback-thunk execution context needs the scheduler;
+catch-inside-fork covers it), fiber-heap page recycling (fiber results
+currently leak one reference, like the other documented leaks), and
+preemption points in non-`Fibers` code.
+
+**Current limits of the backend:** full delimited-continuation effects
+(resumable handlers, generators, async) remain out of scope; handlers are
+syntax (`catch`, `provide`) rather than first-class values precisely so
+that evidence passing stays sufficient.
 
 ## 7. Modules
 
@@ -397,14 +468,14 @@ program   := decl*
 decl      := 'use' name ('/' name)* ('{' name,* '}')?
            | 'pub'? 'struct' Upper '=' '{' field,* '}'
            | 'pub'? 'enum' Upper '=' variant ('|' variant)*
-           | 'pub'? 'service' Upper '{' (name '::' sig)* '}'
+           | 'pub'? 'shared'? 'service' Upper '{' (name '::' sig)* '}'
            | name '::' Upper '{' (name '=' expr | name '::' sig block)* '}'   -- impl
            | name '::' sig block                                              -- func
 variant   := Upper ('{' field,* '}')?
 sig       := '(' param,* ')' ('->' type)? ('!' Upper,+)? ('uses' Upper,+)?
 param     := 'lazy'? type? name
 type      := Upper | lower | '[' type ']' | type '?' | '(' type,+ ')'   -- paren / tuple
-           | Upper '<' type,+ '>'                  -- MutMap<K, V> / Task<T>
+           | Upper '<' type,+ ('!' Upper,+)? '>'   -- MutMap<K, V> / Fiber<T ! E> / Outcome<T ! E>
            | '(' type,* ')' '->' type ('!' Upper,+)? ('uses' Upper,+)?  -- function type
 field     := type? name
 block     := '{' stmt* '}'

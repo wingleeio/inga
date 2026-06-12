@@ -27,6 +27,11 @@ pub const SIZE_SUFFIXES: [(&str, i64); 3] =
 /// Builtin struct raised by `decode`.
 pub const DECODE_ERROR: &str = "DecodeError";
 pub const ASSERT_FAILED: &str = "AssertFailed";
+pub const INTERRUPTED: &str = "Interrupted";
+pub const TIMEOUT: &str = "Timeout";
+/// The capability every `std/fiber` operation needs; satisfied only by the
+/// builtin `provide Runtime(n)` resource.
+pub const FIBERS_SERVICE: &str = "Fibers";
 
 /// Surface names of primitive types that can appear in a `!` row.
 pub const PRIMITIVE_TAGS: [&str; 5] = ["Int", "Float", "Bool", "String", "Duration"];
@@ -78,7 +83,8 @@ pub enum CType {
     Option(Box<CType>),
     List(Box<CType>),
     Tuple(Vec<CType>),
-    Task(Box<CType>),
+    Fiber(Box<CType>),
+    Outcome(Box<CType>),
     Struct(String),
     Enum(String),
     Service(String),
@@ -156,6 +162,9 @@ struct ServiceInfo {
     name_span: Span,
     module: usize,
     is_pub: bool,
+    /// `shared service`: instances may cross fiber boundaries; impls are
+    /// checked to carry only scalar state.
+    shared: bool,
 }
 
 struct ImplInfo {
@@ -215,6 +224,7 @@ pub fn check(
         checker.info.expr_types.insert(key, resolved);
     }
     checker.validate_declared_rows();
+    checker.validate_shared_impls();
     checker.record_def_details();
     checker.record_facts();
 
@@ -288,6 +298,30 @@ impl<'a> Checker<'a> {
                 },
             );
         }
+        // Fieldless builtins raised by the fiber machinery.
+        for name in [INTERRUPTED, TIMEOUT] {
+            checker.structs.insert(
+                name.to_string(),
+                StructInfo {
+                    fields: Vec::new(),
+                    name_span: Span::default(),
+                    module: CORE_MODULE,
+                    is_pub: true,
+                },
+            );
+        }
+        // The capability carried by every std/fiber operation; satisfied
+        // only by `provide Runtime(n)`. Shared so nested forks are fine.
+        checker.services.insert(
+            FIBERS_SERVICE.to_string(),
+            ServiceInfo {
+                methods: Vec::new(),
+                name_span: Span::default(),
+                module: CORE_MODULE,
+                is_pub: true,
+                shared: true,
+            },
+        );
         checker
     }
 
@@ -423,7 +457,13 @@ impl<'a> Checker<'a> {
                 DefKind::Service => {
                     self.services.insert(
                         name.clone(),
-                        ServiceInfo { methods: Vec::new(), name_span: span, module, is_pub },
+                        ServiceInfo {
+                            methods: Vec::new(),
+                            name_span: span,
+                            module,
+                            is_pub,
+                            shared: false,
+                        },
                     );
                 }
                 _ => {}
@@ -509,6 +549,7 @@ impl<'a> Checker<'a> {
                     }
                     if let Some(info) = self.services.get_mut(&d.name) {
                         info.methods = methods;
+                        info.shared = d.is_shared;
                     }
                 }
                 Decl::Impl(d) => {
@@ -699,15 +740,34 @@ impl<'a> Checker<'a> {
                     Type::Unknown
                 }
             },
-            TypeExpr::Apply { name, name_span, args, .. } => {
+            TypeExpr::Apply { name, name_span, args, row, .. } => {
+                if !row.is_empty() && name != "Fiber" && name != "Outcome" {
+                    self.error(
+                        *name_span,
+                        format!("only `Fiber` and `Outcome` carry an error row, not `{name}`"),
+                    );
+                }
+                let mut row_set = BTreeSet::new();
+                for (n, span) in row {
+                    if self.tag_type(n).is_some() {
+                        row_set.insert(n.clone());
+                    } else {
+                        self.diags
+                            .push(Diagnostic::error(*span, format!("unknown error type `{n}`")));
+                    }
+                }
                 match (name.as_str(), args.len()) {
                     ("MutMap", 2) => Type::MutMap(
                         Box::new(self.resolve_type_expr(&args[0], tyvars)),
                         Box::new(self.resolve_type_expr(&args[1], tyvars)),
                     ),
-                    ("Task", 1) => Type::Task(
+                    ("Fiber", 1) => Type::Fiber(
                         Box::new(self.resolve_type_expr(&args[0], tyvars)),
-                        Rc::new(RefCell::new(BTreeSet::new())),
+                        Rc::new(RefCell::new(row_set)),
+                    ),
+                    ("Outcome", 1) => Type::Outcome(
+                        Box::new(self.resolve_type_expr(&args[0], tyvars)),
+                        Rc::new(RefCell::new(row_set)),
                     ),
                     _ => {
                         for arg in args {
@@ -716,7 +776,7 @@ impl<'a> Checker<'a> {
                         self.error(
                             *name_span,
                             format!(
-                                "`{name}` does not take type arguments (only `MutMap<K, V>` and `Task<T>` do)"
+                                "`{name}` does not take type arguments (only `MutMap<K, V>`, `Fiber<T ! E>`, and `Outcome<T ! E>` do)"
                             ),
                         );
                         Type::Unknown
@@ -1132,7 +1192,8 @@ impl<'a> Checker<'a> {
             Type::Option(t) => CType::Option(Box::new(self.ctype(&t))),
             Type::List(t) => CType::List(Box::new(self.ctype(&t))),
             Type::Tuple(ts) => CType::Tuple(ts.iter().map(|t| self.ctype(t)).collect()),
-            Type::Task(t, _) => CType::Task(Box::new(self.ctype(&t))),
+            Type::Fiber(t, _) => CType::Fiber(Box::new(self.ctype(&t))),
+            Type::Outcome(t, _) => CType::Outcome(Box::new(self.ctype(&t))),
             Type::Named(n) => CType::Struct(n),
             Type::Enum(n) => CType::Enum(n),
             Type::Service(n) => CType::Service(n),
@@ -1674,6 +1735,7 @@ impl<'a> Checker<'a> {
         match import.target.as_str() {
             "std/graphics" => return self.check_gfx_call(member, member_span, args, span),
             "std/schedule" => return self.check_schedule_call(member, member_span, args, span),
+            "std/fiber" => return self.check_fiber_call(member, member_span, args, span),
             _ => {}
         }
         let Some(target) = self.modules.iter().position(|m| m.key == import.target) else {
@@ -1844,6 +1906,325 @@ impl<'a> Checker<'a> {
 
     /// The GL-backed graphics module. Signatures are (Int coordinates,
     /// 0–255 Int color channels); `run` takes the per-frame closure.
+    /// Check a forked-by-name action: its capability row merges into the
+    /// spawner (evidence is captured at the fork site) after the `shared`
+    /// contract check; its error row is returned to ride in the Fiber type.
+    fn check_forked(&mut self, action: &Expr) -> (Type, BTreeSet<String>) {
+        let (ty, rows) = self.with_rows(|s| s.check_expr(action));
+        for cap in &rows.caps {
+            let shared = self.services.get(cap).map(|s| s.shared).unwrap_or(false);
+            if !shared {
+                self.error(
+                    action.span,
+                    format!(
+                        "only `shared` services cross fiber boundaries: declare \
+                         `shared service {cap}` (scalar-only state), or provide a \
+                         fresh `{cap}` inside the forked expression"
+                    ),
+                );
+            }
+        }
+        self.merge_rows(&Rows { errors: BTreeSet::new(), caps: rows.caps });
+        self.add_cap_row(FIBERS_SERVICE);
+        (ty, rows.errors)
+    }
+
+    /// Merge a fiber's error row into the current channel (a join site).
+    fn merge_fiber_errors(&mut self, errs: &Rc<RefCell<BTreeSet<String>>>) {
+        let errors = errs.borrow().clone();
+        self.merge_rows(&Rows { errors, caps: BTreeSet::new() });
+    }
+
+    /// `fiber.*` — the std/fiber module (see docs/SPEC.md §6.5).
+    fn check_fiber_call(
+        &mut self,
+        member: &str,
+        member_span: Span,
+        args: &[&Expr],
+        span: Span,
+    ) -> Type {
+        let arity = |s: &mut Self, n: usize| -> bool {
+            if args.len() != n {
+                s.error(span, format!("`fiber.{member}` expects {n} argument(s), found {}", args.len()));
+                for arg in args {
+                    s.check_expr(arg);
+                }
+                return false;
+            }
+            true
+        };
+        match member {
+            "fork" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                // Reject the no-op pipeline `x |> fiber.fork |> fiber.join`-style
+                // catch confusion early: catching a Fiber-typed expression is a
+                // dedicated diagnostic at the catch site, not here.
+                let (ty, errs) = self.check_forked(args[0]);
+                Type::Fiber(Box::new(ty), Rc::new(RefCell::new(errs)))
+            }
+            "join" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                let t = self.check_expr(args[0]);
+                self.add_cap_row(FIBERS_SERVICE);
+                match self.ctx.resolve(&t) {
+                    Type::Fiber(a, e) => {
+                        self.merge_fiber_errors(&e);
+                        *a
+                    }
+                    Type::Tuple(ts) => {
+                        let mut elems = Vec::with_capacity(ts.len());
+                        for (i, ft) in ts.iter().enumerate() {
+                            match self.ctx.resolve(ft) {
+                                Type::Fiber(a, e) => {
+                                    self.merge_fiber_errors(&e);
+                                    elems.push(*a);
+                                }
+                                Type::Unknown | Type::Var(_) => elems.push(Type::Unknown),
+                                other => {
+                                    let rendered = self.render(&other);
+                                    self.error(
+                                        args[0].span,
+                                        format!("`fiber.join` on a tuple needs every slot to be a fiber; slot {i} is {rendered}"),
+                                    );
+                                    elems.push(Type::Unknown);
+                                }
+                            }
+                        }
+                        Type::Tuple(elems)
+                    }
+                    Type::List(elem) => match self.ctx.resolve(&elem) {
+                        Type::Fiber(a, e) => {
+                            self.merge_fiber_errors(&e);
+                            Type::List(a)
+                        }
+                        Type::Var(_) => {
+                            let a = self.ctx.fresh();
+                            let cell = Rc::new(RefCell::new(BTreeSet::new()));
+                            let _ = self
+                                .ctx
+                                .unify(&elem, &Type::Fiber(Box::new(a.clone()), cell.clone()));
+                            self.merge_fiber_errors(&cell);
+                            Type::List(Box::new(a))
+                        }
+                        other => {
+                            let rendered = self.render(&other);
+                            self.error(
+                                args[0].span,
+                                format!("`fiber.join` on a list needs fiber elements, found [{rendered}]"),
+                            );
+                            Type::Unknown
+                        }
+                    },
+                    Type::Var(_) => {
+                        let a = self.ctx.fresh();
+                        let cell = Rc::new(RefCell::new(BTreeSet::new()));
+                        self.unify_at(
+                            &Type::Fiber(Box::new(a.clone()), cell.clone()),
+                            &t,
+                            args[0].span,
+                            "join input",
+                        );
+                        self.merge_fiber_errors(&cell);
+                        a
+                    }
+                    Type::Unknown => Type::Unknown,
+                    other => {
+                        let rendered = self.render(&other);
+                        self.error(
+                            args[0].span,
+                            format!("`fiber.join` works on a fiber, a tuple of fibers, or a list of fibers; found {rendered}"),
+                        );
+                        Type::Unknown
+                    }
+                }
+            }
+            "poll" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                let t = self.check_expr(args[0]);
+                let a = self.ctx.fresh();
+                let cell = Rc::new(RefCell::new(BTreeSet::new()));
+                self.unify_at(
+                    &Type::Fiber(Box::new(a.clone()), cell.clone()),
+                    &t,
+                    args[0].span,
+                    "poll input",
+                );
+                // A failed fiber re-raises at the poll (it is a join with the
+                // answer ready), so the row enters the channel here too.
+                self.merge_fiber_errors(&cell);
+                self.add_cap_row(FIBERS_SERVICE);
+                Type::Option(Box::new(a))
+            }
+            "interrupt" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                let t = self.check_expr(args[0]);
+                let a = self.ctx.fresh();
+                let cell = Rc::new(RefCell::new(BTreeSet::new()));
+                self.unify_at(
+                    &Type::Fiber(Box::new(a), cell),
+                    &t,
+                    args[0].span,
+                    "interrupt input",
+                );
+                self.add_cap_row(FIBERS_SERVICE);
+                Type::Unit
+            }
+            "settle" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                // Runs the action inline (no fork): the error channel moves
+                // into the Outcome type; capabilities pass through untouched
+                // and no Fibers row is added — settle is an error-channel
+                // operator, not a scheduling one.
+                let (ty, rows) = self.with_rows(|s| s.check_expr(args[0]));
+                if matches!(self.ctx.resolve(&ty), Type::Fiber(..)) {
+                    self.error(
+                        args[0].span,
+                        "`fiber.settle` wraps a failing action, not a fiber; move it inside the forked expression, or settle the join: `fiber.join(f) |> fiber.settle`",
+                    );
+                }
+                self.merge_rows(&Rows { errors: BTreeSet::new(), caps: rows.caps });
+                Type::Outcome(Box::new(ty), Rc::new(RefCell::new(rows.errors)))
+            }
+            "unsettle" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                let t = self.check_expr(args[0]);
+                let a = self.ctx.fresh();
+                let cell = Rc::new(RefCell::new(BTreeSet::new()));
+                self.unify_at(
+                    &Type::Outcome(Box::new(a.clone()), cell.clone()),
+                    &t,
+                    args[0].span,
+                    "unsettle input",
+                );
+                let errors = cell.borrow().clone();
+                self.merge_rows(&Rows { errors, caps: BTreeSet::new() });
+                a
+            }
+            "par" => {
+                if args.len() < 2 {
+                    self.error(span, "`fiber.par` needs at least two actions");
+                    for arg in args {
+                        self.check_expr(arg);
+                    }
+                    return Type::Unknown;
+                }
+                // fork each + join immediately: all error rows enter the
+                // channel here, in shape order.
+                let mut elems = Vec::with_capacity(args.len());
+                for arg in args {
+                    let (ty, errs) = self.check_forked(arg);
+                    self.merge_rows(&Rows { errors: errs, caps: BTreeSet::new() });
+                    elems.push(ty);
+                }
+                Type::Tuple(elems)
+            }
+            "parMap" => {
+                if !arity(self, 2) {
+                    return Type::Unknown;
+                }
+                let list_ty = self.check_expr(args[0]);
+                let a = self.ctx.fresh();
+                self.unify_at(
+                    &Type::List(Box::new(a.clone())),
+                    &list_ty,
+                    args[0].span,
+                    "parMap input",
+                );
+                let b = self.ctx.fresh();
+                let expected_f = Type::Func(Rc::new(FuncType {
+                    params: vec![a],
+                    ret: b.clone(),
+                    errors: BTreeSet::new(),
+                    caps: BTreeSet::new(),
+                }));
+                let func_ty = self.check_arg_expecting(args[1], &expected_f);
+                self.unify_at(&expected_f, &func_ty, args[1].span, "parMap function");
+                // The element function's rows behave like a forked action's:
+                // caps cross (shared-checked), errors surface at this
+                // immediate join.
+                if let Type::Func(f) = self.ctx.resolve(&func_ty) {
+                    for cap in &f.caps {
+                        let shared =
+                            self.services.get(cap).map(|s| s.shared).unwrap_or(false);
+                        if !shared {
+                            self.error(
+                                args[1].span,
+                                format!(
+                                    "only `shared` services cross fiber boundaries: declare \
+                                     `shared service {cap}`, or provide a fresh `{cap}` inside \
+                                     the element function"
+                                ),
+                            );
+                        }
+                    }
+                    self.merge_rows(&Rows { errors: f.errors.clone(), caps: f.caps.clone() });
+                }
+                self.add_cap_row(FIBERS_SERVICE);
+                Type::List(Box::new(b))
+            }
+            "race" => {
+                if !arity(self, 2) {
+                    return Type::Unknown;
+                }
+                let (ta, ea) = self.check_forked(args[0]);
+                let (tb, eb) = self.check_forked(args[1]);
+                self.unify_at(&ta, &tb, args[1].span, "race branches");
+                self.merge_rows(&Rows { errors: ea, caps: BTreeSet::new() });
+                self.merge_rows(&Rows { errors: eb, caps: BTreeSet::new() });
+                ta
+            }
+            "within" => {
+                if !arity(self, 2) {
+                    return Type::Unknown;
+                }
+                let (ty, errs) = self.check_forked(args[0]);
+                let d = self.check_expr(args[1]);
+                self.unify_at(&Type::Duration, &d, args[1].span, "within deadline");
+                self.merge_rows(&Rows { errors: errs, caps: BTreeSet::new() });
+                self.add_error_row(TIMEOUT);
+                ty
+            }
+            "partition" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                let t = self.check_expr(args[0]);
+                let a = self.ctx.fresh();
+                let cell = Rc::new(RefCell::new(BTreeSet::new()));
+                let outcome = Type::Outcome(Box::new(a.clone()), cell);
+                self.unify_at(
+                    &Type::List(Box::new(outcome.clone())),
+                    &t,
+                    args[0].span,
+                    "partition input",
+                );
+                Type::Tuple(vec![Type::List(Box::new(a)), Type::List(Box::new(outcome))])
+            }
+            _ => {
+                self.error(
+                    member_span,
+                    format!("`std/fiber` has no member `{member}` (fork, join, poll, interrupt, settle, unsettle, par, parMap, race, within, partition)"),
+                );
+                for arg in args {
+                    self.check_expr(arg);
+                }
+                Type::Unknown
+            }
+        }
+    }
+
     fn check_gfx_call(
         &mut self,
         name: &str,
@@ -2088,50 +2469,6 @@ impl<'a> Checker<'a> {
                 self.unify_at(&a, &b, args[1].span, "assertEq operands");
                 self.add_error_row(ASSERT_FAILED);
                 Type::Unit
-            }
-            "spawn" => {
-                if !check_arity(self, 1) {
-                    return Some(Type::Unknown);
-                }
-                // By-name: the action runs on its own thread. Its error row
-                // travels in the Task type (re-raised by `await`); its
-                // capability row merges into the spawner like a call — the
-                // task captures the evidence in scope — but only services
-                // safe to share across threads may cross.
-                let (action_ty, rows) = self.with_rows(|s| s.check_expr(args[0]));
-                for cap in &rows.caps {
-                    if let Some(blocker) = self.unshareable_impl(cap) {
-                        self.error(
-                            args[0].span,
-                            format!(
-                                "a spawned task can use `{cap}` only if every implementation \
-                                 is shareable across threads (fields limited to Int/Float/\
-                                 Bool/Duration); `{blocker}` holds other state — provide a \
-                                 fresh `{cap}` inside the spawned expression instead"
-                            ),
-                        );
-                    }
-                }
-                self.merge_rows(&Rows { errors: BTreeSet::new(), caps: rows.caps });
-                Type::Task(Box::new(action_ty), Rc::new(RefCell::new(rows.errors)))
-            }
-            "await" => {
-                if !check_arity(self, 1) {
-                    return Some(Type::Unknown);
-                }
-                let task_ty = self.check_expr(args[0]);
-                let a = self.ctx.fresh();
-                let errs = Rc::new(RefCell::new(BTreeSet::new()));
-                self.unify_at(
-                    &Type::Task(Box::new(a.clone()), errs.clone()),
-                    &task_ty,
-                    args[0].span,
-                    "await input",
-                );
-                // Re-raise the spawned action's failures here.
-                let errors = errs.borrow().clone();
-                self.merge_rows(&Rows { errors, caps: BTreeSet::new() });
-                a
             }
             "sleep" => {
                 if check_arity(self, 1) {
@@ -2561,6 +2898,16 @@ impl<'a> Checker<'a> {
             }
             PipeTarget::Catch { arms, span: catch_span } => {
                 let (lhs_ty, mut rows) = self.with_rows(|s| s.check_expr(lhs));
+                if rows.errors.is_empty() {
+                    if let Type::Fiber(_, errs) = self.ctx.resolve(&lhs_ty) {
+                        if !errs.borrow().is_empty() {
+                            self.error(
+                                *catch_span,
+                                "the fiber's errors surface at `fiber.join`; catch there, or catch inside the forked expression",
+                            );
+                        }
+                    }
+                }
                 let result_ty = lhs_ty;
                 // Variant arms only clear an enum's tag once every variant is
                 // covered; partially-caught enums stay in the row.
@@ -2819,6 +3166,61 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
+            Type::Outcome(_, cell) => {
+                let inner_total = |s: &Self, args: &CtorPatArgs| match args {
+                    CtorPatArgs::None => true,
+                    CtorPatArgs::Positional(ps) if ps.len() == 1 => {
+                        s.pattern_irrefutable(&ps[0])
+                    }
+                    _ => false,
+                };
+                let has_ok = arms.iter().any(|a| matches!(&a.pattern.kind,
+                    PatternKind::Ctor { name, args, .. } if name == "Ok" && inner_total(self, args)));
+                let failed_catchall = arms.iter().any(|a| matches!(&a.pattern.kind,
+                    PatternKind::Ctor { name, args, .. } if name == "Failed" && inner_total(self, args)));
+                let mut missing = Vec::new();
+                if !has_ok {
+                    missing.push("`Ok(...)`".to_string());
+                }
+                if !failed_catchall {
+                    let row = cell.borrow().clone();
+                    for t in &row {
+                        let covered = arms.iter().any(|a| match &a.pattern.kind {
+                            PatternKind::Ctor { name, args, .. } if name == "Failed" => {
+                                match args {
+                                    CtorPatArgs::Positional(ps) if ps.len() == 1 => {
+                                        match &ps[0].kind {
+                                            PatternKind::Ctor { name: inner, .. } => {
+                                                inner == t
+                                                    || self
+                                                        .variant_owner
+                                                        .get(inner)
+                                                        .is_some_and(|o| o == t)
+                                            }
+                                            PatternKind::TypedBind { ty, .. } => ty == t,
+                                            _ => false,
+                                        }
+                                    }
+                                    _ => false,
+                                }
+                            }
+                            _ => false,
+                        });
+                        if !covered {
+                            missing.push(format!("`Failed({t} ...)`"));
+                        }
+                    }
+                }
+                if !missing.is_empty() {
+                    self.error(
+                        scrutinee.span,
+                        format!(
+                            "this `match` over an Outcome is not exhaustive: missing {} (or a `Failed(other)` catch-all)",
+                            missing.join(", ")
+                        ),
+                    );
+                }
+            }
             Type::Var(_) | Type::Unknown => {}
             _ => {
                 self.error(
@@ -2868,6 +3270,47 @@ impl<'a> Checker<'a> {
                 self.unify_at(&Type::Bool, scrut_ty, pat.span, "pattern");
             }
             PatternKind::Ctor { name, name_span, args } => match name.as_str() {
+                "Ok" => {
+                    let inner = self.ctx.fresh();
+                    let cell = Rc::new(RefCell::new(BTreeSet::new()));
+                    let outcome = Type::Outcome(Box::new(inner.clone()), cell);
+                    self.unify_at(&outcome, scrut_ty, pat.span, "pattern");
+                    match args {
+                        CtorPatArgs::Positional(pats) if pats.len() == 1 => {
+                            self.check_pattern_against(&pats[0], &inner);
+                        }
+                        CtorPatArgs::None => {}
+                        _ => self.error(pat.span, "`Ok` takes one pattern: `Ok(value)`"),
+                    }
+                }
+                "Failed" => {
+                    let inner = self.ctx.fresh();
+                    let cell = Rc::new(RefCell::new(BTreeSet::new()));
+                    let outcome = Type::Outcome(Box::new(inner), cell.clone());
+                    self.unify_at(&outcome, scrut_ty, pat.span, "pattern");
+                    match args {
+                        CtorPatArgs::Positional(pats) if pats.len() == 1 => {
+                            // The inner pattern speaks `catch`'s language; a
+                            // catch-all binder takes the row's single type
+                            // when there is exactly one.
+                            let bound = {
+                                let row = cell.borrow();
+                                if row.len() == 1 {
+                                    self.tag_type(row.iter().next().unwrap())
+                                        .unwrap_or(Type::Unknown)
+                                } else {
+                                    Type::Unknown
+                                }
+                            };
+                            self.check_pattern_against(&pats[0], &bound);
+                        }
+                        CtorPatArgs::None => {}
+                        _ => self.error(
+                            pat.span,
+                            "`Failed` takes one pattern: `Failed(HttpError e)`, `Failed(Timeout)`, or `Failed(other)`",
+                        ),
+                    }
+                }
                 "Some" => {
                     let inner = self.ctx.fresh();
                     let opt = Type::Option(Box::new(inner.clone()));
@@ -2937,6 +3380,35 @@ impl<'a> Checker<'a> {
         let mut provided: BTreeSet<String> = BTreeSet::new();
         let mut has_arena = false;
         for item in impls {
+            if item.name == "Runtime" {
+                // The fiber runtime: `provide Runtime(n)` (n workers; default
+                // = cores). Satisfies the builtin `Fibers` capability.
+                match item.args.as_deref() {
+                    None | Some([]) => {}
+                    Some([arg]) => {
+                        let ty = self.check_expr(arg);
+                        self.unify_at(&Type::Int, &ty, arg.span, "worker count");
+                    }
+                    Some(args) => {
+                        self.error(
+                            item.name_span,
+                            "`Runtime` takes at most one Int argument, like `Runtime(4)`",
+                        );
+                        for arg in args {
+                            self.check_expr(arg);
+                        }
+                    }
+                }
+                if self.record_info {
+                    self.info.hovers.push((
+                        item.name_span,
+                        "Runtime(Int workers) — the fiber runtime; satisfies `Fibers` for this scope"
+                            .to_string(),
+                    ));
+                }
+                provided.insert(FIBERS_SERVICE.to_string());
+                continue;
+            }
             if item.name == "Arena" {
                 has_arena = true;
                 match item.args.as_deref() {
@@ -3024,27 +3496,40 @@ impl<'a> Checker<'a> {
         body_ty
     }
 
-    /// A service may cross into a spawned task only when every
-    /// implementation's instance is immutable plain data: scalar fields
-    /// only (no maps, strings, functions, or nested services), so two
-    /// threads can never race on a refcount or shared mutation. Returns
-    /// the first offending implementation's name, or None when shareable.
-    fn unshareable_impl(&self, service: &str) -> Option<String> {
-        for (impl_name, info) in &self.impls {
-            if info.service != service {
+    /// `shared service` is the contract that instances may cross fiber
+    /// boundaries; every implementation must then carry only scalar state
+    /// (no maps, strings, functions, or nested services), so two fibers can
+    /// never race on a refcount or shared mutation. Checked at each impl.
+    fn validate_shared_impls(&mut self) {
+        let impls: Vec<(String, String, Span)> = self
+            .impls
+            .iter()
+            .map(|(n, i)| (n.clone(), i.service.clone(), i.name_span))
+            .collect();
+        for (impl_name, service, span) in impls {
+            if !self.services.get(&service).map(|s| s.shared).unwrap_or(false) {
                 continue;
             }
-            let shareable = info.fields.iter().all(|(_, ty)| {
-                matches!(
+            let fields = match self.impls.get(&impl_name) {
+                Some(i) => i.fields.clone(),
+                None => continue,
+            };
+            for (fname, ty) in &fields {
+                let ok = matches!(
                     self.ctx.resolve(ty),
                     Type::Int | Type::Float | Type::Bool | Type::Duration | Type::Unit
-                )
-            });
-            if !shareable {
-                return Some(impl_name.clone());
+                );
+                if !ok {
+                    let rendered = self.render(&self.ctx.resolve(ty));
+                    self.error(
+                        span,
+                        format!(
+                            "`{impl_name}` implements the shared service `{service}`, but field `{fname}` is {rendered} — shared services may carry only scalar state (Int/Float/Bool/Duration)"
+                        ),
+                    );
+                }
             }
         }
-        None
     }
 
     /// Can a value of this type be deep-copied out of an arena region?
@@ -3187,6 +3672,13 @@ impl<'a> Checker<'a> {
                 ));
             }
             for cap in &rows.caps {
+                if cap == FIBERS_SERVICE {
+                    self.diags.push(Diagnostic::error(
+                        name_span,
+                        "this program forks fibers; provide the runtime in `main`: `provide Runtime(4)` (workers; default = cores)",
+                    ));
+                    continue;
+                }
                 self.diags.push(Diagnostic::error(
                     name_span,
                     format!("`main` requires the service `{cap}`; wrap the code in `provide`"),
@@ -3278,6 +3770,13 @@ impl<'a> Checker<'a> {
                 self.info.hovers.push((
                     u.path_span,
                     "std/schedule — retry schedules: schedule.exponential(base), schedule.fixed(interval), schedule.upTo(schedule, times)".to_string(),
+                ));
+                return;
+            }
+            "std/fiber" => {
+                self.info.hovers.push((
+                    u.path_span,
+                    "std/fiber — fibers: fiber.fork/join/poll/interrupt/settle/unsettle/par/parMap/race/within/partition; needs `provide Runtime(n)`".to_string(),
                 ));
                 return;
             }
@@ -3425,7 +3924,7 @@ pub fn builtin_doc(name: &str) -> Option<&'static str> {
     builtin_completions().into_iter().find(|(n, _)| *n == name).map(|(_, doc)| doc)
 }
 
-const BUILTIN_NAMES: [&str; 34] = [
+const BUILTIN_NAMES: [&str; 32] = [
     "println",
     "print",
     "show",
@@ -3437,8 +3936,6 @@ const BUILTIN_NAMES: [&str; 34] = [
     "retry",
     "ignoreFailure",
     "sleep",
-    "spawn",
-    "await",
     "assert",
     "assertEq",
     "len",
@@ -3477,8 +3974,6 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("schedule.upTo", "schedule.upTo(schedule, times) -> Schedule — cap the retry count"),
         ("ignoreFailure", "ignoreFailure(lazy action) -> Unit — swallow the error channel"),
         ("sleep", "sleep(duration) -> Unit"),
-        ("spawn", "spawn(lazy action) -> Task<a ! E> — run `action` on its own thread; its errors re-raise at `await`, and it may use shareable services in scope"),
-        ("await", "await(task) -> a ! E — wait for a task; re-raises the action's failure here (catch it at the await)"),
         ("assert", "assert(condition) -> Unit ! AssertFailed — for `inga test`"),
         ("assertEq", "assertEq(actual, expected) -> Unit ! AssertFailed — for `inga test`"),
         ("len", "len(stringOrList) -> Int"),

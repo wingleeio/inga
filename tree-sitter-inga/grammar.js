@@ -98,7 +98,15 @@ module.exports = grammar({
     field: $ => seq(optional($._type), field('name', $.identifier)),
 
     service_declaration: $ =>
-      seq(optional('pub'), 'service', field('name', $.type_identifier), '{', repeat($.method_signature), '}'),
+      seq(
+        optional('pub'),
+        optional('shared'),
+        'service',
+        field('name', $.type_identifier),
+        '{',
+        repeat($.method_signature),
+        '}'
+      ),
 
     method_signature: $ => seq(field('name', $.identifier), '::', $.signature),
 

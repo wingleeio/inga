@@ -75,6 +75,9 @@ pub struct Field {
 #[derive(Debug)]
 pub struct ServiceDecl {
     pub is_pub: bool,
+    /// `shared service`: instances may cross fiber boundaries; every
+    /// implementation is checked to carry only scalar state.
+    pub is_shared: bool,
     pub name: String,
     pub name_span: Span,
     pub methods: Vec<MethodSig>,
@@ -140,9 +143,16 @@ pub enum TypeExpr {
     List(Box<TypeExpr>, Span),
     /// `(Int, String)` — a tuple type.
     Tuple(Vec<TypeExpr>, Span),
-    /// `MutMap<Int, String>`, `Task<Int>` — the builtin generic types,
-    /// written the way hover renders them.
-    Apply { name: String, name_span: Span, args: Vec<TypeExpr>, span: Span },
+    /// `MutMap<Int, String>`, `Fiber<Int ! Boom>`, `Outcome<a ! E>` — the
+    /// builtin generic types, written the way hover renders them. The row
+    /// (after `!`) is meaningful only for Fiber/Outcome.
+    Apply {
+        name: String,
+        name_span: Span,
+        args: Vec<TypeExpr>,
+        row: Vec<(String, Span)>,
+        span: Span,
+    },
     /// `(Int, String) -> Bool`, optionally with effect rows:
     /// `(Int) -> User ! DbError uses Logger`. A plain arrow type is a
     /// *pure* contract — no failures, no capabilities.

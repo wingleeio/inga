@@ -25,11 +25,14 @@ pub enum Type {
     List(Box<Type>),
     /// `(T, U)`
     Tuple(Vec<Type>),
-    /// A running task; `await` yields the payload and re-raises the
-    /// spawned action's errors. The error set is shared mutable state:
-    /// unifying two task types unions both cells, so every alias of the
+    /// A running fiber; `fiber.join` yields the payload and re-raises the
+    /// forked action's errors. The error set is shared mutable state:
+    /// unifying two fiber types unions both cells, so every alias of the
     /// type agrees (sets only grow — the row fixpoint stays monotone).
-    Task(Box<Type>, Rc<RefCell<BTreeSet<String>>>),
+    Fiber(Box<Type>, Rc<RefCell<BTreeSet<String>>>),
+    /// A settled result: `Ok(value)` or `Failed(error)` — the error channel
+    /// as data. Same row-cell mechanics as Fiber.
+    Outcome(Box<Type>, Rc<RefCell<BTreeSet<String>>>),
     /// A `struct` declaration (nominal record).
     Named(String),
     /// An `enum` declaration (nominal sum type).
@@ -85,7 +88,8 @@ impl TypeCtx {
             Type::Option(t) => Type::Option(Box::new(self.apply(&t))),
             Type::List(t) => Type::List(Box::new(self.apply(&t))),
             Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| self.apply(t)).collect()),
-            Type::Task(t, errs) => Type::Task(Box::new(self.apply(&t)), errs),
+            Type::Fiber(t, errs) => Type::Fiber(Box::new(self.apply(&t)), errs),
+            Type::Outcome(t, errs) => Type::Outcome(Box::new(self.apply(&t)), errs),
             Type::MutMap(k, v) => {
                 Type::MutMap(Box::new(self.apply(&k)), Box::new(self.apply(&v)))
             }
@@ -102,7 +106,9 @@ impl TypeCtx {
     fn occurs(&self, var: u32, ty: &Type) -> bool {
         match self.resolve(ty) {
             Type::Var(v) => v == var,
-            Type::Option(t) | Type::List(t) | Type::Task(t, _) => self.occurs(var, &t),
+            Type::Option(t) | Type::List(t) | Type::Fiber(t, _) | Type::Outcome(t, _) => {
+                self.occurs(var, &t)
+            }
             Type::Tuple(ts) => ts.iter().any(|t| self.occurs(var, t)),
             Type::MutMap(k, v) => self.occurs(var, &k) || self.occurs(var, &v),
             Type::Func(f) => {
@@ -134,7 +140,8 @@ impl TypeCtx {
             (Type::Option(x), Type::Option(y)) | (Type::List(x), Type::List(y)) => {
                 self.unify(x, y)
             }
-            (Type::Task(x, xe), Type::Task(y, ye)) => {
+            (Type::Fiber(x, xe), Type::Fiber(y, ye))
+            | (Type::Outcome(x, xe), Type::Outcome(y, ye)) => {
                 if !Rc::ptr_eq(xe, ye) {
                     let union: BTreeSet<String> =
                         xe.borrow().union(&ye.borrow()).cloned().collect();
@@ -190,14 +197,19 @@ impl TypeCtx {
                 }
             }
             Type::List(t) => format!("[{}]", self.render(&t, names)),
-            Type::Task(t, errs) => {
-                let inner = self.render(&t, names);
+            resolved @ (Type::Fiber(..) | Type::Outcome(..)) => {
+                let (head, t, errs) = match &resolved {
+                    Type::Fiber(t, errs) => ("Fiber", t, errs),
+                    Type::Outcome(t, errs) => ("Outcome", t, errs),
+                    _ => unreachable!(),
+                };
+                let inner = self.render(t, names);
                 let errs = errs.borrow();
                 if errs.is_empty() {
-                    format!("Task<{inner}>")
+                    format!("{head}<{inner}>")
                 } else {
                     let row = errs.iter().cloned().collect::<Vec<_>>().join(", ");
-                    format!("Task<{inner} ! {row}>")
+                    format!("{head}<{inner} ! {row}>")
                 }
             }
             Type::Tuple(ts) => {

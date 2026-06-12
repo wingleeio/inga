@@ -88,7 +88,7 @@
         },
         {
           "name": "keyword.other.inga",
-          "match": "\\b(use|pub|struct|enum|service|provide|uses|lazy)\\b"
+          "match": "\\b(use|pub|shared|struct|enum|service|provide|uses|lazy)\\b"
         },
         {
           "name": "constant.language.inga",

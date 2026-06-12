@@ -432,9 +432,14 @@ main :: () {
 }
 
 #[test]
-fn await_requires_a_task() {
-    let errs = check_errors("main :: () {\n    println(await(3))\n}\n");
-    assert!(errs.iter().any(|m| m.contains("Task")), "got: {errs:?}");
+fn join_requires_a_fiber_shape() {
+    let errs = check_errors(
+        "use std/fiber\n\nmain :: () {\n    provide Runtime(1)\n    println(fiber.join(3))\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("works on a fiber")),
+        "got: {errs:?}"
+    );
 }
 
 #[test]

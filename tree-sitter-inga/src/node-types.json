@@ -2852,6 +2852,10 @@
     "named": false
   },
   {
+    "type": "shared",
+    "named": false
+  },
+  {
     "type": "struct",
     "named": false
   },

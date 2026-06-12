@@ -172,9 +172,21 @@ impl<'a> Cg<'a> {
         // Fixed tag ids for the builtins, then one per struct/enum.
         self.struct_meta.insert("DecodeError".into(), vec!["message".into()]);
         self.struct_meta.insert("AssertFailed".into(), vec!["message".into()]);
-        for (i, tag) in ["DecodeError", "AssertFailed", "Int", "Float", "Bool", "String", "Duration"]
-            .iter()
-            .enumerate()
+        self.struct_meta.insert("Interrupted".into(), Vec::new());
+        self.struct_meta.insert("Timeout".into(), Vec::new());
+        for (i, tag) in [
+            "DecodeError",
+            "AssertFailed",
+            "Interrupted",
+            "Timeout",
+            "Int",
+            "Float",
+            "Bool",
+            "String",
+            "Duration",
+        ]
+        .iter()
+        .enumerate()
         {
             self.tag_ids.insert(tag.to_string(), i as i64);
         }
@@ -318,19 +330,24 @@ impl<'a> Cg<'a> {
         // C entry point. The checker guarantees `main` has empty rows, so it
         // is infallible and takes no evidence. The type-descriptor table is
         // registered first (show/==/encode/copy interpret it).
-        let user_entry = match self.test_main.clone() {
-            Some(tests) => {
-                self.gen_test_main(&tests);
-                "@ing.testmain"
-            }
-            None => "@ing.fn.main",
-        };
         let table = self.type_descs.join("\n");
         let table_const = self.str_const(&table);
-        let _ = write!(
-            self.functions,
-            "define i32 @main() {{\nentry:\n  call void @rt_types_init(i64 {table_const})\n  %r = call i64 {user_entry}()\n  %c = trunc i64 %r to i32\n  ret i32 %c\n}}\n\n"
-        );
+        match self.test_main.clone() {
+            Some(tests) => {
+                // Test mode: the harness's failure count is the exit code.
+                self.gen_test_main(&tests);
+                let _ = write!(
+                    self.functions,
+                    "define i32 @main() {{\nentry:\n  call void @rt_types_init(i64 {table_const})\n  %r = call i64 @ing.testmain()\n  %c = trunc i64 %r to i32\n  ret i32 %c\n}}\n\n"
+                );
+            }
+            None => {
+                let _ = write!(
+                    self.functions,
+                    "define i32 @main() {{\nentry:\n  call void @rt_types_init(i64 {table_const})\n  call i64 @ing.fn.main()\n  ret i32 0\n}}\n\n"
+                );
+            }
+        }
     }
 
     /// Render the value inside an error box `{tag, payload}` for the test
@@ -1017,6 +1034,9 @@ impl<'a> Cg<'a> {
                     if module == "graphics" {
                         return self.gen_gfx(f, name, args, span);
                     }
+                    if module == "fiber" {
+                        return self.gen_fiber(f, name, args, span);
+                    }
                     if let Some(v) = self.gen_qualified(f, module, name, args, span) {
                         return v;
                     }
@@ -1194,6 +1214,9 @@ impl<'a> Cg<'a> {
                 }
                 if module == "graphics" {
                     return self.gen_gfx(f, name, args, span);
+                }
+                if module == "fiber" {
+                    return self.gen_fiber(f, name, args, span);
                 }
                 if let Some(v) = self.gen_qualified(f, module, name, args, span) {
                     return v;
@@ -1857,6 +1880,45 @@ impl<'a> Cg<'a> {
                 f.line(format!("br i1 {c}, label %{ok}, label %{fail}"));
             }
             PatternKind::Ctor { name, args, .. } => match name.as_str() {
+                // Outcome {disc, tag, payload}: Ok matches disc 0 and tests
+                // the payload; Failed matches disc 1 and hands the {tag,
+                // payload} pair to the catch pattern machinery — Failed arms
+                // use the same pattern language as `catch`.
+                "Ok" if matches!(vty, CType::Outcome(_)) => {
+                    let disc = self.load_slot_from_int(f, v, 0);
+                    let c = self.tmp();
+                    let inner_l = self.label("outcome.ok");
+                    f.line(format!("{c} = icmp eq i64 {disc}, 0"));
+                    f.line(format!("br i1 {c}, label %{inner_l}, label %{fail}"));
+                    f.start_block(&inner_l);
+                    match args {
+                        CtorPatArgs::Positional(pats) if pats.len() == 1 => {
+                            let payload = self.load_slot_from_int(f, v, 2);
+                            let inner_ty = match vty {
+                                CType::Outcome(t) => (**t).clone(),
+                                _ => CType::Int,
+                            };
+                            self.gen_pattern_test(f, &pats[0], &payload, &inner_ty, ok, fail);
+                        }
+                        _ => f.line(format!("br label %{ok}")),
+                    }
+                }
+                "Failed" if matches!(vty, CType::Outcome(_)) => {
+                    let disc = self.load_slot_from_int(f, v, 0);
+                    let c = self.tmp();
+                    let inner_l = self.label("outcome.failed");
+                    f.line(format!("{c} = icmp ne i64 {disc}, 0"));
+                    f.line(format!("br i1 {c}, label %{inner_l}, label %{fail}"));
+                    f.start_block(&inner_l);
+                    match args {
+                        CtorPatArgs::Positional(pats) if pats.len() == 1 => {
+                            let tag = self.load_slot_from_int(f, v, 1);
+                            let payload = self.load_slot_from_int(f, v, 2);
+                            self.gen_catch_arm_test(f, &pats[0], &tag, &payload, ok, fail);
+                        }
+                        _ => f.line(format!("br label %{ok}")),
+                    }
+                }
                 "None" => {
                     let c = self.tmp();
                     f.line(format!("{c} = icmp eq i64 {v}, 0"));
@@ -1983,6 +2045,16 @@ impl<'a> Cg<'a> {
         let saved = f.evidence.clone();
         let mut arenas = 0usize;
         for item in impls {
+            if item.name == "Runtime" {
+                // Phase 1 runs one OS thread per fiber: the worker count is
+                // honored by the M:N scheduler (phase 2); here the resource
+                // only satisfies the `Fibers` capability (dummy evidence).
+                for arg in item.args.as_deref().unwrap_or(&[]) {
+                    let _ = self.gen_expr(f, arg);
+                }
+                f.evidence.insert("Fibers".to_string(), "0".to_string());
+                continue;
+            }
             if item.name == "Arena" {
                 // Push a region; allocations in the dynamic extent of the
                 // body come from it and are freed wholesale at scope end.
@@ -2473,59 +2545,6 @@ impl<'a> Cg<'a> {
                 "0".to_string()
             }
             "retry" if args.len() == 2 => return Some(self.gen_retry(f, args[0], args[1])),
-            "spawn" if args.len() == 1 => {
-                // Build a thunk for the action, freeze its captures (two
-                // threads must not race on refcounts; arena captures are
-                // copied out first), and hand it to a runtime thread.
-                let (thunk, env, capture_ctys) = self.gen_closure_parts(f, &[], args[0]);
-                for (i, cty) in capture_ctys.iter().enumerate() {
-                    match cty {
-                        CType::Int
-                        | CType::Float
-                        | CType::Bool
-                        | CType::Unit
-                        | CType::Duration
-                        | CType::Tag(_)
-                        // Instance records are immutable and never freed; the
-                        // checker has limited their fields to scalars.
-                        | CType::Service(_) => {}
-                        CType::Func | CType::MutMap(..) | CType::Task(_) => {
-                            self.unsupported(
-                                args[0].span,
-                                "capturing a function value, map, or task in `spawn`",
-                            );
-                        }
-                        _ => {
-                            let desc = self.desc_const(&cty.clone());
-                            let gep = self.tmp();
-                            f.line(format!(
-                                "{gep} = getelementptr i64, ptr {env}, i64 {}",
-                                1 + i
-                            ));
-                            let gep_i = self.tmp();
-                            f.line(format!("{gep_i} = ptrtoint ptr {gep} to i64"));
-                            f.line(format!(
-                                "call void @rt_freeze_slot(i64 {gep_i}, i64 {desc})"
-                            ));
-                        }
-                    }
-                }
-                let out = self.tmp();
-                f.line(format!("{out} = call i64 @rt_task_spawn(i64 {thunk})"));
-                out
-            }
-            "await" if args.len() == 1 => {
-                let t = self.gen_expr(f, args[0]);
-                let pair = self.tmp();
-                f.line(format!("{pair} = call {{ i64, i64 }} @rt_task_await(i64 {t})"));
-                // A failed action's error re-raises here, through the normal
-                // handler chain — `await(t) |> catch {{ ... }}` just works.
-                let out = self.check_failure(f, &pair);
-                // The parent owns the task's result exclusively after the join.
-                let rcty = self.ctype_of_span(span);
-                self.pool_value(f, &out, &rcty);
-                out
-            }
             "sleep" if args.len() == 1 => {
                 let v = self.gen_expr(f, args[0]);
                 f.line(format!("call void @rt_sleep_millis(i64 {v})"));
@@ -2794,6 +2813,757 @@ impl<'a> Cg<'a> {
         }
         let _ = (dynamic, dyn_idx);
         Some(acc)
+    }
+
+    /// Build a thunk for a by-name forked action, freeze its captures, and
+    /// start a fiber. Returns the (unpooled) handle.
+    fn gen_fork_handle(&mut self, f: &mut FnCtx, action: &Expr) -> String {
+        let (thunk, env, capture_ctys) = self.gen_closure_parts(f, &[], action);
+        self.freeze_captures(f, &env, &capture_ctys, action.span);
+        let out = self.tmp();
+        f.line(format!("{out} = call i64 @rt_fiber_fork(i64 {thunk})"));
+        out
+    }
+
+    /// Freeze a closure environment's captures so two fibers never race on
+    /// a refcount (arena captures are deep-copied out first).
+    fn freeze_captures(
+        &mut self,
+        f: &mut FnCtx,
+        env: &str,
+        capture_ctys: &[CType],
+        span: Span,
+    ) {
+        for (i, cty) in capture_ctys.iter().enumerate() {
+            match cty {
+                CType::Int
+                | CType::Float
+                | CType::Bool
+                | CType::Unit
+                | CType::Duration
+                | CType::Tag(_)
+                // Instance records are immutable and never freed; `shared`
+                // limits their fields to scalars.
+                | CType::Service(_) => {}
+                CType::Func | CType::MutMap(..) | CType::Fiber(_) | CType::Outcome(_) => {
+                    self.unsupported(
+                        span,
+                        "capturing a function value, map, fiber, or outcome at a fork",
+                    );
+                }
+                _ => {
+                    let desc = self.desc_const(&cty.clone());
+                    let gep = self.tmp();
+                    f.line(format!("{gep} = getelementptr i64, ptr {env}, i64 {}", 1 + i));
+                    let gep_i = self.tmp();
+                    f.line(format!("{gep_i} = ptrtoint ptr {gep} to i64"));
+                    f.line(format!("call void @rt_freeze_slot(i64 {gep_i}, i64 {desc})"));
+                }
+            }
+        }
+    }
+
+    fn interrupted_tag(&self) -> i64 {
+        self.tag_ids.get("Interrupted").copied().unwrap_or(0)
+    }
+
+    /// Join one handle: re-raise its failure, dup + pool the value.
+    fn gen_join_one(&mut self, f: &mut FnCtx, handle: &str, elem: &CType) -> String {
+        let tag = self.interrupted_tag();
+        let pair = self.tmp();
+        f.line(format!("{pair} = call {{ i64, i64 }} @rt_fiber_join(i64 {handle}, i64 {tag})"));
+        let out = self.check_failure(f, &pair);
+        self.dup_value(f, &out, elem);
+        self.pool_value(f, &out, elem);
+        out
+    }
+
+    /// Join a set of handles in shape order with first-failure-cancels:
+    /// on the first error, every handle in the shape is interrupted and the
+    /// error re-raises (deterministic under any Runtime(n)). Returns the
+    /// joined values.
+    fn gen_join_many(
+        &mut self,
+        f: &mut FnCtx,
+        handles: &[String],
+        elems: &[CType],
+    ) -> Vec<String> {
+        let tag = self.interrupted_tag();
+        let err_slot = f.fresh_slot(self);
+        let cleanup = self.label("join.fail");
+        let done = self.label("join.done");
+        let mut outs = Vec::with_capacity(handles.len());
+        let mut val_slots = Vec::with_capacity(handles.len());
+        for (h, elem) in handles.iter().zip(elems.iter()) {
+            let pair = self.tmp();
+            f.line(format!("{pair} = call {{ i64, i64 }} @rt_fiber_join(i64 {h}, i64 {tag})"));
+            let v = self.tmp();
+            f.line(format!("{v} = extractvalue {{ i64, i64 }} {pair}, 0"));
+            let e = self.tmp();
+            f.line(format!("{e} = extractvalue {{ i64, i64 }} {pair}, 1"));
+            let ok_l = self.label("join.ok");
+            let bad = self.tmp();
+            f.line(format!("{bad} = icmp ne i64 {e}, 0"));
+            let to_fail = self.label("join.tofail");
+            f.line(format!("br i1 {bad}, label %{to_fail}, label %{ok_l}"));
+            f.start_block(&to_fail);
+            f.line(format!("store i64 {e}, ptr {err_slot}"));
+            f.line(format!("br label %{cleanup}"));
+            f.start_block(&ok_l);
+            self.dup_value(f, &v, elem);
+            let slot = f.fresh_slot(self);
+            f.line(format!("store i64 {v}, ptr {slot}"));
+            val_slots.push(slot);
+        }
+        f.line(format!("br label %{done}"));
+        f.start_block(&cleanup);
+        for h in handles {
+            f.line(format!("call void @rt_fiber_interrupt(i64 {h})"));
+        }
+        let e = self.tmp();
+        f.line(format!("{e} = load i64, ptr {err_slot}"));
+        self.emit_failure(f, &e);
+        f.start_block(&done);
+        for (slot, elem) in val_slots.iter().zip(elems.iter()) {
+            let v = self.tmp();
+            f.line(format!("{v} = load i64, ptr {slot}"));
+            self.pool_value(f, &v, elem);
+            outs.push(v);
+        }
+        outs
+    }
+
+    /// The `@ing.fiber.sleeper` shim for `within`: sleeps, then "fails"
+    /// with Timeout — racing it against the action implements the deadline.
+    fn sleeper_shim(&mut self) -> String {
+        let sym = "@ing.fiber.sleeper".to_string();
+        if self.drop_syms.contains_key(&sym) {
+            return sym;
+        }
+        self.drop_syms.insert(sym.clone(), sym.clone());
+        let _ = writeln!(
+            self.functions,
+            "define {{ i64, i64 }} {sym}(ptr %env) {{\nentry:\n  %msp = getelementptr i64, ptr %env, i64 1\n  %ms = load i64, ptr %msp\n  call void @rt_sleep_millis(i64 %ms)\n  %tp = getelementptr i64, ptr %env, i64 2\n  %tag = load i64, ptr %tp\n  %eb = call i64 @rt_make_errbox(i64 %tag, i64 0)\n  %a = insertvalue {{ i64, i64 }} undef, i64 0, 0\n  %b = insertvalue {{ i64, i64 }} %a, i64 %eb, 1\n  ret {{ i64, i64 }} %b\n}}\n"
+        );
+        sym
+    }
+
+    /// The `@ing.fiber.apply` shim for `parMap`: env = {{shim, closure,
+    /// item}}; calls the closure with the item.
+    fn apply_shim(&mut self) -> String {
+        let sym = "@ing.fiber.apply".to_string();
+        if self.drop_syms.contains_key(&sym) {
+            return sym;
+        }
+        self.drop_syms.insert(sym.clone(), sym.clone());
+        let _ = writeln!(
+            self.functions,
+            "define {{ i64, i64 }} {sym}(ptr %env) {{\nentry:\n  %cp = getelementptr i64, ptr %env, i64 1\n  %c = load i64, ptr %cp\n  %ip = getelementptr i64, ptr %env, i64 2\n  %item = load i64, ptr %ip\n  %cptr = inttoptr i64 %c to ptr\n  %fpi = load i64, ptr %cptr\n  %fp = inttoptr i64 %fpi to ptr\n  %r = call {{ i64, i64 }} %fp(ptr %cptr, i64 %item)\n  ret {{ i64, i64 }} %r\n}}\n"
+        );
+        sym
+    }
+
+    /// `fiber.*` — std/fiber operations (docs/SPEC.md §6.5).
+    fn gen_fiber(&mut self, f: &mut FnCtx, name: &str, args: &[&Expr], span: Span) -> String {
+        match (name, args.len()) {
+            ("fork", 1) => {
+                let h = self.gen_fork_handle(f, args[0]);
+                let fcty = self.ctype_of_span(span);
+                self.pool_value(f, &h, &fcty);
+                h
+            }
+            ("join", 1) => {
+                let arg_cty = self.ctype_of(args[0]);
+                match arg_cty {
+                    CType::Fiber(elem) => {
+                        let h = self.gen_expr(f, args[0]);
+                        self.gen_join_one(f, &h, &elem)
+                    }
+                    CType::Tuple(slots) => {
+                        let tup = self.gen_expr(f, args[0]);
+                        let mut handles = Vec::new();
+                        let mut elems = Vec::new();
+                        for (i, scty) in slots.iter().enumerate() {
+                            let h = self.load_slot_from_int(f, &tup, i as i64);
+                            handles.push(h);
+                            elems.push(match scty {
+                                CType::Fiber(e) => (**e).clone(),
+                                other => other.clone(),
+                            });
+                        }
+                        let vals = self.gen_join_many(f, &handles, &elems);
+                        let ptr = self.gen_alloc(f, vals.len() as i64);
+                        for (i, v) in vals.iter().enumerate() {
+                            self.store_slot(f, &ptr, i as i64, v);
+                        }
+                        let out = self.ptr_to_int(f, &ptr);
+                        // The tuple's slots are already pooled individually;
+                        // pool only the shell (its glue would double-release
+                        // children, so use the leaf form via Func-like key).
+                        let sym = self.leaf_drop();
+                        let slot = f.fresh_slot(self);
+                        f.line(format!("store i64 {out}, ptr {slot}"));
+                        f.pool.push((slot, sym));
+                        out
+                    }
+                    CType::List(inner) => {
+                        let elem = match &*inner {
+                            CType::Fiber(e) => (**e).clone(),
+                            other => other.clone(),
+                        };
+                        self.gen_join_list(f, args[0], &elem)
+                    }
+                    _ => {
+                        self.unsupported(span, "this `fiber.join` shape");
+                        "0".to_string()
+                    }
+                }
+            }
+            ("poll", 1) => {
+                let h = self.gen_expr(f, args[0]);
+                let tag = self.interrupted_tag();
+                let pair = self.tmp();
+                f.line(format!(
+                    "{pair} = call {{ i64, i64 }} @rt_fiber_poll(i64 {h}, i64 {tag})"
+                ));
+                let out = self.check_failure(f, &pair);
+                // `Some(v)`: the inner value gains a reference owned by the
+                // option box (polls and the eventual join are independent).
+                let elem = match self.ctype_of_span(span) {
+                    CType::Option(e) => (*e).clone(),
+                    _ => CType::Int,
+                };
+                if self.is_rc(&elem) {
+                    let (some_l, cont) = (self.label("poll.some"), self.label("poll.done"));
+                    let c = self.tmp();
+                    f.line(format!("{c} = icmp ne i64 {out}, 0"));
+                    f.line(format!("br i1 {c}, label %{some_l}, label %{cont}"));
+                    f.start_block(&some_l);
+                    let inner = self.load_slot_from_int(f, &out, 0);
+                    self.dup_value(f, &inner, &elem);
+                    f.line(format!("br label %{cont}"));
+                    f.start_block(&cont);
+                }
+                self.pool_value(f, &out, &CType::Option(Box::new(elem)));
+                out
+            }
+            ("interrupt", 1) => {
+                let h = self.gen_expr(f, args[0]);
+                f.line(format!("call void @rt_fiber_interrupt(i64 {h})"));
+                "0".to_string()
+            }
+            ("settle", 1) => {
+                let handler = self.label("settle.fail");
+                let cont = self.label("settle.done");
+                let out_slot = f.fresh_slot(self);
+                f.handlers.push(handler.clone());
+                let v = self.gen_expr(f, args[0]);
+                f.handlers.pop();
+                let elem = self.ctype_of(args[0]);
+                self.dup_value(f, &v, &elem);
+                let okp = self.gen_alloc(f, 3);
+                self.store_slot(f, &okp, 0, "0");
+                self.store_slot(f, &okp, 1, "0");
+                self.store_slot(f, &okp, 2, &v);
+                let ok_int = self.ptr_to_int(f, &okp);
+                f.line(format!("store i64 {ok_int}, ptr {out_slot}"));
+                f.line(format!("br label %{cont}"));
+                f.start_block(&handler);
+                let e = self.tmp();
+                f.line(format!("{e} = load i64, ptr %err.slot"));
+                let etag = self.load_slot_from_int(f, &e, 0);
+                let eval = self.load_slot_from_int(f, &e, 1);
+                let failp = self.gen_alloc(f, 3);
+                self.store_slot(f, &failp, 0, "1");
+                self.store_slot(f, &failp, 1, &etag);
+                self.store_slot(f, &failp, 2, &eval);
+                let fail_int = self.ptr_to_int(f, &failp);
+                f.line(format!("store i64 {fail_int}, ptr {out_slot}"));
+                f.line(format!("br label %{cont}"));
+                f.start_block(&cont);
+                let out = self.tmp();
+                f.line(format!("{out} = load i64, ptr {out_slot}"));
+                self.pool_value(f, &out, &CType::Outcome(Box::new(elem)));
+                out
+            }
+            ("unsettle", 1) => {
+                let o = self.gen_expr(f, args[0]);
+                let disc = self.load_slot_from_int(f, &o, 0);
+                let (fail_l, ok_l) = (self.label("uns.fail"), self.label("uns.ok"));
+                let c = self.tmp();
+                f.line(format!("{c} = icmp ne i64 {disc}, 0"));
+                f.line(format!("br i1 {c}, label %{fail_l}, label %{ok_l}"));
+                f.start_block(&fail_l);
+                let etag = self.load_slot_from_int(f, &o, 1);
+                let eval = self.load_slot_from_int(f, &o, 2);
+                let eb = self.tmp();
+                f.line(format!("{eb} = call i64 @rt_make_errbox(i64 {etag}, i64 {eval})"));
+                self.emit_failure(f, &eb);
+                f.start_block(&ok_l);
+                let v = self.load_slot_from_int(f, &o, 2);
+                let elem = self.ctype_of_span(span);
+                self.dup_value(f, &v, &elem);
+                self.pool_value(f, &v, &elem);
+                v
+            }
+            ("par", n) if n >= 2 => {
+                let mut handles = Vec::new();
+                let mut elems = Vec::new();
+                for arg in args {
+                    handles.push(self.gen_fork_handle(f, arg));
+                    elems.push(self.ctype_of(arg));
+                }
+                let vals = self.gen_join_many(f, &handles, &elems);
+                // Abandon the handles when the function returns (no-op once
+                // joined; frees the records).
+                for h in &handles {
+                    self.pool_value(f, &h.clone(), &CType::Fiber(Box::new(CType::Int)));
+                }
+                let ptr = self.gen_alloc(f, vals.len() as i64);
+                for (i, v) in vals.iter().enumerate() {
+                    self.store_slot(f, &ptr, i as i64, v);
+                }
+                let out = self.ptr_to_int(f, &ptr);
+                let sym = self.leaf_drop();
+                let slot = f.fresh_slot(self);
+                f.line(format!("store i64 {out}, ptr {slot}"));
+                f.pool.push((slot, sym));
+                out
+            }
+            ("race", 2) => {
+                let ha = self.gen_fork_handle(f, args[0]);
+                let hb = self.gen_fork_handle(f, args[1]);
+                self.gen_race_join(f, &ha, &hb, span)
+            }
+            ("within", 2) => {
+                let ha = self.gen_fork_handle(f, args[0]);
+                let ms = self.gen_expr(f, args[1]);
+                let shim = self.sleeper_shim();
+                let timeout_tag = self.tag_ids.get("Timeout").copied().unwrap_or(0);
+                let envp = self.gen_alloc(f, 3);
+                self.store_slot(f, &envp, 0, &format!("ptrtoint (ptr {shim} to i64)"));
+                self.store_slot(f, &envp, 1, &ms);
+                self.store_slot(f, &envp, 2, &timeout_tag.to_string());
+                let env_int = self.ptr_to_int(f, &envp);
+                let hb = self.tmp();
+                f.line(format!("{hb} = call i64 @rt_fiber_fork(i64 {env_int})"));
+                self.gen_race_join(f, &ha, &hb, span)
+            }
+            ("parMap", 2) => self.gen_parmap(f, args[0], args[1], span),
+            ("partition", 1) => self.gen_partition(f, args[0], span),
+            _ => {
+                self.unsupported(span, "this `fiber` operation shape");
+                "0".to_string()
+            }
+        }
+    }
+
+    /// Allocate a list of dynamic length `n` (header + n items, zeroed len
+    /// set by the caller). Returns the pointer register.
+    fn gen_alloc_list_dyn(&mut self, f: &mut FnCtx, n: &str) -> String {
+        let slots = self.tmp();
+        f.line(format!("{slots} = add i64 {n}, 1"));
+        let bytes = self.tmp();
+        f.line(format!("{bytes} = mul i64 {slots}, 8"));
+        let ptr = self.tmp();
+        f.line(format!("{ptr} = call ptr @rt_alloc(i64 {bytes})"));
+        ptr
+    }
+
+    /// A counted loop `for i in 0..n`: emits header/body/done blocks and
+    /// returns the loop-index register valid inside `body` (caller emits the
+    /// body between the two returned closures' calls). Implemented inline at
+    /// call sites instead — see gen_join_list for the pattern.
+    /// `fiber.join` over a `[Fiber<a>]`: join in index order; the first
+    /// failure interrupts every element and re-raises.
+    fn gen_join_list(&mut self, f: &mut FnCtx, list_expr: &Expr, elem: &CType) -> String {
+        let lst = self.gen_expr(f, list_expr);
+        let tag = self.interrupted_tag();
+        let n = self.load_slot_from_int(f, &lst, 0);
+        let outp = self.gen_alloc_list_dyn(f, &n);
+        let out_int = self.ptr_to_int(f, &outp);
+        f.line(format!("store i64 {n}, ptr {outp}"));
+        let i_slot = f.fresh_slot(self);
+        let err_slot = f.fresh_slot(self);
+        f.line(format!("store i64 0, ptr {i_slot}"));
+        let (head, body, cleanup, intr_head, intr_body, done) = (
+            self.label("jl.head"),
+            self.label("jl.body"),
+            self.label("jl.fail"),
+            self.label("jl.intr.head"),
+            self.label("jl.intr.body"),
+            self.label("jl.done"),
+        );
+        let lp = self.tmp();
+        f.line(format!("{lp} = inttoptr i64 {lst} to ptr"));
+        f.line(format!("br label %{head}"));
+        f.start_block(&head);
+        let i = self.tmp();
+        f.line(format!("{i} = load i64, ptr {i_slot}"));
+        let more = self.tmp();
+        f.line(format!("{more} = icmp slt i64 {i}, {n}"));
+        f.line(format!("br i1 {more}, label %{body}, label %{done}"));
+        f.start_block(&body);
+        let i1 = self.tmp();
+        f.line(format!("{i1} = add i64 {i}, 1"));
+        let hp = self.tmp();
+        f.line(format!("{hp} = getelementptr i64, ptr {lp}, i64 {i1}"));
+        let h = self.tmp();
+        f.line(format!("{h} = load i64, ptr {hp}"));
+        let pair = self.tmp();
+        f.line(format!("{pair} = call {{ i64, i64 }} @rt_fiber_join(i64 {h}, i64 {tag})"));
+        let v = self.tmp();
+        f.line(format!("{v} = extractvalue {{ i64, i64 }} {pair}, 0"));
+        let e = self.tmp();
+        f.line(format!("{e} = extractvalue {{ i64, i64 }} {pair}, 1"));
+        let bad = self.tmp();
+        f.line(format!("{bad} = icmp ne i64 {e}, 0"));
+        let store_l = self.label("jl.store");
+        let to_fail = self.label("jl.tofail");
+        f.line(format!("br i1 {bad}, label %{to_fail}, label %{store_l}"));
+        f.start_block(&to_fail);
+        f.line(format!("store i64 {e}, ptr {err_slot}"));
+        f.line(format!("br label %{cleanup}"));
+        f.start_block(&store_l);
+        self.dup_value(f, &v, elem);
+        let op = self.tmp();
+        f.line(format!("{op} = getelementptr i64, ptr {outp}, i64 {i1}"));
+        f.line(format!("store i64 {v}, ptr {op}"));
+        f.line(format!("store i64 {i1}, ptr {i_slot}"));
+        f.line(format!("br label %{head}"));
+        // First failure: interrupt every fiber in the list, then re-raise.
+        f.start_block(&cleanup);
+        f.line(format!("store i64 0, ptr {i_slot}"));
+        f.line(format!("br label %{intr_head}"));
+        f.start_block(&intr_head);
+        let j = self.tmp();
+        f.line(format!("{j} = load i64, ptr {i_slot}"));
+        let jmore = self.tmp();
+        f.line(format!("{jmore} = icmp slt i64 {j}, {n}"));
+        let raise_l = self.label("jl.raise");
+        f.line(format!("br i1 {jmore}, label %{intr_body}, label %{raise_l}"));
+        f.start_block(&intr_body);
+        let j1 = self.tmp();
+        f.line(format!("{j1} = add i64 {j}, 1"));
+        let jp = self.tmp();
+        f.line(format!("{jp} = getelementptr i64, ptr {lp}, i64 {j1}"));
+        let jh = self.tmp();
+        f.line(format!("{jh} = load i64, ptr {jp}"));
+        f.line(format!("call void @rt_fiber_interrupt(i64 {jh})"));
+        f.line(format!("store i64 {j1}, ptr {i_slot}"));
+        f.line(format!("br label %{intr_head}"));
+        f.start_block(&raise_l);
+        let e2 = self.tmp();
+        f.line(format!("{e2} = load i64, ptr {err_slot}"));
+        self.emit_failure(f, &e2);
+        f.start_block(&done);
+        self.pool_value(f, &out_int, &CType::List(Box::new(elem.clone())));
+        out_int
+    }
+
+    /// `fiber.parMap(xs, f)`: fork one fiber per element through the apply
+    /// shim, then join in index order (first failure cancels the batch).
+    /// The element function must be a lambda or a named function — an
+    /// arbitrary function value cannot be frozen across fibers.
+    fn gen_parmap(&mut self, f: &mut FnCtx, list_expr: &Expr, func_expr: &Expr, span: Span) -> String {
+        // The callable: a closure value whose captures we can freeze.
+        let closure = match &func_expr.kind {
+            ExprKind::Lambda { params, body } => {
+                let (c, env, capture_ctys) = self.gen_closure_parts(f, params, body);
+                self.freeze_captures(f, &env, &capture_ctys, func_expr.span);
+                c
+            }
+            ExprKind::Var(_) => {
+                let c = self.gen_expr(f, func_expr);
+                // A top-level function's wrapper holds {fnptr, evidence};
+                // evidence is shared-checked by the checker.
+                f.line(format!("call void @rt_freeze_header(i64 {c})"));
+                c
+            }
+            _ => {
+                self.unsupported(
+                    span,
+                    "this `fiber.parMap` function (use a lambda or a function name)",
+                );
+                return "0".to_string();
+            }
+        };
+        let elem_in = match self.ctype_of(list_expr) {
+            CType::List(e) => (*e).clone(),
+            _ => CType::Int,
+        };
+        let elem_out = match self.ctype_of_span(span) {
+            CType::List(e) => (*e).clone(),
+            _ => CType::Int,
+        };
+        let shim = self.apply_shim();
+        let in_desc = self.desc_const(&elem_in);
+        let lst = self.gen_expr(f, list_expr);
+        let n = self.load_slot_from_int(f, &lst, 0);
+        let lp = self.tmp();
+        f.line(format!("{lp} = inttoptr i64 {lst} to ptr"));
+        // handles list (pooled as fibers: abandoned at return = freed).
+        let hsp = self.gen_alloc_list_dyn(f, &n);
+        let hs_int = self.ptr_to_int(f, &hsp);
+        f.line(format!("store i64 {n}, ptr {hsp}"));
+        let i_slot = f.fresh_slot(self);
+        f.line(format!("store i64 0, ptr {i_slot}"));
+        let (head, body, fork_done) =
+            (self.label("pm.head"), self.label("pm.body"), self.label("pm.forked"));
+        f.line(format!("br label %{head}"));
+        f.start_block(&head);
+        let i = self.tmp();
+        f.line(format!("{i} = load i64, ptr {i_slot}"));
+        let more = self.tmp();
+        f.line(format!("{more} = icmp slt i64 {i}, {n}"));
+        f.line(format!("br i1 {more}, label %{body}, label %{fork_done}"));
+        f.start_block(&body);
+        let i1 = self.tmp();
+        f.line(format!("{i1} = add i64 {i}, 1"));
+        let ip = self.tmp();
+        f.line(format!("{ip} = getelementptr i64, ptr {lp}, i64 {i1}"));
+        let item = self.tmp();
+        f.line(format!("{item} = load i64, ptr {ip}"));
+        // env = {shim, closure, item}; the item slot is frozen by descriptor
+        // (copying it out of any arena first).
+        let envp = self.tmp();
+        f.line(format!("{envp} = call ptr @rt_alloc(i64 24)"));
+        let s0 = self.tmp();
+        f.line(format!("{s0} = getelementptr i64, ptr {envp}, i64 0"));
+        f.line(format!("store i64 ptrtoint (ptr {shim} to i64), ptr {s0}"));
+        let s1 = self.tmp();
+        f.line(format!("{s1} = getelementptr i64, ptr {envp}, i64 1"));
+        f.line(format!("store i64 {closure}, ptr {s1}"));
+        let s2 = self.tmp();
+        f.line(format!("{s2} = getelementptr i64, ptr {envp}, i64 2"));
+        f.line(format!("store i64 {item}, ptr {s2}"));
+        let s2i = self.tmp();
+        f.line(format!("{s2i} = ptrtoint ptr {s2} to i64"));
+        f.line(format!("call void @rt_freeze_slot(i64 {s2i}, i64 {in_desc})"));
+        let env_int = self.tmp();
+        f.line(format!("{env_int} = ptrtoint ptr {envp} to i64"));
+        let h = self.tmp();
+        f.line(format!("{h} = call i64 @rt_fiber_fork(i64 {env_int})"));
+        let hp = self.tmp();
+        f.line(format!("{hp} = getelementptr i64, ptr {hsp}, i64 {i1}"));
+        f.line(format!("store i64 {h}, ptr {hp}"));
+        f.line(format!("store i64 {i1}, ptr {i_slot}"));
+        f.line(format!("br label %{head}"));
+        f.start_block(&fork_done);
+        // Pool the handle list (abandon each at return — no-op once joined).
+        self.pool_value(
+            f,
+            &hs_int,
+            &CType::List(Box::new(CType::Fiber(Box::new(CType::Int)))),
+        );
+        // Join phase shares the list-join lowering by treating the handle
+        // list as the input (synthesizing the loop again inline).
+        self.gen_join_handle_list(f, &hs_int, &elem_out)
+    }
+
+    /// Join an already-built list of handles (parMap's second phase).
+    fn gen_join_handle_list(&mut self, f: &mut FnCtx, hs_int: &str, elem: &CType) -> String {
+        let tag = self.interrupted_tag();
+        let n = self.load_slot_from_int(f, hs_int, 0);
+        let lp = self.tmp();
+        f.line(format!("{lp} = inttoptr i64 {hs_int} to ptr"));
+        let outp = self.gen_alloc_list_dyn(f, &n);
+        let out_int = self.ptr_to_int(f, &outp);
+        f.line(format!("store i64 {n}, ptr {outp}"));
+        let i_slot = f.fresh_slot(self);
+        let err_slot = f.fresh_slot(self);
+        f.line(format!("store i64 0, ptr {i_slot}"));
+        let (head, body, cleanup, intr_head, intr_body, done) = (
+            self.label("pj.head"),
+            self.label("pj.body"),
+            self.label("pj.fail"),
+            self.label("pj.intr.head"),
+            self.label("pj.intr.body"),
+            self.label("pj.done"),
+        );
+        f.line(format!("br label %{head}"));
+        f.start_block(&head);
+        let i = self.tmp();
+        f.line(format!("{i} = load i64, ptr {i_slot}"));
+        let more = self.tmp();
+        f.line(format!("{more} = icmp slt i64 {i}, {n}"));
+        f.line(format!("br i1 {more}, label %{body}, label %{done}"));
+        f.start_block(&body);
+        let i1 = self.tmp();
+        f.line(format!("{i1} = add i64 {i}, 1"));
+        let hp = self.tmp();
+        f.line(format!("{hp} = getelementptr i64, ptr {lp}, i64 {i1}"));
+        let h = self.tmp();
+        f.line(format!("{h} = load i64, ptr {hp}"));
+        let pair = self.tmp();
+        f.line(format!("{pair} = call {{ i64, i64 }} @rt_fiber_join(i64 {h}, i64 {tag})"));
+        let v = self.tmp();
+        f.line(format!("{v} = extractvalue {{ i64, i64 }} {pair}, 0"));
+        let e = self.tmp();
+        f.line(format!("{e} = extractvalue {{ i64, i64 }} {pair}, 1"));
+        let bad = self.tmp();
+        f.line(format!("{bad} = icmp ne i64 {e}, 0"));
+        let store_l = self.label("pj.store");
+        let to_fail = self.label("pj.tofail");
+        f.line(format!("br i1 {bad}, label %{to_fail}, label %{store_l}"));
+        f.start_block(&to_fail);
+        f.line(format!("store i64 {e}, ptr {err_slot}"));
+        f.line(format!("br label %{cleanup}"));
+        f.start_block(&store_l);
+        self.dup_value(f, &v, elem);
+        let op = self.tmp();
+        f.line(format!("{op} = getelementptr i64, ptr {outp}, i64 {i1}"));
+        f.line(format!("store i64 {v}, ptr {op}"));
+        f.line(format!("store i64 {i1}, ptr {i_slot}"));
+        f.line(format!("br label %{head}"));
+        f.start_block(&cleanup);
+        f.line(format!("store i64 0, ptr {i_slot}"));
+        f.line(format!("br label %{intr_head}"));
+        f.start_block(&intr_head);
+        let j = self.tmp();
+        f.line(format!("{j} = load i64, ptr {i_slot}"));
+        let jmore = self.tmp();
+        f.line(format!("{jmore} = icmp slt i64 {j}, {n}"));
+        let raise_l = self.label("pj.raise");
+        f.line(format!("br i1 {jmore}, label %{intr_body}, label %{raise_l}"));
+        f.start_block(&intr_body);
+        let j1 = self.tmp();
+        f.line(format!("{j1} = add i64 {j}, 1"));
+        let jp = self.tmp();
+        f.line(format!("{jp} = getelementptr i64, ptr {lp}, i64 {j1}"));
+        let jh = self.tmp();
+        f.line(format!("{jh} = load i64, ptr {jp}"));
+        f.line(format!("call void @rt_fiber_interrupt(i64 {jh})"));
+        f.line(format!("store i64 {j1}, ptr {i_slot}"));
+        f.line(format!("br label %{intr_head}"));
+        f.start_block(&raise_l);
+        let e2 = self.tmp();
+        f.line(format!("{e2} = load i64, ptr {err_slot}"));
+        self.emit_failure(f, &e2);
+        f.start_block(&done);
+        self.pool_value(f, &out_int, &CType::List(Box::new(elem.clone())));
+        out_int
+    }
+
+    /// `fiber.partition([Outcome<a ! E>]) -> ([a], [Outcome<a ! E>])`.
+    fn gen_partition(&mut self, f: &mut FnCtx, list_expr: &Expr, span: Span) -> String {
+        let elem = match self.ctype_of(list_expr) {
+            CType::List(o) => match &*o {
+                CType::Outcome(e) => (**e).clone(),
+                _ => CType::Int,
+            },
+            _ => CType::Int,
+        };
+        let _ = span;
+        let outcome_cty = CType::Outcome(Box::new(elem.clone()));
+        let lst = self.gen_expr(f, list_expr);
+        let n = self.load_slot_from_int(f, &lst, 0);
+        let lp = self.tmp();
+        f.line(format!("{lp} = inttoptr i64 {lst} to ptr"));
+        // Worst-case sizing keeps it one pass: both lists get n slots; the
+        // header records the real count.
+        let oksp = self.gen_alloc_list_dyn(f, &n);
+        let failsp = self.gen_alloc_list_dyn(f, &n);
+        let ok_n = f.fresh_slot(self);
+        let fail_n = f.fresh_slot(self);
+        let i_slot = f.fresh_slot(self);
+        f.line(format!("store i64 0, ptr {ok_n}"));
+        f.line(format!("store i64 0, ptr {fail_n}"));
+        f.line(format!("store i64 0, ptr {i_slot}"));
+        let (head, body, is_ok, is_fail, next, done) = (
+            self.label("pt.head"),
+            self.label("pt.body"),
+            self.label("pt.ok"),
+            self.label("pt.fail"),
+            self.label("pt.next"),
+            self.label("pt.done"),
+        );
+        f.line(format!("br label %{head}"));
+        f.start_block(&head);
+        let i = self.tmp();
+        f.line(format!("{i} = load i64, ptr {i_slot}"));
+        let more = self.tmp();
+        f.line(format!("{more} = icmp slt i64 {i}, {n}"));
+        f.line(format!("br i1 {more}, label %{body}, label %{done}"));
+        f.start_block(&body);
+        let i1 = self.tmp();
+        f.line(format!("{i1} = add i64 {i}, 1"));
+        let ep = self.tmp();
+        f.line(format!("{ep} = getelementptr i64, ptr {lp}, i64 {i1}"));
+        let o = self.tmp();
+        f.line(format!("{o} = load i64, ptr {ep}"));
+        let disc = self.load_slot_from_int(f, &o, 0);
+        let c = self.tmp();
+        f.line(format!("{c} = icmp eq i64 {disc}, 0"));
+        f.line(format!("br i1 {c}, label %{is_ok}, label %{is_fail}"));
+        f.start_block(&is_ok);
+        let v = self.load_slot_from_int(f, &o, 2);
+        self.dup_value(f, &v, &elem);
+        let k = self.tmp();
+        f.line(format!("{k} = load i64, ptr {ok_n}"));
+        let k1 = self.tmp();
+        f.line(format!("{k1} = add i64 {k}, 1"));
+        let okslot = self.tmp();
+        f.line(format!("{okslot} = getelementptr i64, ptr {oksp}, i64 {k1}"));
+        f.line(format!("store i64 {v}, ptr {okslot}"));
+        f.line(format!("store i64 {k1}, ptr {ok_n}"));
+        f.line(format!("br label %{next}"));
+        f.start_block(&is_fail);
+        self.dup_value(f, &o, &outcome_cty);
+        let m = self.tmp();
+        f.line(format!("{m} = load i64, ptr {fail_n}"));
+        let m1 = self.tmp();
+        f.line(format!("{m1} = add i64 {m}, 1"));
+        let fslot = self.tmp();
+        f.line(format!("{fslot} = getelementptr i64, ptr {failsp}, i64 {m1}"));
+        f.line(format!("store i64 {o}, ptr {fslot}"));
+        f.line(format!("store i64 {m1}, ptr {fail_n}"));
+        f.line(format!("br label %{next}"));
+        f.start_block(&next);
+        f.line(format!("store i64 {i1}, ptr {i_slot}"));
+        f.line(format!("br label %{head}"));
+        f.start_block(&done);
+        let kf = self.tmp();
+        f.line(format!("{kf} = load i64, ptr {ok_n}"));
+        f.line(format!("store i64 {kf}, ptr {oksp}"));
+        let mf = self.tmp();
+        f.line(format!("{mf} = load i64, ptr {fail_n}"));
+        f.line(format!("store i64 {mf}, ptr {failsp}"));
+        let ok_int = self.ptr_to_int(f, &oksp);
+        let fail_int = self.ptr_to_int(f, &failsp);
+        let tup = self.gen_alloc(f, 2);
+        self.store_slot(f, &tup, 0, &ok_int);
+        self.store_slot(f, &tup, 1, &fail_int);
+        let out = self.ptr_to_int(f, &tup);
+        // The tuple owns both lists; its glue releases them and their items.
+        self.pool_value(
+            f,
+            &out,
+            &CType::Tuple(vec![
+                CType::List(Box::new(elem)),
+                CType::List(Box::new(outcome_cty)),
+            ]),
+        );
+        out
+    }
+
+    /// Race two handles: first completion in shape-tie order wins, the
+    /// loser is interrupted, the winner's result re-raises/returns here.
+    fn gen_race_join(&mut self, f: &mut FnCtx, ha: &str, hb: &str, span: Span) -> String {
+        let idx = self.tmp();
+        f.line(format!("{idx} = call i64 @rt_fiber_race(i64 {ha}, i64 {hb})"));
+        let a_won = self.tmp();
+        f.line(format!("{a_won} = icmp eq i64 {idx}, 0"));
+        let winner = self.tmp();
+        f.line(format!("{winner} = select i1 {a_won}, i64 {ha}, i64 {hb}"));
+        let loser = self.tmp();
+        f.line(format!("{loser} = select i1 {a_won}, i64 {hb}, i64 {ha}"));
+        f.line(format!("call void @rt_fiber_interrupt(i64 {loser})"));
+        for h in [ha, hb] {
+            self.pool_value(f, &h.to_string(), &CType::Fiber(Box::new(CType::Int)));
+        }
+        let elem = self.ctype_of_span(span);
+        self.gen_join_one(f, &winner.clone(), &elem)
     }
 
     fn gen_retry(&mut self, f: &mut FnCtx, action: &Expr, schedule: &Expr) -> String {
@@ -3139,7 +3909,11 @@ impl<'a> Cg<'a> {
             CType::Unit => "u".into(),
             CType::Duration => "d".into(),
             CType::Schedule => "h".into(),
-            CType::Func | CType::Tag(_) | CType::Service(_) | CType::Task(_) => "F".into(),
+            CType::Func
+            | CType::Tag(_)
+            | CType::Service(_)
+            | CType::Fiber(_)
+            | CType::Outcome(_) => "F".into(),
             CType::MutMap(..) => "M".into(),
             CType::Option(t) => format!("O{}", self.value_desc(t)),
             CType::List(t) => format!("L{}", self.value_desc(t)),
@@ -3238,7 +4012,8 @@ impl<'a> Cg<'a> {
             CType::Tag(n) => format!("T{n}"),
             CType::MutMap(..) => "M".into(),
             CType::Func => "F".into(),
-            CType::Task(t) => format!("k{}", Self::ckey(t)),
+            CType::Fiber(t) => format!("k{}", Self::ckey(t)),
+            CType::Outcome(t) => format!("w{}", Self::ckey(t)),
         }
     }
 
@@ -3278,10 +4053,39 @@ impl<'a> Cg<'a> {
             | CType::Duration
             | CType::Tag(_)
             | CType::Service(_)
-            | CType::Task(_)
             | CType::MutMap(..) => None,
             CType::Enum(n) if self.enum_simple.get(n).copied().unwrap_or(true) => None,
             CType::Str | CType::Schedule | CType::Func => Some(self.leaf_drop()),
+            CType::Fiber(_) => {
+                // Dropping the last handle is supervision: the forker is
+                // gone, so the fiber is interrupted and the record released.
+                let key = "fiber".to_string();
+                if let Some(sym) = self.drop_syms.get(&key) {
+                    return Some(sym.clone());
+                }
+                let sym = "@ing.drop.fiber".to_string();
+                self.drop_syms.insert(key, sym.clone());
+                self.emit_drop_glue(&sym, "  call void @rt_fiber_abandon(i64 %v)\n");
+                Some(sym)
+            }
+            CType::Outcome(inner) => {
+                let key = Self::ckey(cty);
+                if let Some(sym) = self.drop_syms.get(&key) {
+                    return Some(sym.clone());
+                }
+                let sym = format!("@ing.drop.{}", self.drop_syms.len());
+                self.drop_syms.insert(key, sym.clone());
+                // {disc, tag, payload}: release an Ok payload; a Failed
+                // error box is never freed (it may be re-raised).
+                let body = match self.drop_fn(inner) {
+                    Some(child) => format!(
+                        "  %p = inttoptr i64 %v to ptr\n  %d = load i64, ptr %p\n  %isok = icmp eq i64 %d, 0\n  br i1 %isok, label %relpay, label %skippay\nrelpay:\n  %pp = getelementptr i64, ptr %p, i64 2\n  %pv = load i64, ptr %pp\n  call void {child}(i64 %pv)\n  br label %skippay\nskippay:\n"
+                    ),
+                    None => String::new(),
+                };
+                self.emit_drop_glue(&sym, &body);
+                Some(sym)
+            }
             CType::Option(inner) => {
                 let key = Self::ckey(cty);
                 if let Some(sym) = self.drop_syms.get(&key) {
@@ -3707,8 +4511,14 @@ declare i64 @rt_copy_desc(i64, i64)
 declare i64 @rt_encode_desc(i64, i64)
 declare i64 @rt_decode_desc(i64, i64)
 declare void @rt_freeze_slot(i64, i64)
-declare i64 @rt_task_spawn(i64)
-declare { i64, i64 } @rt_task_await(i64)
+declare i64 @rt_fiber_fork(i64)
+declare { i64, i64 } @rt_fiber_join(i64, i64)
+declare { i64, i64 } @rt_fiber_poll(i64, i64)
+declare void @rt_fiber_interrupt(i64)
+declare void @rt_fiber_abandon(i64)
+declare i64 @rt_fiber_race(i64, i64)
+declare i64 @rt_make_errbox(i64, i64)
+declare void @rt_freeze_header(i64)
 declare i64 @rt_random(i64)
 declare void @rt_gfx_run(i64, i64, i64, i64)
 declare void @rt_gfx_clear(i64, i64, i64)

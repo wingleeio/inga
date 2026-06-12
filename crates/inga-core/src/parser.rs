@@ -194,6 +194,15 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
+        let is_shared = if self.at(&TokenKind::KwShared) {
+            self.bump();
+            if !self.at(&TokenKind::KwService) {
+                self.error_here("`shared` applies to services: `shared service Name { ... }`");
+            }
+            true
+        } else {
+            false
+        };
         match self.peek().kind.clone() {
             TokenKind::KwStruct => {
                 self.bump();
@@ -211,6 +220,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let mut d = self.parse_service_decl();
                 d.is_pub = is_pub;
+                d.is_shared = is_shared;
                 Some(Decl::Service(d))
             }
             TokenKind::Ident(_) => {
@@ -391,7 +401,14 @@ impl<'a> Parser<'a> {
             }
             self.expect(&TokenKind::RBrace, "`}`");
         }
-        ServiceDecl { is_pub: false, name, name_span, methods, span: start.to(self.prev_span()) }
+        ServiceDecl {
+            is_pub: false,
+            is_shared: false,
+            name,
+            name_span,
+            methods,
+            span: start.to(self.prev_span()),
+        }
     }
 
     fn parse_impl_decl(&mut self, name: String, name_span: Span) -> ImplDecl {
@@ -543,6 +560,12 @@ impl<'a> Parser<'a> {
                             break;
                         }
                     }
+                    let row = if self.at(&TokenKind::Bang) {
+                        self.bump();
+                        self.parse_name_list("an error type")
+                    } else {
+                        Vec::new()
+                    };
                     if !self.at(&TokenKind::Gt) {
                         return None;
                     }
@@ -551,6 +574,7 @@ impl<'a> Parser<'a> {
                         name,
                         name_span: start,
                         args,
+                        row,
                         span: start.to(self.prev_span()),
                     }
                 } else {

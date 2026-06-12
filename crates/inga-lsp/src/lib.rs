@@ -1162,6 +1162,14 @@ fn value_member_items(
             for decl in &program.decls {
                 if let Decl::Service(d) = decl {
                     if &d.name == n {
+                        for v in &d.values {
+                            items.push(CompletionItem {
+                                label: v.name.clone(),
+                                kind: Some(CompletionItemKind::FIELD),
+                                detail: Some(format!("value of {n}")),
+                                ..Default::default()
+                            });
+                        }
                         for m in &d.methods {
                             items.push(CompletionItem {
                                 label: m.name.clone(),

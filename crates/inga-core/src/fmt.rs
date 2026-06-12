@@ -284,14 +284,43 @@ impl Printer {
         let shared = if d.is_shared { "shared " } else { "" };
         self.out.push_str(&format!("{}{shared}service {} {{\n", pub_prefix(d.is_pub), d.name));
         self.prev_end_line = Some(self.lines.line(d.span.start));
-        for m in &d.methods {
-            self.flush_comments_before(m.span.start, 1);
-            self.blank_line_if_gap(self.lines.line(m.span.start));
-            self.push_indent(1);
-            self.out.push_str(&format!("{} :: {}", m.name, render_sig(&m.sig)));
-            self.attach_trailing_comment(m.span.end);
-            self.out.push('\n');
-            self.prev_end_line = Some(self.lines.line(m.span.end));
+        // Value members and methods interleave by source position.
+        enum Member<'a> {
+            Value(&'a Field),
+            Method(&'a MethodSig),
+        }
+        let mut members: Vec<(u32, Member)> = d
+            .values
+            .iter()
+            .map(|v| (v.span.start, Member::Value(v)))
+            .chain(d.methods.iter().map(|m| (m.span.start, Member::Method(m))))
+            .collect();
+        members.sort_by_key(|(at, _)| *at);
+        for (_, member) in members {
+            match member {
+                Member::Value(v) => {
+                    self.flush_comments_before(v.span.start, 1);
+                    self.blank_line_if_gap(self.lines.line(v.span.start));
+                    self.push_indent(1);
+                    if let Some(ty) = &v.ty {
+                        self.out.push_str(&format!("{} {}", render_type(ty), v.name));
+                    } else {
+                        self.out.push_str(&v.name);
+                    }
+                    self.attach_trailing_comment(v.span.end);
+                    self.out.push('\n');
+                    self.prev_end_line = Some(self.lines.line(v.span.end));
+                }
+                Member::Method(m) => {
+                    self.flush_comments_before(m.span.start, 1);
+                    self.blank_line_if_gap(self.lines.line(m.span.start));
+                    self.push_indent(1);
+                    self.out.push_str(&format!("{} :: {}", m.name, render_sig(&m.sig)));
+                    self.attach_trailing_comment(m.span.end);
+                    self.out.push('\n');
+                    self.prev_end_line = Some(self.lines.line(m.span.end));
+                }
+            }
         }
         self.flush_comments_before(d.span.end, 1);
         self.out.push_str("}\n");

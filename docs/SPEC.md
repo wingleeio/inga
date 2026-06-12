@@ -63,11 +63,13 @@ enum   Shape     = Circle { Float radius }   // a sum type: variants separated b
 service Cache {                              // a capability interface
                                              //   (`shared service` additionally allows
                                              //    instances to cross fibers — §6.5)
+    Duration defaultTtl                      //   a value member: `cache.defaultTtl`
     get :: (String key) -> String ! CacheMiss
     set :: (String key, String value, Duration ttl)
 }
 memoryCache :: Cache {                       // an implementation
-    store = MutMap()                         //   instance state, evaluated per `provide`
+    defaultTtl = 5.minutes                   //   satisfies the declared value member
+    store = MutMap()                         //   private instance state (not in the service)
     get :: (key) { store.get(key) |> orFail(CacheMiss(key)) }
     set :: (key, value, ttl) { store.set(key, value) }
 }
@@ -78,6 +80,11 @@ maxRetries = 3                               // a constant (also `Int port = 808
 - Type-before-name everywhere: `(String id)` in parameters, `{ Int id }` in
   fields, `Cache cache` for capability bindings, `String msg` in patterns.
   Omitted types are inferred.
+- **Service value members**: a service may declare typed values
+  (`Duration defaultTtl`) alongside methods — read them as
+  `cache.defaultTtl`, no getter needed. Every impl must define a field of
+  that name at that type; impl fields *not* declared by the service stay
+  private instance state. The service declaration is the public interface.
 - **Constants** are top-level `name = expr` (optionally typed:
   `Int port = 8080`), evaluated once at startup in declaration order — a
   constant may reference earlier constants, not later ones. Initializers

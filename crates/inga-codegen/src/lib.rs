@@ -84,6 +84,10 @@ const SIZE_SUFFIXES: [(&str, i64); 3] =
 struct ServiceMeta {
     /// Method names in declaration order (the vtable layout).
     methods: Vec<String>,
+    /// Declared value members, in declaration order. They occupy the slots
+    /// right after the methods — the same position in every impl, so an
+    /// access site needs only the service.
+    values: Vec<String>,
 }
 
 struct ImplMeta<'a> {
@@ -250,7 +254,10 @@ impl<'a> Cg<'a> {
                 Decl::Service(d) => {
                     self.services.insert(
                         d.name.clone(),
-                        ServiceMeta { methods: d.methods.iter().map(|m| m.name.clone()).collect() },
+                        ServiceMeta {
+                            methods: d.methods.iter().map(|m| m.name.clone()).collect(),
+                            values: d.values.iter().map(|v| v.name.clone()).collect(),
+                        },
                     );
                 }
                 Decl::Impl(d) => {
@@ -597,8 +604,12 @@ impl<'a> Cg<'a> {
             }
             let field_ctys =
                 self.info.facts.impl_fields.get(&decl.name).cloned().unwrap_or_default();
-            // Impl fields load from the instance (after the method slots).
-            for (i, field) in impl_fields.iter().enumerate() {
+            let cty_by_name: std::collections::HashMap<&String, &CType> =
+                impl_fields.iter().zip(field_ctys.iter()).collect();
+            let canonical = self.canonical_impl_fields(&decl.name);
+            // Impl fields load from the instance (after the method slots),
+            // at their canonical positions.
+            for (i, field) in canonical.iter().enumerate() {
                 let slot = f.alloca(self, field);
                 let p = self.tmp();
                 f.line(format!("{p} = inttoptr i64 %self to ptr"));
@@ -607,7 +618,7 @@ impl<'a> Cg<'a> {
                 let v = self.tmp();
                 f.line(format!("{v} = load i64, ptr {gep}"));
                 f.line(format!("store i64 {v}, ptr {slot}"));
-                let cty = field_ctys.get(i).cloned().unwrap_or(CType::Int);
+                let cty = cty_by_name.get(field).map(|c| (*c).clone()).unwrap_or(CType::Int);
                 f.scopes
                     .last_mut()
                     .unwrap()
@@ -1543,6 +1554,16 @@ impl<'a> Cg<'a> {
     }
 
     fn gen_field(&mut self, f: &mut FnCtx, recv: &Expr, name: &str, name_span: Span) -> String {
+        if let CType::Service(service) = self.ctype_of(recv) {
+            // Declared value members sit right after the method slots.
+            if let Some(smeta) = self.services.get(&service) {
+                if let Some(idx) = smeta.values.iter().position(|v| v == name) {
+                    let slot = (smeta.methods.len() + idx) as i64;
+                    let inst = self.gen_expr(f, recv);
+                    return self.load_slot_from_int(f, &inst, slot);
+                }
+            }
+        }
         let recv_ty = self.ctype_of(recv);
         // Duration and size suffixes on Ints.
         if let Some((_, factor)) = DURATION_SUFFIXES
@@ -2301,6 +2322,24 @@ impl<'a> Cg<'a> {
 
     // ---- provide -----------------------------------------------------------------------------
 
+    /// An impl's instance layout after the method slots: the service's
+    /// declared value members first (service order), then private fields.
+    fn canonical_impl_fields(&self, impl_name: &str) -> Vec<String> {
+        let Some(meta) = self.impls.get(impl_name) else { return Vec::new() };
+        let service_values = self
+            .services
+            .get(&meta.decl.service)
+            .map(|s| s.values.clone())
+            .unwrap_or_default();
+        let mut out = service_values.clone();
+        for f in &meta.fields {
+            if !service_values.contains(f) {
+                out.push(f.clone());
+            }
+        }
+        out
+    }
+
     fn gen_provide(
         &mut self,
         f: &mut FnCtx,
@@ -2357,16 +2396,18 @@ impl<'a> Cg<'a> {
             let service = decl.service.clone();
             let Some(smeta) = self.services.get(&service) else { continue };
             let methods = smeta.methods.clone();
-            let n_fields = meta.fields.len();
+            let canonical = self.canonical_impl_fields(name);
 
-            let ptr = self.gen_alloc(f, (methods.len() + n_fields) as i64);
+            let ptr = self.gen_alloc(f, (methods.len() + canonical.len()) as i64);
             for (i, m) in methods.iter().enumerate() {
                 let fnref = format!("ptrtoint (ptr @ing.m.{name}.{m} to i64)");
                 self.store_slot(f, &ptr, i as i64, &fnref);
             }
-            // Field initializers see earlier fields (a temporary scope).
+            // Field initializers run in declaration order (so later ones see
+            // earlier fields) but store at their canonical slot.
             f.scopes.push(HashMap::new());
-            for (i, (fname, _, init)) in decl.fields.iter().enumerate() {
+            for (fname, _, init) in decl.fields.iter() {
+                let i = canonical.iter().position(|x| x == fname).unwrap_or(0);
                 let v = self.gen_expr(f, init);
                 let fcty = self.ctype_of(init);
                 self.dup_value(f, &v, &fcty);

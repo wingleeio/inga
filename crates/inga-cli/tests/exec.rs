@@ -1010,6 +1010,57 @@ fn named_field_construction_is_checked() {
 }
 
 #[test]
+fn service_value_members() {
+    let out = run(r#"
+struct User = { Int id, String name }
+
+service Session {
+    User user
+    Int startedAt
+    label :: () -> String
+}
+
+demoSession :: Session {
+    user = User { id: 7, name: "wing" }
+    startedAt = 1000
+    secret = "private"
+
+    label :: () {
+        "${user.name}/${secret}"
+    }
+}
+
+whoami :: () -> String uses Session {
+    Session session
+    "${session.user.name} #${session.user.id} @${session.startedAt}"
+}
+
+main :: () {
+    provide demoSession
+    println(whoami())
+    Session s
+    println(s.label())
+}
+"#);
+    assert_eq!(out, "wing #7 @1000\nwing/private\n");
+}
+
+#[test]
+fn service_values_are_checked() {
+    let errs = check_errors(
+        "service Session {\n    Int startedAt\n}\n\nbadSession :: Session {\n    other = 5\n}\n\nmain :: () {\n    provide badSession\n    Session s\n    println(s.other)\n}\n",
+    );
+    assert!(
+        errs.iter().any(|e| e.contains("must define the value member `startedAt`")),
+        "{errs:?}"
+    );
+    assert!(
+        errs.iter().any(|e| e.contains("no value member `other`")),
+        "{errs:?}"
+    );
+}
+
+#[test]
 fn top_level_constants() {
     let out = run(r#"
 use std/fiber

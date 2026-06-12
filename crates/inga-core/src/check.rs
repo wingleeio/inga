@@ -192,6 +192,8 @@ struct MethodInfo {
 
 struct ServiceInfo {
     methods: Vec<(String, MethodInfo)>,
+    /// Typed value members (`User user`), in declaration order.
+    values: Vec<(String, Type)>,
     name_span: Span,
     module: usize,
     is_pub: bool,
@@ -377,6 +379,7 @@ impl<'a> Checker<'a> {
                 name.to_string(),
                 ServiceInfo {
                     methods: Vec::new(),
+                    values: Vec::new(),
                     name_span: Span::default(),
                     module: CORE_MODULE,
                     is_pub: true,
@@ -402,6 +405,7 @@ impl<'a> Checker<'a> {
             FIBERS_SERVICE.to_string(),
             ServiceInfo {
                 methods: Vec::new(),
+                values: Vec::new(),
                 name_span: Span::default(),
                 module: CORE_MODULE,
                 is_pub: true,
@@ -550,6 +554,7 @@ impl<'a> Checker<'a> {
                         name.clone(),
                         ServiceInfo {
                             methods: Vec::new(),
+                            values: Vec::new(),
                             name_span: span,
                             module,
                             is_pub,
@@ -646,8 +651,20 @@ impl<'a> Checker<'a> {
                             },
                         ));
                     }
+                    let mut values = Vec::new();
+                    for v in &d.values {
+                        let ty = match &v.ty {
+                            Some(t) => {
+                                let mut tyvars = HashMap::new();
+                                self.resolve_type_expr(t, &mut tyvars)
+                            }
+                            None => self.ctx.fresh(),
+                        };
+                        values.push((v.name.clone(), ty));
+                    }
                     if let Some(info) = self.services.get_mut(&d.name) {
                         info.methods = methods;
+                        info.values = values;
                         info.shared = d.is_shared;
                     }
                 }
@@ -1120,6 +1137,31 @@ impl<'a> Checker<'a> {
             self.unify_at(ty, &value_ty, value.span, "field initializer");
             field_rows.merge(&self.row_stack.pop().unwrap_or_default());
             scope.insert(name.clone(), ty.clone());
+        }
+        // Every value member the service declares must be a field here, at
+        // the declared type. Extra fields stay private instance state.
+        let declared_values = self
+            .services
+            .get(&service)
+            .map(|i| i.values.clone())
+            .unwrap_or_default();
+        for (vname, vty) in &declared_values {
+            match d.fields.iter().position(|(f, _, _)| f == vname) {
+                Some(i) => {
+                    let (_, fty) = &field_types[i];
+                    let fspan = d.fields[i].1;
+                    self.unify_at(vty, fty, fspan, "service value member");
+                }
+                None => {
+                    self.error(
+                        d.name_span,
+                        format!(
+                            "`{}` must define the value member `{vname}` declared by service `{service}`",
+                            d.name
+                        ),
+                    );
+                }
+            }
         }
         if self.impl_field_rows.get(&d.name) != Some(&field_rows) {
             self.changed = true;
@@ -4069,6 +4111,41 @@ impl<'a> Checker<'a> {
                 }
             }
             Type::Unknown => Type::Unknown,
+            Type::Service(service) => {
+                let value = self
+                    .services
+                    .get(&service)
+                    .and_then(|i| i.values.iter().find(|(v, _)| v == name))
+                    .map(|(_, t)| t.clone());
+                match value {
+                    Some(ty) => {
+                        if self.record_info {
+                            self.typed_hovers.push((name_span, name.to_string(), ty.clone()));
+                            if let Some(info) = self.services.get(&service) {
+                                self.info.refs.push((name_span, info.name_span));
+                            }
+                        }
+                        ty
+                    }
+                    None => {
+                        let values: Vec<&str> = self
+                            .services
+                            .get(&service)
+                            .map(|i| i.values.iter().map(|(v, _)| v.as_str()).collect())
+                            .unwrap_or_default();
+                        let hint = if values.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (values: {})", values.join(", "))
+                        };
+                        self.error(
+                            name_span,
+                            format!("service `{service}` has no value member `{name}`{hint}"),
+                        );
+                        Type::Unknown
+                    }
+                }
+            }
             other => {
                 let rendered = self.render(&other);
                 self.error(name_span, format!("{rendered} has no field `{name}`"));

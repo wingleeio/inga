@@ -94,6 +94,9 @@ pub struct ServiceDecl {
     pub name: String,
     pub name_span: Span,
     pub methods: Vec<MethodSig>,
+    /// `User user` — typed value members; impls satisfy them with fields
+    /// of the same name, callers read them as `instance.user`.
+    pub values: Vec<Field>,
     pub span: Span,
 }
 

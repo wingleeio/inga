@@ -431,6 +431,7 @@ impl<'a> Parser<'a> {
             ));
         }
         let mut methods = Vec::new();
+        let mut values = Vec::new();
         if self.expect(&TokenKind::LBrace, "`{`") {
             loop {
                 self.skip_newlines();
@@ -438,6 +439,21 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 let m_start = self.peek().span;
+                // `name :: sig` is a method; `Type name` a value member.
+                let is_method = matches!(&self.peek().kind, TokenKind::Ident(_))
+                    && self.nth(1).kind == TokenKind::ColonColon;
+                if !is_method {
+                    let Some(ty) = self.try_parse_type() else {
+                        self.error_here("expected a method (`name :: (…)`) or a value member (`Type name`)");
+                        break;
+                    };
+                    let (v_name, v_span) = self.expect_ident("a value member name");
+                    if v_name == "<error>" {
+                        break;
+                    }
+                    values.push(Field { ty: Some(ty), name: v_name, span: v_span });
+                    continue;
+                }
                 let (m_name, m_span) = self.expect_ident("a method name");
                 if m_name == "<error>" {
                     break;
@@ -459,6 +475,7 @@ impl<'a> Parser<'a> {
             name,
             name_span,
             methods,
+            values,
             span: start.to(self.prev_span()),
         }
     }

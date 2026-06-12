@@ -569,6 +569,36 @@ fn process_args_and_exit() {
 }
 
 #[test]
+fn net_tcp_echo_round_trip() {
+    let out = run(r#"
+use std/fiber
+use std/net
+
+serveOne :: (Listener server) -> String ! NetError uses Net {
+    client = net.accept(server)
+    msg = net.read(client, 1024) |> getOrElse("")
+    net.write(client, toUpper(msg))
+    net.close(client)
+    msg
+}
+
+main :: () {
+    provide Net, Runtime(2)
+    server = net.listen(19474) |> catch { NetError(m) -> Listener(-1) }
+    task = fiber.fork(serveOne(server))
+    sleep(100.millis)
+    sock = net.connect("127.0.0.1", 19474) |> catch { NetError -> Socket(-1) }
+    net.write(sock, "hello over tcp") |> ignoreFailure
+    println(net.read(sock, 1024) |> catch { NetError -> None } |> getOrElse("?"))
+    net.close(sock)
+    println(fiber.join(task) |> catch { NetError(m) -> "?" })
+    net.stop(server)
+}
+"#);
+    assert_eq!(out, "HELLO OVER TCP\nhello over tcp\n");
+}
+
+#[test]
 fn http_serve_answers_requests() {
     let out = run_env(
         r#"

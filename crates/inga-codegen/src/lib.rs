@@ -191,6 +191,9 @@ impl<'a> Cg<'a> {
         );
         self.struct_meta.insert("IoError".into(), vec!["path".into(), "message".into()]);
         self.struct_meta.insert("File".into(), vec!["handle".into()]);
+        self.struct_meta.insert("NetError".into(), vec!["message".into()]);
+        self.struct_meta.insert("Socket".into(), vec!["handle".into()]);
+        self.struct_meta.insert("Listener".into(), vec!["handle".into()]);
         for (i, tag) in [
             "DecodeError",
             "AssertionError",
@@ -198,6 +201,7 @@ impl<'a> Cg<'a> {
             "TimeoutError",
             "HttpError",
             "IoError",
+            "NetError",
             "Int",
             "Float",
             "Bool",
@@ -1084,6 +1088,9 @@ impl<'a> Cg<'a> {
                     if module == "process" {
                         return self.gen_process(f, name, args, span);
                     }
+                    if module == "net" {
+                        return self.gen_net(f, name, args, span);
+                    }
                     if let Some(v) = self.gen_qualified(f, module, name, args, span) {
                         return v;
                     }
@@ -1276,6 +1283,9 @@ impl<'a> Cg<'a> {
                 }
                 if module == "process" {
                     return self.gen_process(f, name, args, span);
+                }
+                if module == "net" {
+                    return self.gen_net(f, name, args, span);
                 }
                 if let Some(v) = self.gen_qualified(f, module, name, args, span) {
                     return v;
@@ -2168,6 +2178,10 @@ impl<'a> Cg<'a> {
             }
             if item.name == "Fs" {
                 f.evidence.insert("Fs".to_string(), "0".to_string());
+                continue;
+            }
+            if item.name == "Net" {
+                f.evidence.insert("Net".to_string(), "0".to_string());
                 continue;
             }
             if item.name == "Runtime" {
@@ -4073,6 +4087,113 @@ impl<'a> Cg<'a> {
         a
     }
 
+    /// `net.*` — std/net: raw TCP, blocking on the calling fiber's thread.
+    fn gen_net(&mut self, f: &mut FnCtx, name: &str, args: &[&Expr], span: Span) -> String {
+        // Socket/Listener structs carry the registry handle in slot 0.
+        let handle_of = |s: &mut Self, f: &mut FnCtx, e: &Expr| {
+            let v = s.gen_expr(f, e);
+            s.load_slot_from_int(f, &v, 0)
+        };
+        // Wrap a raw handle into a 1-slot struct.
+        let wrap = |s: &mut Self, f: &mut FnCtx, handle: String, ty: &str| {
+            let sp = s.gen_alloc(f, 1);
+            s.store_slot(f, &sp, 0, &handle);
+            let out = s.ptr_to_int(f, &sp);
+            s.pool_value(f, &out, &CType::Struct(ty.to_string()));
+            out
+        };
+        match (name, args.len()) {
+            ("connect", 2) => {
+                let host = self.gen_expr(f, args[0]);
+                let port = self.gen_expr(f, args[1]);
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @rt_net_connect(i64 {host}, i64 {port})"));
+                let h = self.gen_net_unpack(f, &boxed, span);
+                wrap(self, f, h, "Socket")
+            }
+            ("listen", 1) => {
+                let port = self.gen_expr(f, args[0]);
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @rt_net_listen(i64 {port})"));
+                let h = self.gen_net_unpack(f, &boxed, span);
+                wrap(self, f, h, "Listener")
+            }
+            ("accept", 1) => {
+                let l = handle_of(self, f, args[0]);
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @rt_net_accept(i64 {l})"));
+                let h = self.gen_net_unpack(f, &boxed, span);
+                wrap(self, f, h, "Socket")
+            }
+            ("read", 2) => {
+                let sock = handle_of(self, f, args[0]);
+                let max = self.gen_expr(f, args[1]);
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @rt_net_read(i64 {sock}, i64 {max})"));
+                let chunk = self.gen_net_unpack(f, &boxed, span);
+                // 0 = end of stream (None); else wrap the bytes in Some.
+                let slot = f.fresh_slot(self);
+                let (some_l, done_l) = (self.label("net.some"), self.label("net.eos"));
+                f.line(format!("store i64 0, ptr {slot}"));
+                let c = self.tmp();
+                f.line(format!("{c} = icmp ne i64 {chunk}, 0"));
+                f.line(format!("br i1 {c}, label %{some_l}, label %{done_l}"));
+                f.start_block(&some_l);
+                let optp = self.gen_alloc(f, 1);
+                self.store_slot(f, &optp, 0, &chunk);
+                let opt = self.ptr_to_int(f, &optp);
+                f.line(format!("store i64 {opt}, ptr {slot}"));
+                f.line(format!("br label %{done_l}"));
+                f.start_block(&done_l);
+                let out = self.tmp();
+                f.line(format!("{out} = load i64, ptr {slot}"));
+                self.pool_value(f, &out, &CType::Option(Box::new(CType::Str)));
+                out
+            }
+            ("write", 2) => {
+                let sock = handle_of(self, f, args[0]);
+                let bytes = self.gen_expr(f, args[1]);
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @rt_net_write(i64 {sock}, i64 {bytes})"));
+                self.gen_net_unpack(f, &boxed, span);
+                "0".to_string()
+            }
+            ("close", 1) => {
+                let sock = handle_of(self, f, args[0]);
+                f.line(format!("call void @rt_net_close(i64 {sock})"));
+                "0".to_string()
+            }
+            ("stop", 1) => {
+                let l = handle_of(self, f, args[0]);
+                f.line(format!("call void @rt_net_stop(i64 {l})"));
+                "0".to_string()
+            }
+            _ => {
+                self.unsupported(span, "this `net` operation shape");
+                "0".to_string()
+            }
+        }
+    }
+
+    /// Unpack `{ok, value, message}`: on ok return `value`; else build and
+    /// raise NetError { message }.
+    fn gen_net_unpack(&mut self, f: &mut FnCtx, boxed: &str, span: Span) -> String {
+        let ok = self.load_slot_from_int(f, boxed, 0);
+        let value = self.load_slot_from_int(f, boxed, 1);
+        let (fail_l, ok_l) = (self.label("net.fail"), self.label("net.ok"));
+        let c = self.tmp();
+        f.line(format!("{c} = icmp eq i64 {ok}, 0"));
+        f.line(format!("br i1 {c}, label %{fail_l}, label %{ok_l}"));
+        f.start_block(&fail_l);
+        let msg = self.load_slot_from_int(f, boxed, 2);
+        let errp = self.gen_alloc(f, 1);
+        self.store_slot(f, &errp, 0, &msg);
+        let err = self.ptr_to_int(f, &errp);
+        self.emit_fail_value(f, &err, &CType::Struct("NetError".to_string()), span);
+        f.start_block(&ok_l);
+        value
+    }
+
     /// `process.*` — std/process: the running program's own context.
     fn gen_process(&mut self, f: &mut FnCtx, name: &str, args: &[&Expr], span: Span) -> String {
         match (name, args.len()) {
@@ -5242,6 +5363,13 @@ declare i64 @rt_byte_at(i64, i64)
 declare i64 @rt_int_to_bytes(i64, i64)
 declare i64 @rt_bytes_to_int(i64, i64, i64)
 declare i64 @rt_bytes_from_list(i64)
+declare i64 @rt_net_connect(i64, i64)
+declare i64 @rt_net_listen(i64)
+declare i64 @rt_net_accept(i64)
+declare i64 @rt_net_read(i64, i64)
+declare i64 @rt_net_write(i64, i64)
+declare void @rt_net_close(i64)
+declare void @rt_net_stop(i64)
 declare i64 @rt_process_args()
 declare i64 @rt_process_cwd()
 declare void @rt_process_exit(i64)

@@ -40,6 +40,10 @@ pub const HTTP_ERROR: &str = "HttpError";
 /// `provide Fs`. Shared, so file access crosses fiber boundaries.
 pub const FS_SERVICE: &str = "Fs";
 pub const IO_ERROR: &str = "IoError";
+/// The capability every `std/net` operation needs; satisfied by
+/// `provide Net`. Shared, so sockets cross fiber boundaries.
+pub const NET_SERVICE: &str = "Net";
+pub const NET_ERROR: &str = "NetError";
 
 /// Surface names of primitive types that can appear in a `!` row.
 pub const PRIMITIVE_TAGS: [&str; 5] = ["Int", "Float", "Bool", "String", "Duration"];
@@ -311,6 +315,9 @@ impl<'a> Checker<'a> {
             "HttpRequest",
             IO_ERROR,
             "File",
+            NET_ERROR,
+            "Socket",
+            "Listener",
         ] {
             let fields = builtin_struct_fields(name)
                 .iter()
@@ -333,7 +340,7 @@ impl<'a> Checker<'a> {
                 },
             );
         }
-        for name in [HTTP_SERVICE, FS_SERVICE] {
+        for name in [HTTP_SERVICE, FS_SERVICE, NET_SERVICE] {
             checker.services.insert(
                 name.to_string(),
                 ServiceInfo {
@@ -1829,6 +1836,7 @@ impl<'a> Checker<'a> {
             "std/json" => return self.check_json_call(member, member_span, args, span),
             "std/fs" => return self.check_fs_call(member, member_span, args, span),
             "std/process" => return self.check_process_call(member, member_span, args, span),
+            "std/net" => return self.check_net_call(member, member_span, args, span),
             _ => {}
         }
         let Some(target) = self.modules.iter().position(|m| m.key == import.target) else {
@@ -2569,6 +2577,116 @@ impl<'a> Checker<'a> {
                 self.error(
                     member_span,
                     format!("`std/fs` has no member `{member}` (read, write, append, exists, list, remove, createDir, open, readAt, writeAt, size, sync, close)"),
+                );
+                for arg in args {
+                    self.check_expr(arg);
+                }
+                Type::Unknown
+            }
+        }
+    }
+
+    /// `net.*` — std/net: raw TCP. Failures raise NetError; `Net` names
+    /// the network in the row, like `Http` and `Fs`.
+    fn check_net_call(
+        &mut self,
+        member: &str,
+        member_span: Span,
+        args: &[&Expr],
+        span: Span,
+    ) -> Type {
+        let arity = |s: &mut Self, n: usize| -> bool {
+            if args.len() != n {
+                s.error(
+                    span,
+                    format!("`net.{member}` expects {n} argument(s), found {}", args.len()),
+                );
+                for arg in args {
+                    s.check_expr(arg);
+                }
+                return false;
+            }
+            true
+        };
+        match member {
+            "connect" => {
+                if !arity(self, 2) {
+                    return Type::Unknown;
+                }
+                let host = self.check_expr(args[0]);
+                self.unify_at(&Type::Str, &host, args[0].span, "net host");
+                let port = self.check_expr(args[1]);
+                self.unify_at(&Type::Int, &port, args[1].span, "net port");
+                self.add_cap_row(NET_SERVICE);
+                self.add_error_row(NET_ERROR);
+                Type::Named("Socket".into())
+            }
+            "listen" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                let port = self.check_expr(args[0]);
+                self.unify_at(&Type::Int, &port, args[0].span, "net port");
+                self.add_cap_row(NET_SERVICE);
+                self.add_error_row(NET_ERROR);
+                Type::Named("Listener".into())
+            }
+            "accept" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                let l = self.check_expr(args[0]);
+                self.unify_at(&Type::Named("Listener".into()), &l, args[0].span, "net listener");
+                self.add_cap_row(NET_SERVICE);
+                self.add_error_row(NET_ERROR);
+                Type::Named("Socket".into())
+            }
+            "read" => {
+                if !arity(self, 2) {
+                    return Type::Unknown;
+                }
+                let sock = self.check_expr(args[0]);
+                self.unify_at(&Type::Named("Socket".into()), &sock, args[0].span, "net socket");
+                let max = self.check_expr(args[1]);
+                self.unify_at(&Type::Int, &max, args[1].span, "net read size");
+                self.add_cap_row(NET_SERVICE);
+                self.add_error_row(NET_ERROR);
+                Type::Option(Box::new(Type::Str))
+            }
+            "write" => {
+                if !arity(self, 2) {
+                    return Type::Unknown;
+                }
+                let sock = self.check_expr(args[0]);
+                self.unify_at(&Type::Named("Socket".into()), &sock, args[0].span, "net socket");
+                let bytes = self.check_expr(args[1]);
+                self.unify_at(&Type::Str, &bytes, args[1].span, "net bytes");
+                self.add_cap_row(NET_SERVICE);
+                self.add_error_row(NET_ERROR);
+                Type::Unit
+            }
+            "close" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                let sock = self.check_expr(args[0]);
+                self.unify_at(&Type::Named("Socket".into()), &sock, args[0].span, "net socket");
+                self.add_cap_row(NET_SERVICE);
+                Type::Unit
+            }
+            "stop" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                let l = self.check_expr(args[0]);
+                self.unify_at(&Type::Named("Listener".into()), &l, args[0].span, "net listener");
+                self.add_cap_row(NET_SERVICE);
+                Type::Unit
+            }
+            _ => {
+                self.error(
+                    member_span,
+                    format!("`std/net` has no member `{member}` (connect, listen, accept, read, write, close, stop)"),
                 );
                 for arg in args {
                     self.check_expr(arg);
@@ -4201,6 +4319,22 @@ impl<'a> Checker<'a> {
                 provided.insert(FS_SERVICE.to_string());
                 continue;
             }
+            if item.name == "Net" {
+                if let Some(args) = &item.args {
+                    self.error(item.name_span, "`Net` takes no arguments: `provide Net`");
+                    for arg in args {
+                        self.check_expr(arg);
+                    }
+                }
+                if self.record_info {
+                    self.info.hovers.push((
+                        item.name_span,
+                        "Net — built-in raw TCP; satisfies `Net` for this scope".to_string(),
+                    ));
+                }
+                provided.insert(NET_SERVICE.to_string());
+                continue;
+            }
             if item.name == "Runtime" {
                 // The fiber runtime: `provide Runtime(n)` (n workers; default
                 // = cores). Satisfies the builtin `Fibers` capability.
@@ -4629,6 +4763,13 @@ impl<'a> Checker<'a> {
                 ));
                 return;
             }
+            "std/net" => {
+                self.info.hovers.push((
+                    u.path_span,
+                    "std/net — raw TCP: net.connect/listen/accept/read/write/close/stop; needs `provide Net`".to_string(),
+                ));
+                return;
+            }
             _ => {}
         }
         let ref_module = self.module_of(u.path_span);
@@ -4780,6 +4921,8 @@ pub fn builtin_struct_fields(name: &str) -> &'static [(&'static str, &'static st
         "DecodeError" | "AssertionError" => &[("message", "String")],
         "IoError" => &[("path", "String"), ("message", "String")],
         "File" => &[("handle", "Int")],
+        "NetError" => &[("message", "String")],
+        "Socket" | "Listener" => &[("handle", "Int")],
         _ => &[],
     }
 }
@@ -4809,6 +4952,15 @@ pub fn std_module_members(target: &str) -> &'static [(&'static str, &'static str
         "std/json" => &[
             ("encode", "json.encode(value) -> String — JSON"),
             ("decode", "json.decode(raw, StructName) -> a ! DecodeError — parse JSON into a struct"),
+        ],
+        "std/net" => &[
+            ("connect", "net.connect(host, port) -> Socket ! NetError uses Net"),
+            ("listen", "net.listen(port) -> Listener ! NetError uses Net — binds 0.0.0.0"),
+            ("accept", "net.accept(listener) -> Socket ! NetError uses Net — blocks for a client"),
+            ("read", "net.read(socket, maxBytes) -> String? ! NetError uses Net — one read; None at end of stream"),
+            ("write", "net.write(socket, bytes) -> Unit ! NetError uses Net — writes all bytes"),
+            ("close", "net.close(socket) uses Net"),
+            ("stop", "net.stop(listener) uses Net"),
         ],
         "std/process" => &[
             ("args", "process.args() -> [String] — command-line arguments (after the program name)"),

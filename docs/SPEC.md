@@ -603,6 +603,28 @@ fs.close   (File)
 With `intToBytes`/`bytesToInt` (§2 builtins) this is enough to write a
 pager: fixed-size pages, little-endian headers, fsync at commit points.
 
+## 8.65 Raw TCP: `std/net`
+
+When the protocol isn't HTTP, `std/net` is the layer underneath — same
+capability discipline (`uses Net`, `provide Net`), failures raise
+`NetError { String message }`, and the byte strings flowing through
+sockets are the same values `intToBytes`/`bytesToInt` build, so custom
+wire protocols are ordinary code:
+
+```
+net.connect (String host, Int port) -> Socket ! NetError
+net.listen  (Int port) -> Listener ! NetError              binds 0.0.0.0
+net.accept  (Listener) -> Socket ! NetError                blocks for a client
+net.read    (Socket, Int maxBytes) -> String? ! NetError   one read; None at end
+net.write   (Socket, String bytes) -> Unit ! NetError      writes all bytes
+net.close   (Socket)
+net.stop    (Listener)
+```
+
+Calls block the calling fiber's thread — accept in a forked fiber for a
+background server, exactly like `http.serve`. `Socket`/`Listener` are
+`{ Int handle }` structs and cross fibers freely.
+
 ## 8.7 The program itself: `std/process`
 
 ```

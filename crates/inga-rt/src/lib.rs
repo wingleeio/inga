@@ -2288,6 +2288,122 @@ pub extern "C" fn rt_http_serve(port: i64, closure: i64) -> i64 {
     }
 }
 
+// ---- raw TCP -----------------------------------------------------------------------
+// Sockets and listeners live in registries; failures return the usual
+// `{ok, value, message}` box and codegen raises NetError { message }.
+
+static SOCKETS: std::sync::Mutex<Option<std::collections::HashMap<i64, std::net::TcpStream>>> =
+    std::sync::Mutex::new(None);
+static LISTENERS: std::sync::Mutex<Option<std::collections::HashMap<i64, std::net::TcpListener>>> =
+    std::sync::Mutex::new(None);
+static NEXT_SOCK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+
+fn net_fail(e: impl std::fmt::Display) -> i64 {
+    http_box(0, 0, make_str(e.to_string().as_bytes()))
+}
+
+fn sock_insert(s: std::net::TcpStream) -> i64 {
+    let handle = NEXT_SOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SOCKETS.lock().unwrap().get_or_insert_with(Default::default).insert(handle, s);
+    handle
+}
+
+#[no_mangle]
+pub extern "C" fn rt_net_connect(host: i64, port: i64) -> i64 {
+    let host = unsafe { std::str::from_utf8_unchecked(str_bytes(host)) };
+    match std::net::TcpStream::connect((host, port as u16)) {
+        Ok(s) => http_box(1, sock_insert(s), 0),
+        Err(e) => net_fail(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_net_listen(port: i64) -> i64 {
+    match std::net::TcpListener::bind(("0.0.0.0", port as u16)) {
+        Ok(l) => {
+            let handle = NEXT_SOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            LISTENERS.lock().unwrap().get_or_insert_with(Default::default).insert(handle, l);
+            http_box(1, handle, 0)
+        }
+        Err(e) => net_fail(e),
+    }
+}
+
+/// Block until a client connects. The listener is cloned out of the
+/// registry first so concurrent accepts (and `stop`) never hold the lock.
+#[no_mangle]
+pub extern "C" fn rt_net_accept(listener: i64) -> i64 {
+    let l = LISTENERS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&listener))
+        .map(|l| l.try_clone());
+    match l {
+        Some(Ok(l)) => match l.accept() {
+            Ok((s, _)) => http_box(1, sock_insert(s), 0),
+            Err(e) => net_fail(e),
+        },
+        Some(Err(e)) => net_fail(e),
+        None => net_fail("listener is closed"),
+    }
+}
+
+/// Up to `max` bytes (one read); empty box payload (0) at end of stream.
+#[no_mangle]
+pub extern "C" fn rt_net_read(socket: i64, max: i64) -> i64 {
+    use std::io::Read;
+    let s = SOCKETS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&socket))
+        .map(|s| s.try_clone());
+    let mut buf = vec![0u8; max.clamp(1, 1 << 24) as usize];
+    match s {
+        Some(Ok(mut s)) => match s.read(&mut buf) {
+            Ok(0) => http_box(1, 0, 0),
+            Ok(n) => http_box(1, make_str(&buf[..n]), 0),
+            Err(e) => net_fail(e),
+        },
+        Some(Err(e)) => net_fail(e),
+        None => net_fail("socket is closed"),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_net_write(socket: i64, bytes: i64) -> i64 {
+    use std::io::Write;
+    let s = SOCKETS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&socket))
+        .map(|s| s.try_clone());
+    match s {
+        Some(Ok(mut s)) => match s.write_all(unsafe { str_bytes(bytes) }) {
+            Ok(()) => http_box(1, 0, 0),
+            Err(e) => net_fail(e),
+        },
+        Some(Err(e)) => net_fail(e),
+        None => net_fail("socket is closed"),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_net_close(socket: i64) {
+    if let Some(m) = SOCKETS.lock().unwrap().as_mut() {
+        m.remove(&socket);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_net_stop(listener: i64) {
+    if let Some(m) = LISTENERS.lock().unwrap().as_mut() {
+        m.remove(&listener);
+    }
+}
+
 // ---- file system -----------------------------------------------------------------
 // Every fallible call returns `{ok, value, message}`; on failure the
 // value slot carries the path, and codegen raises IoError { path, message }.

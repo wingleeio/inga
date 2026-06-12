@@ -645,10 +645,11 @@ struct Export {
     module: String,
 }
 
-const STD_ALIASES: [(&str, &str); 3] = [
+const STD_ALIASES: [(&str, &str); 4] = [
     ("graphics", "std/graphics"),
     ("schedule", "std/schedule"),
     ("fiber", "std/fiber"),
+    ("http", "std/http"),
 ];
 
 /// Parse a source text, ignoring diagnostics (good enough for listing decls).
@@ -814,8 +815,16 @@ fn std_member_items(target: &str) -> Vec<CompletionItem> {
             ("par", "fiber.par(lazy a, lazy b, ...) -> (a, b, ...) — fork all + join"),
             ("parMap", "fiber.parMap(xs, f) -> [b] ! E — one fiber per element"),
             ("race", "fiber.race(lazy a, lazy b) -> a — first completion wins, loser interrupted"),
-            ("within", "fiber.within(lazy action, deadline) -> a ! E, Timeout"),
+            ("within", "fiber.within(lazy action, deadline) -> a ! E, TimeoutError"),
             ("partition", "fiber.partition(outcomes) -> ([a], [Outcome<a ! E>])"),
+        ],
+        "std/http" => &[
+            ("get", "http.get(url) -> HttpResponse ! HttpError — a non-2xx status is data, not a failure"),
+            ("post", "http.post(url, body) -> HttpResponse ! HttpError"),
+            ("send", "http.send(method, url, body, headers) -> HttpResponse ! HttpError — headers: [(String, String)]"),
+            ("openStream", "http.openStream(url) -> HttpStream ! HttpError — GET with a streamed body"),
+            ("read", "http.read(stream) -> String? ! HttpError — next chunk; None at end"),
+            ("close", "http.close(stream)"),
         ],
         "std/graphics" => &[
             ("run", "graphics.run(width, height, title, frame) — runtime-owned loop"),

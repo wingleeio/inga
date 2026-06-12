@@ -1,0 +1,67 @@
+// std/http — the HTTP client, the Inga way: every request carries
+// `uses Http` (satisfied by one `provide Http` in main), transport
+// failures raise `! HttpError`, and a non-2xx status is *data* on the
+// response — check it like fetch. Streaming is pull-based: open, read
+// chunks in a tail-recursive loop, close.
+//
+// Composes with the rest of the language: `fiber.within` for deadlines,
+// `retry` for backoff, `fiber.parMap` + `fiber.settle` for fan-out.
+//
+//   inga run examples/http_client.inga   (needs network access)
+
+use std/fiber
+use std/http
+use std/schedule
+
+struct PageError = { String url }
+
+// Deadline + retry around a request — rows compose: the result can fail
+// with HttpError (kept by retry) or TimeoutError (from within).
+fetchPage :: (String url) -> String ! HttpError, TimeoutError, PageError uses Http, Fibers {
+    resp = http.get(url)
+        |> fiber.within(5.seconds)
+        |> retry(schedule.exponential(200.millis) |> schedule.upTo(2))
+    if resp.status != 200 {
+        fail PageError(url)
+    }
+    resp.body
+}
+
+// Pull the body chunk by chunk; the recursive loop is the iteration.
+countBytes :: (HttpStream s, Int acc) -> Int ! HttpError uses Http {
+    match http.read(s) {
+        Some(chunk) -> countBytes(s, acc + len(chunk))
+        None        -> acc
+    }
+}
+
+main :: () {
+    provide Http, Runtime(4)
+
+    page = fetchPage("https://example.com")
+        |> tapError((e) -> println("fetch failed:", show(e)))
+        |> catch {
+            HttpError      -> ""
+            TimeoutError   -> ""
+            PageError(url) -> ""
+        }
+    println("fetched ${len(page)} chars")
+
+    streamed = {
+        s = http.openStream("https://example.com")
+        n = countBytes(s, 0)
+        http.close(s)
+        "streamed ${n} bytes (status ${s.status})"
+    }
+        |> catch { HttpError(status, m) -> "stream failed: ${m}" }
+    println(streamed)
+
+    // Fan out a batch; each element settles to an Outcome, so one dead
+    // host can't fail (or cancel) the rest.
+    urls = ["https://example.com", "http://127.0.0.1:1/down"]
+    outcomes = fiber.parMap(urls, (u) -> http.get(u) |> fiber.settle)
+    map(outcomes, (o) -> match o {
+        Ok(resp)                     -> println("ok:", resp.status)
+        Failed(HttpError(status, m)) -> println("failed:", m)
+    })
+}

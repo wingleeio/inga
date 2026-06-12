@@ -458,7 +458,7 @@ fn asserts_count_toward_the_error_row() {
     // Unhandled in main -> the usual "main must handle" error.
     let errs = check_errors("main :: () {\n    assert(true)\n}\n");
     assert!(
-        errs.iter().any(|m| m.contains("AssertFailed")),
+        errs.iter().any(|m| m.contains("AssertionError")),
         "got: {errs:?}"
     );
 }

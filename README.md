@@ -137,9 +137,30 @@ inga test games/logic_test.inga
 ```
 
 Every zero-parameter `test*` function is a test; `assert(cond)` and
-`assertEq(actual, expected)` are ordinary typed errors (`! AssertFailed`),
+`assertEq(actual, expected)` are ordinary typed errors (`! AssertionError`),
 so a failing assertion prints with the usual caret pointing at the line.
 INGA-LATRO's poker evaluator is tested this way.
+
+## The network is in your types
+
+`std/http` is the HTTP client — and `uses Http` in a signature is how you
+know a function touches the network, the same honesty as every other
+capability. A non-2xx status is data (like fetch); only transport failures
+raise `! HttpError`; streaming is a pull loop; deadlines and backoff are
+the combinators you already have:
+
+```inga
+use std/http
+
+fetchPrice :: (String sym) -> Float ! HttpError, TimeoutError uses Http, Fibers {
+    resp = http.get("https://api.example/price/${sym}")
+        |> fiber.within(2.seconds)
+        |> retry(schedule.exponential(100.millis) |> schedule.upTo(3))
+    resp.body |> parseInt |> getOrElse(0) |> toFloat
+}
+```
+
+Try it: `inga run examples/http_client.inga`.
 
 ## Graphics, and a game
 
@@ -182,7 +203,7 @@ crates/inga-lsp       language server (lsp-server / lsp-types)
 editors/vscode        VS Code extension + TextMate grammar
 editors/zed           Zed extension (tree-sitter highlighting + LSP)
 tree-sitter-inga      tree-sitter grammar (used by the Zed extension)
-examples/             hello.inga, retry.inga, shapes.inga, arena.inga, fibers.inga, fiber_errors.inga, modules.inga (+ geometry.inga), user_service.inga
+examples/             hello.inga, retry.inga, shapes.inga, arena.inga, fibers.inga, fiber_errors.inga, http_client.inga, modules.inga (+ geometry.inga), user_service.inga
 games/                balatro.inga (+ game, util, cards, jokers, poker, state, logic_test) — a Balatro-style deckbuilder
 bench/                the same workloads in Inga, JavaScript, and Rust (see bench/README.md)
 docs/SPEC.md          language design: semantics, effect rows, execution strategy

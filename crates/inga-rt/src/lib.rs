@@ -1860,6 +1860,149 @@ pub extern "C" fn rt_fiber_race(a: i64, b: i64) -> i64 {
     }
 }
 
+// ---- http (std/http) -------------------------------------------------------------
+//
+// Blocking client over ureq/rustls — exactly right for thread-per-fiber:
+// a request parks one fiber, `fiber.within` gives deadlines, `retry` gives
+// backoff. Results come back as a 3-slot box the compiler unpacks:
+//   { 1, payload, 0 }            success (payload depends on the call)
+//   { 0, status,  message }      failure (status 0 = transport error)
+// Non-2xx responses are SUCCESSES carrying their status — like fetch, the
+// status is data; only transport/TLS/connect failures raise.
+
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(30))
+            .user_agent("inga/0.3")
+            .build()
+    })
+}
+
+fn http_box(ok: i64, a: i64, b: i64) -> i64 {
+    let p = rt_alloc_global(24) as *mut i64;
+    unsafe {
+        *p = ok;
+        *p.add(1) = a;
+        *p.add(2) = b;
+    }
+    p as i64
+}
+
+fn http_fail(message: String) -> i64 {
+    http_box(0, 0, make_str(message.as_bytes()))
+}
+
+fn read_body(resp: ureq::Response) -> Result<(i64, i64), String> {
+    use std::io::Read;
+    let status = resp.status() as i64;
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .take(64 << 20)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    Ok((status, make_str(&bytes)))
+}
+
+/// One request: method/url/body strings (body 0 = none), headers an Inga
+/// list of (String, String) tuples (0 = none). Success payload is a
+/// 2-slot HttpResponse struct {status, body}.
+#[no_mangle]
+pub extern "C" fn rt_http_send(method: i64, url: i64, body: i64, headers: i64) -> i64 {
+    let m = unsafe { std::str::from_utf8_unchecked(str_bytes(method)) };
+    let u = unsafe { std::str::from_utf8_unchecked(str_bytes(url)) };
+    let mut req = http_agent().request(m, u);
+    if headers != 0 {
+        for &pair in unsafe { list_items(headers) } {
+            let p = pair as *const i64;
+            let (k, v) = unsafe { (*p, *p.add(1)) };
+            req = req.set(
+                unsafe { std::str::from_utf8_unchecked(str_bytes(k)) },
+                unsafe { std::str::from_utf8_unchecked(str_bytes(v)) },
+            );
+        }
+    }
+    let result = if body != 0 {
+        req.send_string(unsafe { std::str::from_utf8_unchecked(str_bytes(body)) })
+    } else {
+        req.call()
+    };
+    let resp = match result {
+        Ok(r) => r,
+        // Non-2xx is a response, not a failure.
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(ureq::Error::Transport(t)) => return http_fail(t.to_string()),
+    };
+    match read_body(resp) {
+        Ok((status, body)) => {
+            let s = rt_alloc(16) as *mut i64;
+            unsafe {
+                *s = status;
+                *s.add(1) = body;
+            }
+            http_box(1, s as i64, 0)
+        }
+        Err(e) => http_fail(e),
+    }
+}
+
+// Open streams: readers parked in a registry keyed by handle. A reader is
+// taken out while a chunk is read so a slow stream never blocks others.
+static HTTP_STREAMS: std::sync::Mutex<Option<std::collections::HashMap<i64, Box<dyn std::io::Read + Send>>>> =
+    std::sync::Mutex::new(None);
+static NEXT_STREAM: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+
+/// GET `url` and stream the body. Success payload is the stream handle;
+/// non-2xx still opens (the status is reported alongside the handle in
+/// slot 2, consumed by the compiler into the HttpStream struct).
+#[no_mangle]
+pub extern "C" fn rt_http_open(url: i64) -> i64 {
+    let u = unsafe { std::str::from_utf8_unchecked(str_bytes(url)) };
+    let resp = match http_agent().get(u).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(ureq::Error::Transport(t)) => return http_fail(t.to_string()),
+    };
+    let status = resp.status() as i64;
+    let handle = NEXT_STREAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut guard = HTTP_STREAMS.lock().unwrap();
+    guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(handle, Box::new(resp.into_reader()));
+    http_box(1, handle, status)
+}
+
+/// Next chunk: payload is a string (up to 64 KB) or 0 at end-of-stream.
+#[no_mangle]
+pub extern "C" fn rt_http_read(handle: i64) -> i64 {
+    use std::io::Read;
+    let reader = HTTP_STREAMS.lock().unwrap().as_mut().and_then(|m| m.remove(&handle));
+    let Some(mut reader) = reader else {
+        return http_box(1, 0, 0); // closed or drained: end of stream
+    };
+    let mut buf = vec![0u8; 64 << 10];
+    match reader.read(&mut buf) {
+        Ok(0) => http_box(1, 0, 0),
+        Ok(n) => {
+            HTTP_STREAMS
+                .lock()
+                .unwrap()
+                .get_or_insert_with(std::collections::HashMap::new)
+                .insert(handle, reader);
+            http_box(1, make_str(&buf[..n]), 0)
+        }
+        Err(e) => http_fail(e.to_string()),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_http_close(handle: i64) {
+    if let Some(m) = HTTP_STREAMS.lock().unwrap().as_mut() {
+        m.remove(&handle);
+    }
+}
+
 // ---- JSON encode/decode over descriptors ----------------------------------------
 
 fn encode_desc(v: i64, d: &mut Desc, out: &mut String) {

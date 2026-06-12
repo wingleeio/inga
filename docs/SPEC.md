@@ -119,6 +119,10 @@ expr |> catch {
 }
 ```
 
+**Naming convention:** error types end in `Error` — `HttpError`,
+`DecodeError`, `TimeoutError`, `AssertionError`, `InterruptedError`; name
+yours the same way (`PageGoneError`, not `PageGone`).
+
 An arm clears its type from the row when it matches *every* value of that
 type: struct arms and typed-bind arms subtract their tag; literal arms never
 subtract; enum **variant** arms subtract the enum only once all variants are
@@ -134,7 +138,7 @@ fail. `tap(value, f)` runs a side effect on the value mid-pipe and passes it
 along untouched; `tapError(action, f)` runs a side effect on a *failure* and
 re-raises it — both are observation points (logging, metrics), neither
 transforms nor clears anything. `assert(cond)` and `assertEq(actual, expected)` fail with the builtin
-struct `AssertFailed { message }` — ordinary typed errors, catchable
+struct `AssertionError { message }` — ordinary typed errors, catchable
 anywhere, and the backbone of `inga test` (§9).
 
 ## 4. Dependencies (capabilities)
@@ -318,7 +322,7 @@ fiber.unsettle  (Outcome<a ! E>) -> a ! E          row-free      put it back in 
 fiber.par       (lazy a, lazy b, …) -> (a, b, …)   uses Fibers   fork all + join
 fiber.parMap    ([a], (a) -> b ! E) -> [b] ! E     uses Fibers   one fiber per element
 fiber.race      (lazy a, lazy a) -> a ! Ea, Eb     uses Fibers   first completion wins, loser interrupted
-fiber.within    (lazy a, Duration) -> a ! E, Timeout             race against a deadline
+fiber.within    (lazy a, Duration) -> a ! E, TimeoutError             race against a deadline
 fiber.partition ([Outcome<a ! E>]) -> ([a], [Outcome<a ! E>])    split successes from failures
 ```
 
@@ -327,7 +331,7 @@ list of fibers, and returns the same shape with the fibers stripped; the
 joined error row is the union of the element rows. On failure the **first
 error in shape order** wins (deterministic under any `Runtime(n)`): the
 remaining fibers in the shape are interrupted and the error re-raises.
-`Interrupted` and `Timeout` are fieldless builtin structs — ordinary
+`InterruptedError` and `TimeoutError` are fieldless builtin structs — ordinary
 catchable errors.
 
 **Error placement** — one sentence to teach: *errors live in the fiber's
@@ -342,7 +346,7 @@ itself is data you will act on:
 outcomes = urls |> fiber.parMap((u) -> fetch(u) |> fiber.settle)
 map(outcomes, (o) -> match o {
     Ok(body)          -> store(body)
-    Failed(Timeout)   -> queueRetry()
+    Failed(TimeoutError)   -> queueRetry()
     Failed(HttpError e) -> logger.warn("${e.status}")
 })
 ```
@@ -452,6 +456,53 @@ evidence like any closure — services work normally inside frames. Helpers:
 `range(n) -> [Int]` and `random(n) -> Int`. Setting `INGA_GFX_SHOT=<path>`
 renders 30 frames, writes a PNG of the framebuffer, and exits (CI smoke
 tests). See `games/balatro.inga` for a complete game.
+
+## 8.5 HTTP client: `std/http`
+
+```inga
+use std/http
+
+main :: () {
+    provide Http
+    resp = http.get(url) |> catch { HttpError(status, m) -> ... }
+    if resp.status == 200 { store(resp.body) }
+}
+```
+
+Every operation carries `uses Http`, satisfied by `provide Http` — the
+network shows up in your rows, which is the package-honesty story made
+real. The service is `shared`, so requests cross fiber boundaries:
+`http.get(url) |> fiber.within(2.seconds)` and `retry` compose directly
+(a request parks one fiber; deadlines and backoff come from the existing
+combinators, not from client options).
+
+```
+http.get        (String url) -> HttpResponse ! HttpError            uses Http
+http.post       (String url, String body) -> HttpResponse ! HttpError
+http.send       (method, url, body, [(String, String)] headers) -> HttpResponse ! HttpError
+http.openStream (String url) -> HttpStream ! HttpError              GET, streamed body
+http.read       (HttpStream) -> String? ! HttpError                 next chunk; None at end
+http.close      (HttpStream)
+```
+
+`HttpResponse { Int status, String body }` — like fetch, a non-2xx
+status is **data**, not a failure; only transport/TLS/connect errors
+raise `HttpError { Int status, String message }` (status 0 = transport).
+Streaming is pull-based — a tail-recursive loop is the iteration:
+
+```inga
+readAll :: (HttpStream s, String acc) -> String ! HttpError uses Http {
+    match http.read(s) {
+        Some(chunk) -> readAll(s, acc + chunk)
+        None -> acc
+    }
+}
+```
+
+`HttpStream { Int handle, Int status }` reports the response status at
+open. Bodies decode with the existing `decode(resp.body, User)`. The
+client is blocking (rustls underneath) — exactly right for
+thread-per-fiber, and the M:N reactor adopts these calls in phase 2.
 
 ## 9. Tooling (all in this repo)
 

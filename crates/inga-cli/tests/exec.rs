@@ -682,7 +682,7 @@ fn arena_scopes_copy_their_value_out() {
 #[test]
 fn asserts_fail_with_assert_failed() {
     let out = run(
-        "main :: () {\n    assertEq(2 + 2, 4) |> catch { AssertFailed(m) -> println(m) }\n    assertEq(\"a\", \"b\") |> catch { AssertFailed(m) -> println(\"caught:\", m) }\n    assert(false) |> catch { AssertFailed(m) -> println(\"caught:\", m) }\n}\n",
+        "main :: () {\n    assertEq(2 + 2, 4) |> catch { AssertionError(m) -> println(m) }\n    assertEq(\"a\", \"b\") |> catch { AssertionError(m) -> println(\"caught:\", m) }\n    assert(false) |> catch { AssertionError(m) -> println(\"caught:\", m) }\n}\n",
     );
     assert_eq!(
         out,
@@ -818,7 +818,7 @@ fn settle_outcome_and_partition() {
 #[test]
 fn parmap_race_and_within() {
     let out = run(
-        "use std/fiber\n\nslow :: () -> Int {\n    sleep(2.seconds)\n    99\n}\n\nmain :: () {\n    provide Runtime(4)\n    println(fiber.parMap([1, 2, 3], (n) -> n * 10))\n    fast = fiber.within(40 + 2, 1.seconds) |> catch { Timeout -> -1 }\n    println(fast)\n    timed = fiber.within(slow(), 50.millis) |> catch { Timeout -> -1 }\n    println(timed)\n    won = fiber.race(7, slow())\n    println(won)\n}\n",
+        "use std/fiber\n\nslow :: () -> Int {\n    sleep(2.seconds)\n    99\n}\n\nmain :: () {\n    provide Runtime(4)\n    println(fiber.parMap([1, 2, 3], (n) -> n * 10))\n    fast = fiber.within(40 + 2, 1.seconds) |> catch { TimeoutError -> -1 }\n    println(fast)\n    timed = fiber.within(slow(), 50.millis) |> catch { TimeoutError -> -1 }\n    println(timed)\n    won = fiber.race(7, slow())\n    println(won)\n}\n",
     );
     assert_eq!(out, "[10, 20, 30]\n42\n-1\n7\n");
 }
@@ -870,6 +870,84 @@ fn tap_and_tap_error_observe_without_transforming() {
     );
     assert!(
         errs.iter().any(|m| m.contains("`main` does not handle the error `Boom`")),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn http_get_post_status_and_streaming() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() || line.is_empty() {
+                continue;
+            }
+            let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+            let is_post = line.starts_with("POST");
+            let mut len = 0usize;
+            loop {
+                let mut h = String::new();
+                if reader.read_line(&mut h).is_err() || h == "\r\n" || h == "\n" || h.is_empty() {
+                    break;
+                }
+                if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; len];
+            if len > 0 {
+                let _ = reader.read_exact(&mut body);
+            }
+            let mut out = stream;
+            let respond = |out: &mut std::net::TcpStream, status: &str, body: &[u8]| {
+                let _ = write!(
+                    out,
+                    "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = out.write_all(body);
+            };
+            match (is_post, path.as_str()) {
+                (false, "/hello") => respond(&mut out, "200 OK", b"hi there"),
+                (true, "/echo") => {
+                    let mut e = b"echo:".to_vec();
+                    e.extend_from_slice(&body);
+                    respond(&mut out, "200 OK", &e);
+                }
+                (false, "/stream") => {
+                    let _ = write!(
+                        out,
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    );
+                    for chunk in [&b"alpha "[..], b"beta ", b"gamma"] {
+                        let _ = write!(out, "{:x}\r\n", chunk.len());
+                        let _ = out.write_all(chunk);
+                        let _ = write!(out, "\r\n");
+                        let _ = out.flush();
+                    }
+                    let _ = write!(out, "0\r\n\r\n");
+                }
+                _ => respond(&mut out, "404 Not Found", b"nope"),
+            }
+        }
+    });
+
+    let src = format!(
+        "use std/http\n\nreadAll :: (HttpStream s, String acc) -> String ! HttpError uses Http {{\n    match http.read(s) {{\n        Some(chunk) -> readAll(s, acc + chunk)\n        None -> acc\n    }}\n}}\n\nmain :: () {{\n    provide Http\n    ok = http.get(\"http://127.0.0.1:{port}/hello\") |> catch {{ HttpError -> HttpResponse(0, \"\") }}\n    println(ok.status, ok.body)\n    missing = http.get(\"http://127.0.0.1:{port}/missing\") |> catch {{ HttpError -> HttpResponse(0, \"\") }}\n    println(missing.status)\n    echoed = http.post(\"http://127.0.0.1:{port}/echo\", \"ping\") |> catch {{ HttpError -> HttpResponse(0, \"\") }}\n    println(echoed.body)\n    streamed = {{\n        s = http.openStream(\"http://127.0.0.1:{port}/stream\")\n        text = readAll(s, \"\")\n        http.close(s)\n        text\n    }} |> catch {{ HttpError -> \"failed\" }}\n    println(streamed)\n    down = http.get(\"http://127.0.0.1:1/x\") |> catch {{ HttpError(status, m) -> HttpResponse(status, \"transport\") }}\n    println(down.status, down.body)\n}}\n"
+    );
+    let out = run(&src);
+    assert_eq!(out, "200 hi there\n404\necho:ping\nalpha beta gamma\n0 transport\n");
+
+    // Requests require the capability: no `provide Http` -> teaching error.
+    let errs = check_errors(
+        "use std/http\n\nmain :: () {\n    println(http.get(\"http://x\").status |> catch { HttpError -> 0 })\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("`main` requires the service `Http`")),
         "got: {errs:?}"
     );
 }

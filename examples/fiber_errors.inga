@@ -76,12 +76,12 @@ main :: () {
     })
 
     // 5. Deadlines and cancellation are just more typed errors: `within`
-    //    fails with Timeout, joining an interrupted fiber fails with
-    //    Interrupted — both ordinary, both catchable.
-    late = fiber.within(slowEcho("zzz"), 50.millis) |> catch { Timeout -> "timed out" }
+    //    fails with TimeoutError, joining an interrupted fiber fails with
+    //    InterruptedError — both ordinary, both catchable.
+    late = fiber.within(slowEcho("zzz"), 50.millis) |> catch { TimeoutError -> "timed out" }
     println("5:", late)
 
     cancelled = slowEcho("never") |> fiber.fork
     fiber.interrupt(cancelled)
-    println("6:", fiber.join(cancelled) |> catch { Interrupted -> "cancelled" })
+    println("6:", fiber.join(cancelled) |> catch { InterruptedError -> "cancelled" })
 }

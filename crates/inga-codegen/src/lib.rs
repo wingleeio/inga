@@ -171,14 +171,21 @@ impl<'a> Cg<'a> {
     fn collect_decls(&mut self) {
         // Fixed tag ids for the builtins, then one per struct/enum.
         self.struct_meta.insert("DecodeError".into(), vec!["message".into()]);
-        self.struct_meta.insert("AssertFailed".into(), vec!["message".into()]);
-        self.struct_meta.insert("Interrupted".into(), Vec::new());
-        self.struct_meta.insert("Timeout".into(), Vec::new());
+        self.struct_meta.insert("AssertionError".into(), vec!["message".into()]);
+        self.struct_meta.insert("InterruptedError".into(), Vec::new());
+        self.struct_meta.insert("TimeoutError".into(), Vec::new());
+        self.struct_meta
+            .insert("HttpResponse".into(), vec!["status".into(), "body".into()]);
+        self.struct_meta
+            .insert("HttpError".into(), vec!["status".into(), "message".into()]);
+        self.struct_meta
+            .insert("HttpStream".into(), vec!["handle".into(), "status".into()]);
         for (i, tag) in [
             "DecodeError",
-            "AssertFailed",
-            "Interrupted",
-            "Timeout",
+            "AssertionError",
+            "InterruptedError",
+            "TimeoutError",
+            "HttpError",
             "Int",
             "Float",
             "Bool",
@@ -351,7 +358,7 @@ impl<'a> Cg<'a> {
     }
 
     /// Render the value inside an error box `{tag, payload}` for the test
-    /// report: AssertFailed shows its bare message, everything else its
+    /// report: AssertionError shows its bare message, everything else its
     /// `show` form via the type descriptor for the tag.
     fn gen_show_err_fn(&mut self) {
         let mut f = FnCtx::new(false);
@@ -368,7 +375,7 @@ impl<'a> Cg<'a> {
             f.line(format!("{c} = icmp eq i64 {tag}, {id}"));
             f.line(format!("br i1 {c}, label %{hit_l}, label %{next_l}"));
             f.start_block(&hit_l);
-            let shown = if name == "AssertFailed" {
+            let shown = if name == "AssertionError" {
                 // { message } — print the message itself.
                 self.load_slot_from_int(&mut f, &payload, 0)
             } else {
@@ -1037,6 +1044,9 @@ impl<'a> Cg<'a> {
                     if module == "fiber" {
                         return self.gen_fiber(f, name, args, span);
                     }
+                    if module == "http" {
+                        return self.gen_http(f, name, args, span);
+                    }
                     if let Some(v) = self.gen_qualified(f, module, name, args, span) {
                         return v;
                     }
@@ -1217,6 +1227,9 @@ impl<'a> Cg<'a> {
                 }
                 if module == "fiber" {
                     return self.gen_fiber(f, name, args, span);
+                }
+                if module == "http" {
+                    return self.gen_http(f, name, args, span);
                 }
                 if let Some(v) = self.gen_qualified(f, module, name, args, span) {
                     return v;
@@ -2045,6 +2058,10 @@ impl<'a> Cg<'a> {
         let saved = f.evidence.clone();
         let mut arenas = 0usize;
         for item in impls {
+            if item.name == "Http" {
+                f.evidence.insert("Http".to_string(), "0".to_string());
+                continue;
+            }
             if item.name == "Runtime" {
                 // Phase 1 runs one OS thread per fiber: the worker count is
                 // honored by the M:N scheduler (phase 2); here the resource
@@ -2745,7 +2762,7 @@ impl<'a> Cg<'a> {
                 let err_ptr = self.gen_alloc(f, 1);
                 self.store_slot(f, &err_ptr, 0, &msg);
                 let err_val = self.ptr_to_int(f, &err_ptr);
-                self.emit_fail_value(f, &err_val, &CType::Struct("AssertFailed".to_string()), span);
+                self.emit_fail_value(f, &err_val, &CType::Struct("AssertionError".to_string()), span);
                 f.start_block(&ok_l);
                 "0".to_string()
             }
@@ -2768,7 +2785,7 @@ impl<'a> Cg<'a> {
                 let err_ptr = self.gen_alloc(f, 1);
                 self.store_slot(f, &err_ptr, 0, &msg);
                 let err_val = self.ptr_to_int(f, &err_ptr);
-                self.emit_fail_value(f, &err_val, &CType::Struct("AssertFailed".to_string()), span);
+                self.emit_fail_value(f, &err_val, &CType::Struct("AssertionError".to_string()), span);
                 f.start_block(&ok_l);
                 "0".to_string()
             }
@@ -2895,7 +2912,7 @@ impl<'a> Cg<'a> {
     }
 
     fn interrupted_tag(&self) -> i64 {
-        self.tag_ids.get("Interrupted").copied().unwrap_or(0)
+        self.tag_ids.get("InterruptedError").copied().unwrap_or(0)
     }
 
     /// Join one handle: re-raise its failure, dup + pool the value.
@@ -2965,7 +2982,7 @@ impl<'a> Cg<'a> {
     }
 
     /// The `@ing.fiber.sleeper` shim for `within`: sleeps, then "fails"
-    /// with Timeout — racing it against the action implements the deadline.
+    /// with TimeoutError — racing it against the action implements the deadline.
     fn sleeper_shim(&mut self) -> String {
         let sym = "@ing.fiber.sleeper".to_string();
         if self.drop_syms.contains_key(&sym) {
@@ -3170,7 +3187,7 @@ impl<'a> Cg<'a> {
                 let ha = self.gen_fork_handle(f, args[0]);
                 let ms = self.gen_expr(f, args[1]);
                 let shim = self.sleeper_shim();
-                let timeout_tag = self.tag_ids.get("Timeout").copied().unwrap_or(0);
+                let timeout_tag = self.tag_ids.get("TimeoutError").copied().unwrap_or(0);
                 let envp = self.gen_alloc(f, 3);
                 self.store_slot(f, &envp, 0, &format!("ptrtoint (ptr {shim} to i64)"));
                 self.store_slot(f, &envp, 1, &ms);
@@ -3576,6 +3593,112 @@ impl<'a> Cg<'a> {
             ]),
         );
         out
+    }
+
+    /// `http.*` — std/http. Runtime calls return a 3-slot box
+    /// `{ok, a, b}`; on failure (ok = 0) `a` is the status (0 = transport)
+    /// and `b` the message, raised as HttpError.
+    fn gen_http(&mut self, f: &mut FnCtx, name: &str, args: &[&Expr], span: Span) -> String {
+        match (name, args.len()) {
+            ("get", 1) | ("post", 2) | ("send", 4) => {
+                let (method, url, body, headers) = match name {
+                    "get" => (
+                        self.str_const("GET"),
+                        self.gen_expr(f, args[0]),
+                        "0".to_string(),
+                        "0".to_string(),
+                    ),
+                    "post" => (
+                        self.str_const("POST"),
+                        self.gen_expr(f, args[0]),
+                        self.gen_expr(f, args[1]),
+                        "0".to_string(),
+                    ),
+                    _ => (
+                        self.gen_expr(f, args[0]),
+                        self.gen_expr(f, args[1]),
+                        self.gen_expr(f, args[2]),
+                        self.gen_expr(f, args[3]),
+                    ),
+                };
+                let boxed = self.tmp();
+                f.line(format!(
+                    "{boxed} = call i64 @rt_http_send(i64 {method}, i64 {url}, i64 {body}, i64 {headers})"
+                ));
+                let payload = self.gen_http_unpack(f, &boxed, span);
+                self.pool_value(f, &payload, &CType::Struct("HttpResponse".into()));
+                payload
+            }
+            ("openStream", 1) => {
+                let url = self.gen_expr(f, args[0]);
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @rt_http_open(i64 {url})"));
+                let handle = self.gen_http_unpack(f, &boxed, span);
+                // Success box carries {handle, status}; build the struct.
+                let status = self.load_slot_from_int(f, &boxed, 2);
+                let sp = self.gen_alloc(f, 2);
+                self.store_slot(f, &sp, 0, &handle);
+                self.store_slot(f, &sp, 1, &status);
+                let out = self.ptr_to_int(f, &sp);
+                self.pool_value(f, &out, &CType::Struct("HttpStream".into()));
+                out
+            }
+            ("read", 1) => {
+                let s = self.gen_expr(f, args[0]);
+                let handle = self.load_slot_from_int(f, &s, 0);
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @rt_http_read(i64 {handle})"));
+                let chunk = self.gen_http_unpack(f, &boxed, span);
+                // 0 = end of stream (None); else wrap the string in Some.
+                let slot = f.fresh_slot(self);
+                let (some_l, done_l) = (self.label("http.some"), self.label("http.eos"));
+                f.line(format!("store i64 0, ptr {slot}"));
+                let c = self.tmp();
+                f.line(format!("{c} = icmp ne i64 {chunk}, 0"));
+                f.line(format!("br i1 {c}, label %{some_l}, label %{done_l}"));
+                f.start_block(&some_l);
+                let optp = self.gen_alloc(f, 1);
+                self.store_slot(f, &optp, 0, &chunk);
+                let opt = self.ptr_to_int(f, &optp);
+                f.line(format!("store i64 {opt}, ptr {slot}"));
+                f.line(format!("br label %{done_l}"));
+                f.start_block(&done_l);
+                let out = self.tmp();
+                f.line(format!("{out} = load i64, ptr {slot}"));
+                self.pool_value(f, &out, &CType::Option(Box::new(CType::Str)));
+                out
+            }
+            ("close", 1) => {
+                let s = self.gen_expr(f, args[0]);
+                let handle = self.load_slot_from_int(f, &s, 0);
+                f.line(format!("call void @rt_http_close(i64 {handle})"));
+                "0".to_string()
+            }
+            _ => {
+                self.unsupported(span, "this `http` operation shape");
+                "0".to_string()
+            }
+        }
+    }
+
+    /// Unpack `{ok, a, b}`: on ok return `a`; else build and raise
+    /// HttpError { status: a, message: b }.
+    fn gen_http_unpack(&mut self, f: &mut FnCtx, boxed: &str, span: Span) -> String {
+        let ok = self.load_slot_from_int(f, boxed, 0);
+        let a = self.load_slot_from_int(f, boxed, 1);
+        let (fail_l, ok_l) = (self.label("http.fail"), self.label("http.ok"));
+        let c = self.tmp();
+        f.line(format!("{c} = icmp eq i64 {ok}, 0"));
+        f.line(format!("br i1 {c}, label %{fail_l}, label %{ok_l}"));
+        f.start_block(&fail_l);
+        let msg = self.load_slot_from_int(f, boxed, 2);
+        let errp = self.gen_alloc(f, 2);
+        self.store_slot(f, &errp, 0, &a);
+        self.store_slot(f, &errp, 1, &msg);
+        let err = self.ptr_to_int(f, &errp);
+        self.emit_fail_value(f, &err, &CType::Struct("HttpError".to_string()), span);
+        f.start_block(&ok_l);
+        a
     }
 
     /// Race two handles: first completion in shape-tie order wins, the
@@ -4550,6 +4673,10 @@ declare void @rt_fiber_abandon(i64)
 declare i64 @rt_fiber_race(i64, i64)
 declare i64 @rt_make_errbox(i64, i64)
 declare void @rt_freeze_header(i64)
+declare i64 @rt_http_send(i64, i64, i64, i64)
+declare i64 @rt_http_open(i64)
+declare i64 @rt_http_read(i64)
+declare void @rt_http_close(i64)
 declare i64 @rt_random(i64)
 declare void @rt_gfx_run(i64, i64, i64, i64)
 declare void @rt_gfx_clear(i64, i64, i64)

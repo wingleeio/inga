@@ -26,12 +26,16 @@ pub const SIZE_SUFFIXES: [(&str, i64); 3] =
 
 /// Builtin struct raised by `decode`.
 pub const DECODE_ERROR: &str = "DecodeError";
-pub const ASSERT_FAILED: &str = "AssertFailed";
-pub const INTERRUPTED: &str = "Interrupted";
-pub const TIMEOUT: &str = "Timeout";
+pub const ASSERT_FAILED: &str = "AssertionError";
+pub const INTERRUPTED: &str = "InterruptedError";
+pub const TIMEOUT: &str = "TimeoutError";
 /// The capability every `std/fiber` operation needs; satisfied only by the
 /// builtin `provide Runtime(n)` resource.
 pub const FIBERS_SERVICE: &str = "Fibers";
+/// The capability every `std/http` operation needs; satisfied by
+/// `provide Http`. Shared, so requests cross fiber boundaries.
+pub const HTTP_SERVICE: &str = "Http";
+pub const HTTP_ERROR: &str = "HttpError";
 
 /// Surface names of primitive types that can appear in a `!` row.
 pub const PRIMITIVE_TAGS: [&str; 5] = ["Int", "Float", "Bool", "String", "Duration"];
@@ -298,6 +302,44 @@ impl<'a> Checker<'a> {
                 },
             );
         }
+        // std/http data types.
+        checker.structs.insert(
+            "HttpResponse".to_string(),
+            StructInfo {
+                fields: vec![("status".into(), Type::Int), ("body".into(), Type::Str)],
+                name_span: Span::default(),
+                module: CORE_MODULE,
+                is_pub: true,
+            },
+        );
+        checker.structs.insert(
+            HTTP_ERROR.to_string(),
+            StructInfo {
+                fields: vec![("status".into(), Type::Int), ("message".into(), Type::Str)],
+                name_span: Span::default(),
+                module: CORE_MODULE,
+                is_pub: true,
+            },
+        );
+        checker.structs.insert(
+            "HttpStream".to_string(),
+            StructInfo {
+                fields: vec![("handle".into(), Type::Int), ("status".into(), Type::Int)],
+                name_span: Span::default(),
+                module: CORE_MODULE,
+                is_pub: true,
+            },
+        );
+        checker.services.insert(
+            HTTP_SERVICE.to_string(),
+            ServiceInfo {
+                methods: Vec::new(),
+                name_span: Span::default(),
+                module: CORE_MODULE,
+                is_pub: true,
+                shared: true,
+            },
+        );
         // Fieldless builtins raised by the fiber machinery.
         for name in [INTERRUPTED, TIMEOUT] {
             checker.structs.insert(
@@ -1736,6 +1778,7 @@ impl<'a> Checker<'a> {
             "std/graphics" => return self.check_gfx_call(member, member_span, args, span),
             "std/schedule" => return self.check_schedule_call(member, member_span, args, span),
             "std/fiber" => return self.check_fiber_call(member, member_span, args, span),
+            "std/http" => return self.check_http_call(member, member_span, args, span),
             _ => {}
         }
         let Some(target) = self.modules.iter().position(|m| m.key == import.target) else {
@@ -2216,6 +2259,106 @@ impl<'a> Checker<'a> {
                 self.error(
                     member_span,
                     format!("`std/fiber` has no member `{member}` (fork, join, poll, interrupt, settle, unsettle, par, parMap, race, within, partition)"),
+                );
+                for arg in args {
+                    self.check_expr(arg);
+                }
+                Type::Unknown
+            }
+        }
+    }
+
+    /// `http.*` — std/http: a blocking client whose calls park the fiber.
+    /// Transport failures raise HttpError; a non-2xx status is data.
+    fn check_http_call(
+        &mut self,
+        member: &str,
+        member_span: Span,
+        args: &[&Expr],
+        span: Span,
+    ) -> Type {
+        let arity = |s: &mut Self, n: usize| -> bool {
+            if args.len() != n {
+                s.error(
+                    span,
+                    format!("`http.{member}` expects {n} argument(s), found {}", args.len()),
+                );
+                for arg in args {
+                    s.check_expr(arg);
+                }
+                return false;
+            }
+            true
+        };
+        let str_arg = |s: &mut Self, i: usize| {
+            let t = s.check_expr(args[i]);
+            s.unify_at(&Type::Str, &t, args[i].span, "http argument");
+        };
+        match member {
+            "get" | "openStream" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                str_arg(self, 0);
+                self.add_cap_row(HTTP_SERVICE);
+                self.add_error_row(HTTP_ERROR);
+                if member == "get" {
+                    Type::Named("HttpResponse".into())
+                } else {
+                    Type::Named("HttpStream".into())
+                }
+            }
+            "post" => {
+                if !arity(self, 2) {
+                    return Type::Unknown;
+                }
+                str_arg(self, 0);
+                str_arg(self, 1);
+                self.add_cap_row(HTTP_SERVICE);
+                self.add_error_row(HTTP_ERROR);
+                Type::Named("HttpResponse".into())
+            }
+            "send" => {
+                if !arity(self, 4) {
+                    return Type::Unknown;
+                }
+                str_arg(self, 0);
+                str_arg(self, 1);
+                str_arg(self, 2);
+                let headers = self.check_expr(args[3]);
+                self.unify_at(
+                    &Type::List(Box::new(Type::Tuple(vec![Type::Str, Type::Str]))),
+                    &headers,
+                    args[3].span,
+                    "http headers",
+                );
+                self.add_cap_row(HTTP_SERVICE);
+                self.add_error_row(HTTP_ERROR);
+                Type::Named("HttpResponse".into())
+            }
+            "read" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                let t = self.check_expr(args[0]);
+                self.unify_at(&Type::Named("HttpStream".into()), &t, args[0].span, "http stream");
+                self.add_cap_row(HTTP_SERVICE);
+                self.add_error_row(HTTP_ERROR);
+                Type::Option(Box::new(Type::Str))
+            }
+            "close" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                let t = self.check_expr(args[0]);
+                self.unify_at(&Type::Named("HttpStream".into()), &t, args[0].span, "http stream");
+                self.add_cap_row(HTTP_SERVICE);
+                Type::Unit
+            }
+            _ => {
+                self.error(
+                    member_span,
+                    format!("`std/http` has no member `{member}` (get, post, send, openStream, read, close)"),
                 );
                 for arg in args {
                     self.check_expr(arg);
@@ -3079,7 +3222,7 @@ impl<'a> Checker<'a> {
     fn warn_unreachable_arm(&mut self, span: Span, tag: &str) {
         // Cancellation can surface at any `fiber.join`/`fiber.poll`; it is
         // deliberately not part of inferred rows (every join would carry it),
-        // so an `Interrupted` arm is always considered reachable.
+        // so an `InterruptedError` arm is always considered reachable.
         if tag == INTERRUPTED {
             return;
         }
@@ -3365,7 +3508,7 @@ impl<'a> Checker<'a> {
                         CtorPatArgs::None => {}
                         _ => self.error(
                             pat.span,
-                            "`Failed` takes one pattern: `Failed(HttpError e)`, `Failed(Timeout)`, or `Failed(other)`",
+                            "`Failed` takes one pattern: `Failed(HttpError e)`, `Failed(TimeoutError)`, or `Failed(other)`",
                         ),
                     }
                 }
@@ -3438,6 +3581,23 @@ impl<'a> Checker<'a> {
         let mut provided: BTreeSet<String> = BTreeSet::new();
         let mut has_arena = false;
         for item in impls {
+            if item.name == "Http" {
+                if let Some(args) = &item.args {
+                    self.error(item.name_span, "`Http` takes no arguments: `provide Http`");
+                    for arg in args {
+                        self.check_expr(arg);
+                    }
+                }
+                if self.record_info {
+                    self.info.hovers.push((
+                        item.name_span,
+                        "Http — the built-in HTTP client; satisfies `Http` for this scope"
+                            .to_string(),
+                    ));
+                }
+                provided.insert(HTTP_SERVICE.to_string());
+                continue;
+            }
             if item.name == "Runtime" {
                 // The fiber runtime: `provide Runtime(n)` (n workers; default
                 // = cores). Satisfies the builtin `Fibers` capability.
@@ -3838,6 +3998,13 @@ impl<'a> Checker<'a> {
                 ));
                 return;
             }
+            "std/http" => {
+                self.info.hovers.push((
+                    u.path_span,
+                    "std/http — HTTP client: http.get/post/send/openStream/read/close; needs `provide Http`".to_string(),
+                ));
+                return;
+            }
             _ => {}
         }
         let ref_module = self.module_of(u.path_span);
@@ -4036,8 +4203,8 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("tap", "tap(value, f) -> value — run a side effect on the value mid-pipe, pass it along untouched"),
         ("tapError", "tapError(lazy action, f) -> a — run a side effect on a failure, then re-raise it (the row is preserved)"),
         ("sleep", "sleep(duration) -> Unit"),
-        ("assert", "assert(condition) -> Unit ! AssertFailed — for `inga test`"),
-        ("assertEq", "assertEq(actual, expected) -> Unit ! AssertFailed — for `inga test`"),
+        ("assert", "assert(condition) -> Unit ! AssertionError — for `inga test`"),
+        ("assertEq", "assertEq(actual, expected) -> Unit ! AssertionError — for `inga test`"),
         ("len", "len(stringOrList) -> Int"),
         ("filter", "filter(list, predicate) -> [a]"),
         ("fold", "fold(list, init, f) -> b — f(acc, item) left to right"),

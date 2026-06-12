@@ -236,6 +236,45 @@ impl<'a> Parser<'a> {
                 d.is_shared = is_shared;
                 Some(Decl::Service(d))
             }
+            // `maxRetries = 3` / `Int port = 8080` — top-level constants.
+            TokenKind::Ident(name)
+                if !is_upper(&name) && self.nth(1).kind == TokenKind::Eq =>
+            {
+                let start = self.peek().span;
+                let (name, name_span) = self.expect_ident("a constant name");
+                self.bump(); // =
+                self.skip_newlines();
+                let value = self.parse_expr();
+                Some(Decl::Const(ConstDecl {
+                    is_pub,
+                    ty: None,
+                    name,
+                    name_span,
+                    value,
+                    span: start.to(self.prev_span()),
+                }))
+            }
+            TokenKind::Ident(tyname)
+                if is_upper(&tyname)
+                    && matches!(&self.nth(1).kind, TokenKind::Ident(n) if !is_upper(n))
+                    && self.nth(2).kind == TokenKind::Eq =>
+            {
+                let start = self.peek().span;
+                let ty_span = self.peek().span;
+                self.bump(); // the type
+                let (name, name_span) = self.expect_ident("a constant name");
+                self.bump(); // =
+                self.skip_newlines();
+                let value = self.parse_expr();
+                Some(Decl::Const(ConstDecl {
+                    is_pub,
+                    ty: Some(TypeExpr::Name(tyname, ty_span)),
+                    name,
+                    name_span,
+                    value,
+                    span: start.to(self.prev_span()),
+                }))
+            }
             TokenKind::Ident(_) => {
                 let (name, name_span) = self.expect_ident("a declaration name");
                 if !self.expect(&TokenKind::ColonColon, "`::`") {

@@ -59,6 +59,7 @@ pub enum DefKind {
     Service,
     Impl,
     Method,
+    Const,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +125,8 @@ pub struct RowFact {
 
 #[derive(Debug, Default)]
 pub struct Facts {
+    /// Top-level constants, in declaration (= initialization) order.
+    pub consts: Vec<(String, CType)>,
     pub funcs: HashMap<String, RowFact>,
     /// Keyed by (service, method): the union row across all implementations.
     pub methods: HashMap<(String, String), RowFact>,
@@ -155,6 +158,14 @@ impl Rows {
         self.errors.extend(other.errors.iter().cloned());
         self.caps.extend(other.caps.iter().cloned());
     }
+}
+
+struct ConstInfo {
+    ty: Type,
+    index: usize,
+    name_span: Span,
+    module: usize,
+    is_pub: bool,
 }
 
 struct StructInfo {
@@ -283,6 +294,11 @@ struct Checker<'a> {
     /// the rendered type reflects constraints discovered after the use site
     /// (e.g. `xs = MutList()` refined by a later `xs.push(1)`).
     typed_hovers: Vec<(Span, String, Type)>,
+    /// Top-level constants: type, declaration index (init order), origin.
+    consts: HashMap<String, ConstInfo>,
+    /// Set while checking a constant's initializer: its declaration index,
+    /// so references to later constants (uninitialized at that point) error.
+    current_const: Option<usize>,
     current_rigid: std::collections::HashSet<u32>,
     raw_expr_types: HashMap<(u32, u32), Type>,
     info: CheckInfo,
@@ -310,6 +326,8 @@ impl<'a> Checker<'a> {
             diags: Vec::new(),
             record_info: false,
             typed_hovers: Vec::new(),
+            consts: HashMap::new(),
+            current_const: None,
             current_rigid: std::collections::HashSet::new(),
             raw_expr_types: HashMap::new(),
             info: CheckInfo::default(),
@@ -486,6 +504,7 @@ impl<'a> Checker<'a> {
 
     fn collect_decls(&mut self) {
         // First sweep: names only, so types can reference each other.
+        let mut next_const = 0usize;
         for decl in &self.program.decls {
             let (name, span, kind, is_pub) = match decl {
                 Decl::Use(_) => continue,
@@ -494,6 +513,7 @@ impl<'a> Checker<'a> {
                 Decl::Service(d) => (&d.name, d.name_span, DefKind::Service, d.is_pub),
                 Decl::Impl(d) => (&d.name, d.name_span, DefKind::Impl, d.is_pub),
                 Decl::Func(d) => (&d.name, d.name_span, DefKind::Func, d.is_pub),
+                Decl::Const(d) => (&d.name, d.name_span, DefKind::Const, d.is_pub),
             };
             let module = self.module_of(span);
             let dup = match kind {
@@ -503,6 +523,9 @@ impl<'a> Checker<'a> {
                 DefKind::Service => self.services.contains_key(name),
                 DefKind::Impl | DefKind::Func | DefKind::Method => {
                     self.impls.contains_key(name) || self.funcs.contains_key(name)
+                }
+                DefKind::Const => {
+                    self.consts.contains_key(name) || self.funcs.contains_key(name)
                 }
             };
             if dup {
@@ -534,6 +557,14 @@ impl<'a> Checker<'a> {
                         },
                     );
                 }
+                DefKind::Const => {
+                    let ty = self.ctx.fresh();
+                    self.consts.insert(
+                        name.clone(),
+                        ConstInfo { ty, index: next_const, name_span: span, module, is_pub },
+                    );
+                    next_const += 1;
+                }
                 _ => {}
             }
         }
@@ -541,7 +572,7 @@ impl<'a> Checker<'a> {
         // Second sweep: full signatures.
         for decl in &self.program.decls {
             match decl {
-                Decl::Use(_) => {}
+                Decl::Use(_) | Decl::Const(_) => {}
                 Decl::Struct(d) => {
                     let mut fields = Vec::new();
                     let mut tyvars = HashMap::new();
@@ -1000,8 +1031,43 @@ impl<'a> Checker<'a> {
             match decl {
                 Decl::Func(d) => self.check_func(d),
                 Decl::Impl(d) => self.check_impl(d),
+                Decl::Const(d) => self.check_const(d),
                 _ => {}
             }
+        }
+    }
+
+    fn check_const(&mut self, d: &ConstDecl) {
+        let Some(info) = self.consts.get(&d.name) else { return };
+        let (declared, index) = (info.ty.clone(), info.index);
+        self.current_const = Some(index);
+        self.scopes = vec![HashMap::new()];
+        self.row_stack = vec![Rows::default()];
+        let value_ty = self.check_expr(&d.value);
+        if let Some(ann) = &d.ty {
+            let mut tyvars = HashMap::new();
+            let t = self.resolve_type_expr(ann, &mut tyvars);
+            self.unify_at(&t, &value_ty, d.value.span, "constant");
+        }
+        self.unify_at(&declared, &value_ty, d.value.span, "constant");
+        let rows = self.row_stack.pop().unwrap_or_default();
+        if !rows.errors.is_empty() {
+            let errs = rows.errors.iter().cloned().collect::<Vec<_>>().join(", ");
+            self.error(
+                d.name_span,
+                format!("constants are pure: this initializer can fail with {errs}"),
+            );
+        }
+        if !rows.caps.is_empty() {
+            let caps = rows.caps.iter().cloned().collect::<Vec<_>>().join(", ");
+            self.error(
+                d.name_span,
+                format!("constants are pure: this initializer uses {caps}"),
+            );
+        }
+        self.current_const = None;
+        if self.record_info {
+            self.typed_hovers.push((d.name_span, d.name.clone(), declared));
         }
     }
 
@@ -1280,6 +1346,14 @@ impl<'a> Checker<'a> {
 
     /// Export effective rows for codegen (called once, after the final pass).
     fn record_facts(&mut self) {
+        let mut consts: Vec<(&String, &ConstInfo)> = self.consts.iter().collect();
+        consts.sort_by_key(|(_, i)| i.index);
+        let consts: Vec<(String, Type)> =
+            consts.into_iter().map(|(n, i)| (n.clone(), i.ty.clone())).collect();
+        for (name, ty) in consts {
+            let cty = self.ctype(&ty);
+            self.info.facts.consts.push((name, cty));
+        }
         for name in self.funcs.keys().cloned().collect::<Vec<_>>() {
             let rows = self.func_effective_rows(&name);
             let info = &self.funcs[&name];
@@ -1571,6 +1645,26 @@ impl<'a> Checker<'a> {
                 }
                 return ty;
             }
+        }
+        if let Some(info) = self.consts.get(name) {
+            let (ty, index, def_span, def_module, is_pub) =
+                (info.ty.clone(), info.index, info.name_span, info.module, info.is_pub);
+            if let Some(current) = self.current_const {
+                if index >= current {
+                    self.error(
+                        span,
+                        format!(
+                            "constant `{name}` is not initialized yet here (constants initialize in declaration order)"
+                        ),
+                    );
+                }
+            }
+            self.gate(name, def_module, is_pub, span);
+            if self.record_info {
+                self.info.refs.push((span, def_span));
+                self.typed_hovers.push((span, name.to_string(), ty.clone()));
+            }
+            return ty;
         }
         if let Some(info) = self.funcs.get(name) {
             let (def_module, is_pub, def_span) = (info.module, info.is_pub, info.name_span);
@@ -4971,6 +5065,16 @@ impl<'a> Checker<'a> {
                     kind: DefKind::Impl,
                     detail: format!("{} :: {}", d.name, d.service),
                 },
+                Decl::Const(d) => {
+                    let ty =
+                        self.consts.get(&d.name).map(|i| i.ty.clone()).unwrap_or(Type::Unknown);
+                    DefInfo {
+                        name: d.name.clone(),
+                        span: d.name_span,
+                        kind: DefKind::Const,
+                        detail: format!("{} : {}", d.name, self.render(&ty)),
+                    }
+                }
                 Decl::Func(d) => DefInfo {
                     name: d.name.clone(),
                     span: d.name_span,

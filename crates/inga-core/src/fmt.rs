@@ -188,6 +188,22 @@ impl Printer {
                 Decl::Service(d) => self.print_service(d),
                 Decl::Impl(d) => self.print_impl(d),
                 Decl::Func(d) => self.print_func(d, 0),
+                Decl::Const(d) => {
+                    self.flush_comments_before(d.span.start, 0);
+                    self.blank_line_if_gap(self.lines.line(d.span.start));
+                    self.out.push_str(pub_prefix(d.is_pub));
+                    if let Some(TypeExpr::Name(ty, _)) = &d.ty {
+                        self.out.push_str(ty);
+                        self.out.push(' ');
+                    }
+                    self.out.push_str(&d.name);
+                    self.out.push_str(" = ");
+                    let rendered = self.render_expr(&d.value, 0);
+                    self.out.push_str(&rendered);
+                    self.attach_trailing_comment(d.span.end);
+                    self.out.push('\n');
+                    self.prev_end_line = Some(self.lines.line(d.span.end));
+                }
             }
             i += 1;
         }
@@ -727,6 +743,7 @@ fn decl_span(decl: &Decl) -> Span {
         Decl::Service(d) => d.span,
         Decl::Impl(d) => d.span,
         Decl::Func(d) => d.span,
+        Decl::Const(d) => d.span,
     }
 }
 

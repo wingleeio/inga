@@ -1010,6 +1010,44 @@ fn named_field_construction_is_checked() {
 }
 
 #[test]
+fn top_level_constants() {
+    let out = run(r#"
+use std/fiber
+
+maxRetries = 3
+greeting = "hello, ${maxRetries} retries"
+Int port = 8000 + 80
+names = ["ada", "grace"]
+derived = maxRetries * 10
+
+shout :: (Int i) -> String {
+    at(names, i) |> getOrElse("?") |> toUpper
+}
+
+main :: () {
+    provide Runtime(2)
+    println(maxRetries, port, derived)
+    println(greeting)
+    println(fiber.parMap([0, 1], shout) |> catch { other -> [] })
+}
+"#);
+    assert_eq!(out, "3 8080 30\nhello, 3 retries\n[\"ADA\", \"GRACE\"]\n");
+}
+
+#[test]
+fn constants_are_pure_and_ordered() {
+    let errs = check_errors("early = late + 1\nlate = 2\n\nmain :: () {\n    println(early)\n}\n");
+    assert!(
+        errs.iter().any(|e| e.contains("not initialized yet")),
+        "{errs:?}"
+    );
+    let errs = check_errors(
+        "risky = { fail \"no\" }\n\nmain :: () {\n    println(risky)\n}\n",
+    );
+    assert!(errs.iter().any(|e| e.contains("constants are pure")), "{errs:?}");
+}
+
+#[test]
 fn string_template_patterns_route() {
     let out = run(r#"
 route :: (String path) -> String {

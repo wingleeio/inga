@@ -223,6 +223,7 @@ impl<'a> Cg<'a> {
         let mut next_tag_id = self.tag_ids.len() as i64;
         for decl in &self.program.decls {
             match decl {
+                Decl::Const(_) => {}
                 Decl::Struct(d) => {
                     self.struct_meta
                         .insert(d.name.clone(), d.fields.iter().map(|f| f.name.clone()).collect());
@@ -362,19 +363,25 @@ impl<'a> Cg<'a> {
         // registered first (show/==/encode/copy interpret it).
         let table = self.type_descs.join("\n");
         let table_const = self.str_const(&table);
+        self.gen_consts_init();
+        let consts_init = if self.info.facts.consts.is_empty() {
+            ""
+        } else {
+            "  call i64 @ing.consts.init()\n"
+        };
         match self.test_main.clone() {
             Some(tests) => {
                 // Test mode: the harness's failure count is the exit code.
                 self.gen_test_main(&tests);
                 let _ = write!(
                     self.functions,
-                    "define i32 @main() {{\nentry:\n  call void @rt_types_init(i64 {table_const})\n  %r = call i64 @ing.testmain()\n  %c = trunc i64 %r to i32\n  ret i32 %c\n}}\n\n"
+                    "define i32 @main() {{\nentry:\n  call void @rt_types_init(i64 {table_const})\n{consts_init}  %r = call i64 @ing.testmain()\n  %c = trunc i64 %r to i32\n  ret i32 %c\n}}\n\n"
                 );
             }
             None => {
                 let _ = write!(
                     self.functions,
-                    "define i32 @main() {{\nentry:\n  call void @rt_types_init(i64 {table_const})\n  call i64 @ing.fn.main()\n  ret i32 0\n}}\n\n"
+                    "define i32 @main() {{\nentry:\n  call void @rt_types_init(i64 {table_const})\n{consts_init}  call i64 @ing.fn.main()\n  ret i32 0\n}}\n\n"
                 );
             }
         }
@@ -611,6 +618,51 @@ impl<'a> Cg<'a> {
             f.ret(self, &value, ret_cty.as_ref());
             self.emit_fn(&format!("@ing.m.{}.{}", decl.name, method.name), &params, f);
         }
+    }
+
+    /// Top-level constants: a global slot each, filled by `ing.consts.init`
+    /// (called from @main before user code) in declaration order. Values are
+    /// deep-frozen so fibers can read them without racing refcounts.
+    fn gen_consts_init(&mut self) {
+        if self.info.facts.consts.is_empty() {
+            return;
+        }
+        for (name, _) in self.info.facts.consts.clone() {
+            let _ = writeln!(self.globals, "@ing.const.{name} = global i64 0");
+        }
+        let mut f = FnCtx::new(false);
+        let const_decls: Vec<&ConstDecl> = self
+            .program
+            .decls
+            .iter()
+            .filter_map(|d| match d {
+                Decl::Const(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        for d in const_decls {
+            let cty = self
+                .info
+                .facts
+                .consts
+                .iter()
+                .find(|(n, _)| n == &d.name)
+                .map(|(_, c)| c.clone())
+                .unwrap_or(CType::Int);
+            let v = self.gen_expr(&mut f, &d.value);
+            // The global takes its own reference (the pool releases the
+            // value's creation reference at the end of init).
+            self.dup_value(&mut f, &v, &cty);
+            f.line(format!("store i64 {v}, ptr @ing.const.{}", d.name));
+            if self.is_rc(&cty) {
+                let addr = self.tmp();
+                f.line(format!("{addr} = ptrtoint ptr @ing.const.{} to i64", d.name));
+                let desc = self.desc_const(&cty);
+                f.line(format!("call void @rt_freeze_slot(i64 {addr}, i64 {desc})"));
+            }
+        }
+        f.ret(self, "0", None);
+        self.emit_fn("@ing.consts.init", &[], f);
     }
 
     fn emit_fn(&mut self, name: &str, params: &[String], f: FnCtx) {
@@ -875,6 +927,11 @@ impl<'a> Cg<'a> {
             "true" => return "1".to_string(),
             "false" => return "0".to_string(),
             _ => {}
+        }
+        if self.info.facts.consts.iter().any(|(n, _)| n == name) {
+            let v = self.tmp();
+            f.line(format!("{v} = load i64, ptr @ing.const.{name}"));
+            return v;
         }
         if let Some(vmeta) = self.variant_meta.get(name).cloned() {
             if vmeta.fields.is_empty() {

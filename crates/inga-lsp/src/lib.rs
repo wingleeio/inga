@@ -380,6 +380,7 @@ impl Server {
                     inga_core::check::DefKind::Service => CompletionItemKind::INTERFACE,
                     inga_core::check::DefKind::Impl => CompletionItemKind::MODULE,
                     inga_core::check::DefKind::Method => CompletionItemKind::METHOD,
+                    inga_core::check::DefKind::Const => CompletionItemKind::CONSTANT,
                 }),
                 detail: Some(def.detail.clone()),
                 ..Default::default()
@@ -671,6 +672,7 @@ impl Server {
                 Decl::Struct(d) if d.is_pub => (d.name.clone(), CompletionItemKind::STRUCT),
                 Decl::Enum(d) if d.is_pub => (d.name.clone(), CompletionItemKind::ENUM),
                 Decl::Service(d) if d.is_pub => (d.name.clone(), CompletionItemKind::INTERFACE),
+                Decl::Const(d) if d.is_pub => (d.name.clone(), CompletionItemKind::CONSTANT),
                 Decl::Impl(d) if d.is_pub => (d.name.clone(), CompletionItemKind::MODULE),
                 _ => continue,
             };
@@ -1008,6 +1010,7 @@ fn sibling_exports(uri: &Url, docs: &HashMap<Url, String>) -> Vec<Export> {
                     (d.name.clone(), CompletionItemKind::ENUM)
                 }
                 Decl::Service(d) if d.is_pub => (d.name.clone(), CompletionItemKind::INTERFACE),
+                Decl::Const(d) if d.is_pub => (d.name.clone(), CompletionItemKind::CONSTANT),
                 Decl::Impl(d) if d.is_pub => (d.name.clone(), CompletionItemKind::MODULE),
                 _ => continue,
             };

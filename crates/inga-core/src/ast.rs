@@ -24,6 +24,19 @@ pub enum Decl {
     Impl(ImplDecl),
     /// `getUserById :: (id) { ... }`
     Func(FuncDecl),
+    /// `maxRetries = 3` — a top-level constant, evaluated once at startup
+    /// in declaration order. Initializers are pure (no `!`, no `uses`).
+    Const(ConstDecl),
+}
+
+#[derive(Debug)]
+pub struct ConstDecl {
+    pub is_pub: bool,
+    pub ty: Option<TypeExpr>,
+    pub name: String,
+    pub name_span: Span,
+    pub value: Expr,
+    pub span: Span,
 }
 
 #[derive(Debug)]

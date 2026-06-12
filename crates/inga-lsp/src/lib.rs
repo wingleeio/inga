@@ -13,16 +13,18 @@ use lsp_types::notification::{
     PublishDiagnostics,
 };
 use lsp_types::request::{
-    Completion, Formatting, GotoDefinition, HoverRequest, Request as _, SemanticTokensFullRequest,
+    CodeActionRequest, Completion, Formatting, GotoDefinition, HoverRequest, Request as _,
+    SemanticTokensFullRequest,
 };
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionOptions, CompletionResponse, Diagnostic,
-    DiagnosticSeverity, GotoDefinitionResponse, Hover, HoverContents, HoverProviderCapability,
-    InitializeParams, Location, MarkedString, OneOf, Position, PublishDiagnosticsParams, Range,
-    SemanticToken, SemanticTokenType, SemanticTokens, SemanticTokensFullOptions,
-    SemanticTokensLegend, SemanticTokensOptions, SemanticTokensResult,
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionProviderCapability,
+    CodeActionResponse, CompletionItem, CompletionItemKind, CompletionOptions, CompletionResponse,
+    Diagnostic, DiagnosticSeverity, GotoDefinitionResponse, Hover, HoverContents,
+    HoverProviderCapability, InitializeParams, Location, MarkedString, OneOf, Position,
+    PublishDiagnosticsParams, Range, SemanticToken, SemanticTokenType, SemanticTokens,
+    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensResult,
     SemanticTokensServerCapabilities, ServerCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextEdit, Url,
+    TextDocumentSyncKind, TextEdit, Url, WorkspaceEdit,
 };
 
 use inga_core::check_source as check_single;
@@ -96,6 +98,7 @@ pub fn run_server() {
         definition_provider: Some(OneOf::Left(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions::default()),
+        code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
             SemanticTokensOptions {
                 legend: SemanticTokensLegend {
@@ -230,6 +233,11 @@ impl Server {
             Completion::METHOD => {
                 let (id, params) = cast::<Completion>(req)?;
                 let result = self.completion(params);
+                Some(Response::new_ok(id, result))
+            }
+            CodeActionRequest::METHOD => {
+                let (id, params) = cast::<CodeActionRequest>(req)?;
+                let result = self.code_action(params);
                 Some(Response::new_ok(id, result))
             }
             _ => Some(Response::new_ok(id, serde_json::Value::Null)),
@@ -371,7 +379,7 @@ impl Server {
             });
         }
         for keyword in
-            ["use", "pub", "struct", "enum", "service", "match", "catch", "fail", "provide", "uses", "lazy", "if", "else"]
+            ["use", "pub", "shared", "struct", "enum", "service", "match", "catch", "fail", "provide", "uses", "lazy", "if", "else"]
         {
             items.push(CompletionItem {
                 label: keyword.to_string(),
@@ -379,8 +387,296 @@ impl Server {
                 ..Default::default()
             });
         }
+        // Names from sibling modules and std module aliases: completing one
+        // also inserts (or extends) the `use` line.
+        for export in sibling_exports(&uri, &self.documents) {
+            match import_state(src, &export.module, Some(&export.import_name)) {
+                ImportState::Needs(edit) => items.push(CompletionItem {
+                    label: export.label.clone(),
+                    kind: Some(export.kind),
+                    detail: Some(format!(
+                        "auto-import from `{}`{}",
+                        export.module,
+                        if export.label != export.import_name {
+                            format!(" (imports `{}`)", export.import_name)
+                        } else {
+                            String::new()
+                        }
+                    )),
+                    additional_text_edits: Some(vec![edit]),
+                    ..Default::default()
+                }),
+                ImportState::Imported => items.push(CompletionItem {
+                    label: export.label.clone(),
+                    kind: Some(export.kind),
+                    detail: Some(format!("from `{}`", export.module)),
+                    ..Default::default()
+                }),
+                ImportState::Qualified => {}
+            }
+        }
+        for (alias, target) in STD_ALIASES {
+            if let ImportState::Needs(edit) = import_state(src, target, None) {
+                items.push(CompletionItem {
+                    label: alias.to_string(),
+                    kind: Some(CompletionItemKind::MODULE),
+                    detail: Some(format!("auto-import `use {target}`")),
+                    additional_text_edits: Some(vec![edit]),
+                    ..Default::default()
+                });
+            }
+        }
         Some(CompletionResponse::Array(items))
     }
+
+    /// Quick fixes (cmd+.): on an unknown-name family diagnostic, offer the
+    /// imports that would resolve it.
+    fn code_action(&self, params: lsp_types::CodeActionParams) -> Option<CodeActionResponse> {
+        let uri = params.text_document.uri;
+        let src = self.documents.get(&uri)?;
+        let lines = LineIndex::new(src);
+        let (checked, _mods, _base) = check_document(&uri, src, &self.documents);
+        let overlaps = |s: Span| {
+            let r = span_range(src, &lines, s);
+            !(r.end.line < params.range.start.line
+                || r.start.line > params.range.end.line
+                || (r.end.line == params.range.start.line
+                    && r.end.character < params.range.start.character)
+                || (r.start.line == params.range.end.line
+                    && r.start.character > params.range.end.character))
+        };
+        let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+        let mut offered: Vec<String> = Vec::new();
+        let exports = sibling_exports(&uri, &self.documents);
+        for d in checked.diagnostics.iter().filter(|d| overlaps(d.span)) {
+            let unknown = ["unknown name `", "unknown type `", "unknown constructor `",
+                "unknown service `", "unknown implementation `"]
+                .iter()
+                .any(|p| d.message.starts_with(p))
+                || d.message.contains("module is not imported");
+            if !unknown {
+                continue;
+            }
+            let Some(name) = d.message.split('`').nth(1) else { continue };
+            let diag = Diagnostic {
+                range: span_range(src, &lines, d.span),
+                severity: Some(DiagnosticSeverity::ERROR),
+                source: Some("inga".to_string()),
+                message: d.message.clone(),
+                ..Default::default()
+            };
+            let mut offer = |title: String, edit: TextEdit, actions: &mut Vec<CodeActionOrCommand>| {
+                if offered.contains(&title) {
+                    return;
+                }
+                offered.push(title.clone());
+                let mut changes = HashMap::new();
+                changes.insert(uri.clone(), vec![edit]);
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title,
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![diag.clone()]),
+                    edit: Some(WorkspaceEdit { changes: Some(changes), ..Default::default() }),
+                    is_preferred: Some(true),
+                    ..Default::default()
+                }));
+            };
+            // A std module alias: `schedule.upTo(...)` without the import.
+            for (alias, target) in STD_ALIASES {
+                if name == alias {
+                    if let ImportState::Needs(edit) = import_state(src, target, None) {
+                        offer(format!("Add `use {target}`"), edit, &mut actions);
+                    }
+                }
+            }
+            // A pub name (or enum variant) from a sibling module.
+            for export in exports.iter().filter(|e| e.label == name) {
+                if let ImportState::Needs(edit) =
+                    import_state(src, &export.module, Some(&export.import_name))
+                {
+                    let title = if export.label != export.import_name {
+                        format!(
+                            "Import `{}` from `{}` (brings `{}`)",
+                            export.import_name, export.module, export.label
+                        )
+                    } else {
+                        format!("Import `{}` from `{}`", export.import_name, export.module)
+                    };
+                    offer(title, edit, &mut actions);
+                }
+            }
+        }
+        Some(actions)
+    }
+}
+
+// ---- auto-import -------------------------------------------------------------
+//
+// Two surfaces share this machinery: completion items for not-yet-imported
+// names (the `use` line arrives via additionalTextEdits), and quick fixes
+// (cmd+.) on "unknown name/type/..." diagnostics.
+
+/// One importable name from a sibling module (or a std module alias).
+struct Export {
+    /// The name a `use mod { name }` would bring in.
+    import_name: String,
+    /// What completing it inserts (= import_name, except enum variants,
+    /// which are reachable by importing their enum).
+    label: String,
+    kind: CompletionItemKind,
+    /// `use` path: `cards`, `std/fiber`, ...
+    module: String,
+}
+
+const STD_ALIASES: [(&str, &str); 3] = [
+    ("graphics", "std/graphics"),
+    ("schedule", "std/schedule"),
+    ("fiber", "std/fiber"),
+];
+
+/// Parse a source text, ignoring diagnostics (good enough for listing decls).
+fn parse_loose(src: &str) -> inga_core::ast::Program {
+    let mut diags = Vec::new();
+    let tokens = inga_core::lexer::lex(src, &mut diags);
+    inga_core::parser::parse(tokens, &mut diags)
+}
+
+/// Every `pub` name exported by the open file's sibling modules. Open
+/// documents win over the disk copies.
+fn sibling_exports(uri: &Url, docs: &HashMap<Url, String>) -> Vec<Export> {
+    use inga_core::ast::Decl;
+    let mut out = Vec::new();
+    let Ok(path) = uri.to_file_path() else { return out };
+    let Some(dir) = path.parent() else { return out };
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("inga") || p == path {
+            continue;
+        }
+        let Some(module) = p.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+            continue;
+        };
+        let src = Url::from_file_path(&p)
+            .ok()
+            .and_then(|u| docs.get(&u).cloned())
+            .or_else(|| std::fs::read_to_string(&p).ok());
+        let Some(src) = src else { continue };
+        for decl in &parse_loose(&src).decls {
+            let (name, kind) = match decl {
+                Decl::Func(d) if d.is_pub => (d.name.clone(), CompletionItemKind::FUNCTION),
+                Decl::Struct(d) if d.is_pub => (d.name.clone(), CompletionItemKind::STRUCT),
+                Decl::Enum(d) if d.is_pub => {
+                    // Importing the enum also grants its variants.
+                    for v in &d.variants {
+                        out.push(Export {
+                            import_name: d.name.clone(),
+                            label: v.name.clone(),
+                            kind: CompletionItemKind::ENUM_MEMBER,
+                            module: module.clone(),
+                        });
+                    }
+                    (d.name.clone(), CompletionItemKind::ENUM)
+                }
+                Decl::Service(d) if d.is_pub => (d.name.clone(), CompletionItemKind::INTERFACE),
+                Decl::Impl(d) if d.is_pub => (d.name.clone(), CompletionItemKind::MODULE),
+                _ => continue,
+            };
+            out.push(Export { import_name: name.clone(), label: name, kind, module: module.clone() });
+        }
+    }
+    out
+}
+
+/// The open file's `use` declarations: (path text, selective names, decl span).
+fn current_imports(src: &str) -> Vec<(String, Option<Vec<String>>, Span)> {
+    parse_loose(src)
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            inga_core::ast::Decl::Use(u) => Some((
+                u.path.join("/"),
+                u.names.as_ref().map(|ns| ns.iter().map(|(n, _)| n.clone()).collect()),
+                u.span,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// How a name from `module` relates to the open file's imports.
+enum ImportState {
+    /// Not imported: the edit adds/extends a `use` line.
+    Needs(TextEdit),
+    /// Already reachable unqualified — nothing to do.
+    Imported,
+    /// The module is plain-imported (qualified alias); adding a selective
+    /// line too would be ambiguous — offer nothing.
+    Qualified,
+}
+
+/// Compute the edit that makes `selective` (or, for std modules, the
+/// qualified alias) available: extend an existing selective `use`, or
+/// insert a new line after the last `use` / the leading comment block.
+fn import_state(src: &str, module: &str, selective: Option<&str>) -> ImportState {
+    let lines = LineIndex::new(src);
+    let imports = current_imports(src);
+    let mut last_use_end: Option<u32> = None;
+    for (target, names, span) in &imports {
+        last_use_end = Some(last_use_end.unwrap_or(0).max(span.end));
+        if target != module {
+            continue;
+        }
+        match (selective, names) {
+            (None, _) => return ImportState::Imported,
+            (Some(n), Some(names)) => {
+                if names.iter().any(|x| x == n) {
+                    return ImportState::Imported;
+                }
+                // Extend the brace list; the formatter re-wraps long lines.
+                let mut all: Vec<String> = names.clone();
+                all.push(n.to_string());
+                all.sort();
+                let text = format!("use {module} {{ {} }}", all.join(", "));
+                return ImportState::Needs(TextEdit {
+                    range: span_range(src, &lines, *span),
+                    new_text: text,
+                });
+            }
+            (Some(_), None) => return ImportState::Qualified,
+        }
+    }
+    // No import of this module yet: insert a fresh line.
+    let line_text = match selective {
+        Some(n) => format!("use {module} {{ {n} }}\n"),
+        None => format!("use {module}\n"),
+    };
+    let insert_at = match last_use_end {
+        Some(end) => {
+            // The line after the last use decl.
+            let (line, _) = lines.line_col_utf16(src, end);
+            Position::new(line + 1, 0)
+        }
+        None => {
+            // After the leading comment block (and its trailing blank).
+            let mut line = 0u32;
+            for (i, l) in src.lines().enumerate() {
+                if l.trim_start().starts_with("//") || l.trim().is_empty() {
+                    line = i as u32 + 1;
+                } else {
+                    break;
+                }
+            }
+            return ImportState::Needs(TextEdit {
+                range: Range { start: Position::new(line, 0), end: Position::new(line, 0) },
+                new_text: format!("{line_text}\n"),
+            });
+        }
+    };
+    ImportState::Needs(TextEdit {
+        range: Range { start: insert_at, end: insert_at },
+        new_text: line_text,
+    })
 }
 
 fn cast<R: lsp_types::request::Request>(req: Request) -> Option<(RequestId, R::Params)> {
@@ -581,4 +877,124 @@ fn span_range(src: &str, lines: &LineIndex, span: Span) -> Range {
     let (sl, sc) = lines.line_col_utf16(src, span.start);
     let (el, ec) = lines.line_col_utf16(src, span.end);
     Range { start: Position::new(sl, sc), end: Position::new(el, ec) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn edit_text(state: ImportState) -> TextEdit {
+        match state {
+            ImportState::Needs(e) => e,
+            _ => panic!("expected an edit"),
+        }
+    }
+
+    #[test]
+    fn import_inserts_after_leading_comments() {
+        let src = "// a comment\n// more\n\nmain :: () {\n    fiber.fork(1)\n}\n";
+        let e = edit_text(import_state(src, "std/fiber", None));
+        assert_eq!(e.range.start, Position::new(3, 0));
+        assert_eq!(e.new_text, "use std/fiber\n\n");
+    }
+
+    #[test]
+    fn import_inserts_after_last_use() {
+        let src = "use std/graphics\nuse cards { rankName }\n\nmain :: () {\n}\n";
+        let e = edit_text(import_state(src, "std/fiber", None));
+        assert_eq!(e.range.start, Position::new(2, 0));
+        assert_eq!(e.new_text, "use std/fiber\n");
+    }
+
+    #[test]
+    fn import_extends_selective_list_sorted() {
+        let src = "use cards { rankName, suitCol }\n\nmain :: () {\n}\n";
+        let e = edit_text(import_state(src, "cards", Some("chipsOf")));
+        assert_eq!(e.new_text, "use cards { chipsOf, rankName, suitCol }");
+        assert_eq!(e.range.start, Position::new(0, 0));
+    }
+
+    #[test]
+    fn import_recognizes_existing_and_qualified() {
+        let src = "use cards { rankName }\nuse jokers\n";
+        assert!(matches!(import_state(src, "cards", Some("rankName")), ImportState::Imported));
+        assert!(matches!(import_state(src, "jokers", None), ImportState::Imported));
+        assert!(matches!(import_state(src, "jokers", Some("jokerName")), ImportState::Qualified));
+    }
+
+    #[test]
+    fn sibling_exports_and_quick_fixes_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("inga-lsp-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("geometry.inga"),
+            "pub enum Shape = Circle { Float radius } | Dot\n\npub area :: (Shape s) -> Float {\n    1.0\n}\n\nsecret :: () -> Int {\n    1\n}\n",
+        )
+        .unwrap();
+        let main_path = dir.join("main.inga");
+        let main_src = "main :: () {\n    println(area(Circle(2.0)))\n    schedule.fixed(1.millis)\n}\n";
+        std::fs::write(&main_path, main_src).unwrap();
+
+        let uri = Url::from_file_path(&main_path).unwrap();
+        let mut docs = HashMap::new();
+        docs.insert(uri.clone(), main_src.to_string());
+
+        // Exports: pub names + variants via their enum; private excluded.
+        let exports = sibling_exports(&uri, &docs);
+        let labels: Vec<&str> = exports.iter().map(|e| e.label.as_str()).collect();
+        assert!(labels.contains(&"area"), "got: {labels:?}");
+        assert!(labels.contains(&"Shape"));
+        assert!(labels.contains(&"Circle"));
+        assert!(!labels.contains(&"secret"));
+        let circle = exports.iter().find(|e| e.label == "Circle").unwrap();
+        assert_eq!(circle.import_name, "Shape");
+
+        // Quick fixes on the unknown names.
+        let server = Server { documents: docs };
+        let params = lsp_types::CodeActionParams {
+            text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+            range: Range { start: Position::new(0, 0), end: Position::new(4, 0) },
+            context: Default::default(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let actions = server.code_action(params).unwrap();
+        let titles: Vec<String> = actions
+            .iter()
+            .map(|a| match a {
+                CodeActionOrCommand::CodeAction(c) => c.title.clone(),
+                CodeActionOrCommand::Command(c) => c.title.clone(),
+            })
+            .collect();
+        assert!(
+            titles.iter().any(|t| t == "Import `area` from `geometry`"),
+            "got: {titles:?}"
+        );
+        assert!(
+            titles.iter().any(|t| t == "Import `Shape` from `geometry` (brings `Circle`)"),
+            "got: {titles:?}"
+        );
+        assert!(titles.iter().any(|t| t == "Add `use std/schedule`"), "got: {titles:?}");
+
+        // Completions carry the auto-import edit.
+        let completion_params = lsp_types::CompletionParams {
+            text_document_position: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(1, 4),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+        let Some(CompletionResponse::Array(items)) = server.completion(completion_params) else {
+            panic!("no completions");
+        };
+        let area = items.iter().find(|i| i.label == "area").expect("area completion");
+        let edits = area.additional_text_edits.as_ref().expect("auto-import edit");
+        assert_eq!(edits[0].new_text, "use geometry { area }\n\n");
+        let sched = items.iter().find(|i| i.label == "schedule").expect("schedule completion");
+        assert!(sched.additional_text_edits.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

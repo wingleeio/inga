@@ -194,6 +194,13 @@ impl<'a> Cg<'a> {
         self.struct_meta.insert("NetError".into(), vec!["message".into()]);
         self.struct_meta.insert("Socket".into(), vec!["handle".into()]);
         self.struct_meta.insert("Listener".into(), vec!["handle".into()]);
+        self.struct_meta.insert(
+            "DateTime".into(),
+            ["year", "month", "day", "hour", "minute", "second", "millis"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
         for (i, tag) in [
             "DecodeError",
             "AssertionError",
@@ -1091,6 +1098,9 @@ impl<'a> Cg<'a> {
                     if module == "net" {
                         return self.gen_net(f, name, args, span);
                     }
+                    if module == "time" {
+                        return self.gen_time(f, name, args, span);
+                    }
                     if let Some(v) = self.gen_qualified(f, module, name, args, span) {
                         return v;
                     }
@@ -1286,6 +1296,9 @@ impl<'a> Cg<'a> {
                 }
                 if module == "net" {
                     return self.gen_net(f, name, args, span);
+                }
+                if module == "time" {
+                    return self.gen_time(f, name, args, span);
                 }
                 if let Some(v) = self.gen_qualified(f, module, name, args, span) {
                     return v;
@@ -4087,6 +4100,35 @@ impl<'a> Cg<'a> {
         a
     }
 
+    /// `time.*` — std/time: the wall clock.
+    fn gen_time(&mut self, f: &mut FnCtx, name: &str, args: &[&Expr], span: Span) -> String {
+        match (name, args.len()) {
+            ("now", 0) => {
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_time_now()"));
+                out
+            }
+            ("utc", 1) => {
+                let t = self.gen_expr(f, args[0]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_time_utc(i64 {t})"));
+                self.pool_value(f, &out, &CType::Struct("DateTime".into()));
+                out
+            }
+            ("iso", 1) => {
+                let t = self.gen_expr(f, args[0]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_time_iso(i64 {t})"));
+                self.pool_value(f, &out, &CType::Str);
+                out
+            }
+            _ => {
+                self.unsupported(span, "this `time` operation shape");
+                "0".to_string()
+            }
+        }
+    }
+
     /// `net.*` — std/net: raw TCP, blocking on the calling fiber's thread.
     fn gen_net(&mut self, f: &mut FnCtx, name: &str, args: &[&Expr], span: Span) -> String {
         // Socket/Listener structs carry the registry handle in slot 0.
@@ -5363,6 +5405,9 @@ declare i64 @rt_byte_at(i64, i64)
 declare i64 @rt_int_to_bytes(i64, i64)
 declare i64 @rt_bytes_to_int(i64, i64, i64)
 declare i64 @rt_bytes_from_list(i64)
+declare i64 @rt_time_now()
+declare i64 @rt_time_utc(i64)
+declare i64 @rt_time_iso(i64)
 declare i64 @rt_net_connect(i64, i64)
 declare i64 @rt_net_listen(i64)
 declare i64 @rt_net_accept(i64)

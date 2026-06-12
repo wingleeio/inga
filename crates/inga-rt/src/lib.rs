@@ -2636,6 +2636,58 @@ pub extern "C" fn rt_process_exit(code: i64) {
     std::process::exit(code as i32);
 }
 
+// ---- wall-clock time ---------------------------------------------------------------
+
+/// Unix time in milliseconds (wall clock; nowMillis is monotonic).
+#[no_mangle]
+pub extern "C" fn rt_time_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Civil date from unix days (Howard Hinnant's algorithm) — no deps.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn utc_parts(millis: i64) -> (i64, i64, i64, i64, i64, i64, i64) {
+    let days = millis.div_euclid(86_400_000);
+    let ms_of_day = millis.rem_euclid(86_400_000);
+    let (year, month, day) = civil_from_days(days);
+    let (hour, minute) = (ms_of_day / 3_600_000, ms_of_day % 3_600_000 / 60_000);
+    let (second, ms) = (ms_of_day % 60_000 / 1000, ms_of_day % 1000);
+    (year, month, day, hour, minute, second, ms)
+}
+
+/// DateTime { year, month, day, hour, minute, second, millis } in UTC.
+#[no_mangle]
+pub extern "C" fn rt_time_utc(millis: i64) -> i64 {
+    let (year, month, day, hour, minute, second, ms) = utc_parts(millis);
+    let p = rt_alloc(56) as *mut i64;
+    for (i, v) in [year, month, day, hour, minute, second, ms].iter().enumerate() {
+        unsafe { *p.add(i) = *v };
+    }
+    p as i64
+}
+
+/// "YYYY-MM-DDTHH:MM:SS.mmmZ".
+#[no_mangle]
+pub extern "C" fn rt_time_iso(millis: i64) -> i64 {
+    let (y, mo, d, h, mi, s, ms) = utc_parts(millis);
+    make_str(format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{ms:03}Z").as_bytes())
+}
+
 // ---- strings: predicates and transforms -------------------------------------------
 
 fn str_pair<'a>(a: i64, b: i64) -> (&'a [u8], &'a [u8]) {

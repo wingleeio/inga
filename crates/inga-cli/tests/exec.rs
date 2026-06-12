@@ -569,6 +569,24 @@ fn process_args_and_exit() {
 }
 
 #[test]
+fn wall_clock_time_and_utc_parts() {
+    let out = run(r#"
+use std/time
+
+main :: () {
+    d = time.utc(1718200496789)
+    println(d.year, d.month, d.day, d.hour, d.minute, d.second, d.millis)
+    println(time.iso(1718200496789), time.iso(0))
+    println(time.now() > 1700000000000)
+}
+"#);
+    assert_eq!(
+        out,
+        "2024 6 12 13 54 56 789\n2024-06-12T13:54:56.789Z 1970-01-01T00:00:00.000Z\ntrue\n"
+    );
+}
+
+#[test]
 fn net_tcp_echo_round_trip() {
     let out = run(r#"
 use std/fiber

@@ -318,6 +318,7 @@ impl<'a> Checker<'a> {
             NET_ERROR,
             "Socket",
             "Listener",
+            "DateTime",
         ] {
             let fields = builtin_struct_fields(name)
                 .iter()
@@ -1837,6 +1838,7 @@ impl<'a> Checker<'a> {
             "std/fs" => return self.check_fs_call(member, member_span, args, span),
             "std/process" => return self.check_process_call(member, member_span, args, span),
             "std/net" => return self.check_net_call(member, member_span, args, span),
+            "std/time" => return self.check_time_call(member, member_span, args, span),
             _ => {}
         }
         let Some(target) = self.modules.iter().position(|m| m.key == import.target) else {
@@ -2577,6 +2579,64 @@ impl<'a> Checker<'a> {
                 self.error(
                     member_span,
                     format!("`std/fs` has no member `{member}` (read, write, append, exists, list, remove, createDir, open, readAt, writeAt, size, sync, close)"),
+                );
+                for arg in args {
+                    self.check_expr(arg);
+                }
+                Type::Unknown
+            }
+        }
+    }
+
+    /// `time.*` — std/time: the wall clock. Ambient like `env` and
+    /// `nowMillis` — reading the clock is not an effect worth a row.
+    fn check_time_call(
+        &mut self,
+        member: &str,
+        member_span: Span,
+        args: &[&Expr],
+        span: Span,
+    ) -> Type {
+        let arity = |s: &mut Self, n: usize| -> bool {
+            if args.len() != n {
+                s.error(
+                    span,
+                    format!("`time.{member}` expects {n} argument(s), found {}", args.len()),
+                );
+                for arg in args {
+                    s.check_expr(arg);
+                }
+                return false;
+            }
+            true
+        };
+        match member {
+            "now" => {
+                if !arity(self, 0) {
+                    return Type::Unknown;
+                }
+                Type::Int
+            }
+            "utc" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                let t = self.check_expr(args[0]);
+                self.unify_at(&Type::Int, &t, args[0].span, "time argument");
+                Type::Named("DateTime".into())
+            }
+            "iso" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                let t = self.check_expr(args[0]);
+                self.unify_at(&Type::Int, &t, args[0].span, "time argument");
+                Type::Str
+            }
+            _ => {
+                self.error(
+                    member_span,
+                    format!("`std/time` has no member `{member}` (now, utc, iso)"),
                 );
                 for arg in args {
                     self.check_expr(arg);
@@ -4770,6 +4830,13 @@ impl<'a> Checker<'a> {
                 ));
                 return;
             }
+            "std/time" => {
+                self.info.hovers.push((
+                    u.path_span,
+                    "std/time — wall clock: time.now() unix millis, time.utc(millis) -> DateTime, time.iso(millis)".to_string(),
+                ));
+                return;
+            }
             _ => {}
         }
         let ref_module = self.module_of(u.path_span);
@@ -4923,6 +4990,15 @@ pub fn builtin_struct_fields(name: &str) -> &'static [(&'static str, &'static st
         "File" => &[("handle", "Int")],
         "NetError" => &[("message", "String")],
         "Socket" | "Listener" => &[("handle", "Int")],
+        "DateTime" => &[
+            ("year", "Int"),
+            ("month", "Int"),
+            ("day", "Int"),
+            ("hour", "Int"),
+            ("minute", "Int"),
+            ("second", "Int"),
+            ("millis", "Int"),
+        ],
         _ => &[],
     }
 }
@@ -4952,6 +5028,11 @@ pub fn std_module_members(target: &str) -> &'static [(&'static str, &'static str
         "std/json" => &[
             ("encode", "json.encode(value) -> String — JSON"),
             ("decode", "json.decode(raw, StructName) -> a ! DecodeError — parse JSON into a struct"),
+        ],
+        "std/time" => &[
+            ("now", "time.now() -> Int — unix milliseconds (wall clock; nowMillis is monotonic)"),
+            ("utc", "time.utc(millis) -> DateTime — { year, month, day, hour, minute, second, millis } in UTC"),
+            ("iso", "time.iso(millis) -> String — YYYY-MM-DDTHH:MM:SS.mmmZ"),
         ],
         "std/net" => &[
             ("connect", "net.connect(host, port) -> Socket ! NetError uses Net"),

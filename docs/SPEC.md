@@ -637,6 +637,17 @@ Ambient like the `env` builtin — process metadata is not an effect worth
 a row. `inga run file.inga a b` forwards `a b` to the program, so
 `process.args()` behaves identically under `run` and in a built binary.
 
+## 8.8 The wall clock: `std/time`
+
+```
+time.now () -> Int            unix milliseconds (nowMillis is monotonic-since-start)
+time.utc (Int millis) -> DateTime   { year, month, day, hour, minute, second, millis } in UTC
+time.iso (Int millis) -> String     YYYY-MM-DDTHH:MM:SS.mmmZ
+```
+
+Ambient like `env`. Timestamps in storage formats are
+`intToBytes(time.now(), 8)`; human-readable ones are `time.iso`.
+
 ## 9. Tooling (all in this repo)
 
 | Tool | Where | Notes |

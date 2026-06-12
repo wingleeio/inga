@@ -22,7 +22,7 @@ use crate::{lexer, parser};
 
 /// Std modules, by full path. Imported like file modules but implemented
 /// by the compiler/runtime.
-pub const STD_MODULES: [&str; 8] = [
+pub const STD_MODULES: [&str; 9] = [
     "std/graphics",
     "std/schedule",
     "std/fiber",
@@ -31,6 +31,7 @@ pub const STD_MODULES: [&str; 8] = [
     "std/fs",
     "std/process",
     "std/net",
+    "std/time",
 ];
 
 /// One `use` in a module, resolved.

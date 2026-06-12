@@ -256,13 +256,16 @@ on two of them.
 
 ## Status
 
-v0.3 — a complete, tested vertical slice: language (structs/enums/tuples,
-record update, generics, exhaustive `match`, typed errors over any value),
+v0.4 — a complete, tested vertical slice: language (structs/enums/tuples,
+named-field construction and record update, generics, exhaustive `match`,
+typed errors over any value),
 inference, a **native-only LLVM backend** (`show`/`==`/`json.encode`/`json.decode`/
 functions-as-values all compile; the reference interpreter served its
 purpose and was removed), Perceus-style ARC + arenas with copy-out,
 **`std/fiber` concurrency** (fork / structural join / settle / race /
-within, `shared` services, drop-is-supervision), a built-in test runner,
+within, `shared` services, drop-is-supervision), a system-level std
+(`std/http` client **and server**, `std/fs`, `std/json`, `std/process`,
+sort/string/number builtins), a built-in test runner,
 formatter, LSP, editor tooling (`cargo test` covers all of it). Not yet: a
 package manager, the M:N fiber scheduler (fibers run thread-per-fiber
 today — same semantics, that's the point of the `Runtime` promise),

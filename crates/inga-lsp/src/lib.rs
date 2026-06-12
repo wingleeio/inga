@@ -756,11 +756,14 @@ struct Export {
     module: String,
 }
 
-const STD_ALIASES: [(&str, &str); 4] = [
+const STD_ALIASES: [(&str, &str); 7] = [
     ("graphics", "std/graphics"),
     ("schedule", "std/schedule"),
     ("fiber", "std/fiber"),
     ("http", "std/http"),
+    ("json", "std/json"),
+    ("fs", "std/fs"),
+    ("process", "std/process"),
 ];
 
 /// Parse a source text, ignoring diagnostics (good enough for listing decls).

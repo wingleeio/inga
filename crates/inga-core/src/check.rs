@@ -289,47 +289,30 @@ impl<'a> Checker<'a> {
             scopes: Vec::new(),
             row_stack: Vec::new(),
         };
-        // Builtin structs available to every program (raised by `decode`
-        // and by `assert`/`assertEq`).
-        for name in [DECODE_ERROR, ASSERT_FAILED] {
+        // Builtin structs available to every program (raised by `decode`,
+        // `assert`/`assertEq`, and std/http) — shapes from one shared table.
+        for name in [DECODE_ERROR, ASSERT_FAILED, "HttpResponse", HTTP_ERROR, "HttpStream"] {
+            let fields = builtin_struct_fields(name)
+                .iter()
+                .map(|(f, t)| {
+                    let ty = match *t {
+                        "Int" => Type::Int,
+                        "String" => Type::Str,
+                        other => unreachable!("unmapped builtin field type {other}"),
+                    };
+                    (f.to_string(), ty)
+                })
+                .collect();
             checker.structs.insert(
                 name.to_string(),
                 StructInfo {
-                    fields: vec![("message".into(), Type::Str)],
+                    fields,
                     name_span: Span::default(),
                     module: CORE_MODULE,
                     is_pub: true,
                 },
             );
         }
-        // std/http data types.
-        checker.structs.insert(
-            "HttpResponse".to_string(),
-            StructInfo {
-                fields: vec![("status".into(), Type::Int), ("body".into(), Type::Str)],
-                name_span: Span::default(),
-                module: CORE_MODULE,
-                is_pub: true,
-            },
-        );
-        checker.structs.insert(
-            HTTP_ERROR.to_string(),
-            StructInfo {
-                fields: vec![("status".into(), Type::Int), ("message".into(), Type::Str)],
-                name_span: Span::default(),
-                module: CORE_MODULE,
-                is_pub: true,
-            },
-        );
-        checker.structs.insert(
-            "HttpStream".to_string(),
-            StructInfo {
-                fields: vec![("handle".into(), Type::Int), ("status".into(), Type::Int)],
-                name_span: Span::default(),
-                module: CORE_MODULE,
-                is_pub: true,
-            },
-        );
         checker.services.insert(
             HTTP_SERVICE.to_string(),
             ServiceInfo {
@@ -1774,6 +1757,15 @@ impl<'a> Checker<'a> {
         args: &[&Expr],
         span: Span,
     ) -> Type {
+        // Every std member hovers with its signature, in one place.
+        if self.record_info {
+            if let Some((_, doc)) = std_module_members(&import.target)
+                .iter()
+                .find(|(n, _)| *n == member)
+            {
+                self.info.hovers.push((member_span, doc.to_string()));
+            }
+        }
         match import.target.as_str() {
             "std/graphics" => return self.check_gfx_call(member, member_span, args, span),
             "std/schedule" => return self.check_schedule_call(member, member_span, args, span),
@@ -4160,6 +4152,67 @@ fn last_span(block: &Block) -> Span {
         Some(Stmt::Bind { value, .. }) => value.span,
         Some(Stmt::Acquire { name_span, .. }) => *name_span,
         None => block.span,
+    }
+}
+
+/// Builtin struct shapes: (field, type) pairs — one table powering the
+/// checker's registrations and the LSP's `.`-member completion.
+pub fn builtin_struct_fields(name: &str) -> &'static [(&'static str, &'static str)] {
+    match name {
+        "HttpResponse" => &[("status", "Int"), ("body", "String")],
+        "HttpError" => &[("status", "Int"), ("message", "String")],
+        "HttpStream" => &[("handle", "Int"), ("status", "Int")],
+        "DecodeError" | "AssertionError" => &[("message", "String")],
+        _ => &[],
+    }
+}
+
+/// The std modules' members with their docs — one table powering checker
+/// hovers and the LSP's `.`-member completion.
+pub fn std_module_members(target: &str) -> &'static [(&'static str, &'static str)] {
+    match target {
+        "std/schedule" => &[
+            ("exponential", "schedule.exponential(base) -> Schedule — delay doubles per attempt"),
+            ("fixed", "schedule.fixed(interval) -> Schedule"),
+            ("upTo", "schedule.upTo(schedule, times) -> Schedule — cap the retry count"),
+        ],
+        "std/fiber" => &[
+            ("fork", "fiber.fork(lazy action) -> Fiber<a ! E> uses Fibers — start now, return immediately; errors surface at the join"),
+            ("join", "fiber.join(fiber | (fibers...) | [fibers]) uses Fibers — park, take the result(s), re-raise the error channel"),
+            ("poll", "fiber.poll(fiber) -> a? ! E uses Fibers — non-blocking probe (frame loops)"),
+            ("interrupt", "fiber.interrupt(fiber) uses Fibers — request cooperative cancellation"),
+            ("settle", "fiber.settle(lazy action) -> Outcome<a ! E> — the error channel as data (row-free)"),
+            ("unsettle", "fiber.unsettle(outcome) -> a ! E — put the error back in the channel"),
+            ("par", "fiber.par(lazy a, lazy b, ...) -> (a, b, ...) uses Fibers — fork all + join"),
+            ("parMap", "fiber.parMap(xs, f) -> [b] ! E uses Fibers — one fiber per element; first failure cancels the batch"),
+            ("race", "fiber.race(lazy a, lazy b) -> a uses Fibers — first completion wins, loser interrupted"),
+            ("within", "fiber.within(lazy action, deadline) -> a ! E, TimeoutError uses Fibers"),
+            ("partition", "fiber.partition(outcomes) -> ([a], [Outcome<a ! E>])"),
+        ],
+        "std/http" => &[
+            ("get", "http.get(url) -> HttpResponse ! HttpError uses Http — a non-2xx status is data, not a failure"),
+            ("post", "http.post(url, body) -> HttpResponse ! HttpError uses Http"),
+            ("send", "http.send(method, url, body, headers) -> HttpResponse ! HttpError uses Http — headers: [(String, String)]"),
+            ("openStream", "http.openStream(url) -> HttpStream ! HttpError uses Http — GET with a streamed body"),
+            ("read", "http.read(stream) -> String? ! HttpError uses Http — next chunk; None at end"),
+            ("close", "http.close(stream) uses Http"),
+        ],
+        "std/graphics" => &[
+            ("run", "graphics.run(width, height, title, frame) — runtime-owned loop; frame runs once per frame"),
+            ("clear", "graphics.clear(r, g, b) — 0–255 channels"),
+            ("rect", "graphics.rect(x, y, w, h, r, g, b, a)"),
+            ("rectLines", "graphics.rectLines(x, y, w, h, thick, r, g, b, a)"),
+            ("circle", "graphics.circle(x, y, radius, r, g, b, a)"),
+            ("text", "graphics.text(s, x, y, size, r, g, b)"),
+            ("textWidth", "graphics.textWidth(s, size) -> Int"),
+            ("mouseX", "graphics.mouseX() -> Int"),
+            ("mouseY", "graphics.mouseY() -> Int"),
+            ("mousePressed", "graphics.mousePressed() -> Bool"),
+            ("shaderNew", "graphics.shaderNew(fragGlsl) -> Int — compile GLSL ES; uniforms iTime, iRes"),
+            ("shaderUse", "graphics.shaderUse(handle)"),
+            ("shaderOff", "graphics.shaderOff()"),
+        ],
+        _ => &[],
     }
 }
 

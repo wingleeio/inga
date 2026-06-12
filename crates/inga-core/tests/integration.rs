@@ -462,3 +462,27 @@ fn asserts_count_toward_the_error_row() {
         "got: {errs:?}"
     );
 }
+
+#[test]
+fn std_module_members_hover_with_signatures() {
+    let src = "use std/fiber\nuse std/http\n\nmain :: () {\n    provide Runtime(1), Http\n    t = (1 + 1) |> fiber.fork\n    println(fiber.join(t))\n    r = http.get(\"http://x\") |> catch { HttpError -> HttpResponse(0, \"\") }\n    println(r.status)\n}\n";
+    let checked = check_source(src);
+    let hover_at = |name: &str| {
+        let off = src.find(name).unwrap() as u32 + 1;
+        checked
+            .info
+            .hovers
+            .iter()
+            .filter(|(s, _)| s.contains(off))
+            .min_by_key(|(s, _)| s.end - s.start)
+            .map(|(_, text)| text.clone())
+            .unwrap_or_default()
+    };
+    assert!(hover_at("fork").contains("Fiber<a ! E>"), "got: {}", hover_at("fork"));
+    assert!(hover_at("join").contains("re-raise"), "got: {}", hover_at("join"));
+    assert!(
+        hover_at("get(\"http://x\")").contains("HttpResponse ! HttpError"),
+        "got: {}",
+        hover_at("get(\"http://x\")")
+    );
+}

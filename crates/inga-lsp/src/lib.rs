@@ -797,53 +797,10 @@ fn import_state(src: &str, module: &str, selective: Option<&str>) -> ImportState
     })
 }
 
-/// Member lists for the std modules, with the same docs hover shows.
+/// Member lists for the std modules — the same table the checker's hovers
+/// use (inga_core::check::std_module_members).
 fn std_member_items(target: &str) -> Vec<CompletionItem> {
-    let members: &[(&str, &str)] = match target {
-        "std/schedule" => &[
-            ("exponential", "schedule.exponential(base) -> Schedule — delay doubles per attempt"),
-            ("fixed", "schedule.fixed(interval) -> Schedule"),
-            ("upTo", "schedule.upTo(schedule, times) -> Schedule — cap the retry count"),
-        ],
-        "std/fiber" => &[
-            ("fork", "fiber.fork(lazy action) -> Fiber<a ! E> — start now, return immediately"),
-            ("join", "fiber.join(fiber | tuple | list) — park, re-raise the error channel"),
-            ("poll", "fiber.poll(fiber) -> a? ! E — non-blocking probe (frame loops)"),
-            ("interrupt", "fiber.interrupt(fiber) — request cooperative cancellation"),
-            ("settle", "fiber.settle(lazy action) -> Outcome<a ! E> — the error channel as data"),
-            ("unsettle", "fiber.unsettle(outcome) -> a ! E — put the error back in the channel"),
-            ("par", "fiber.par(lazy a, lazy b, ...) -> (a, b, ...) — fork all + join"),
-            ("parMap", "fiber.parMap(xs, f) -> [b] ! E — one fiber per element"),
-            ("race", "fiber.race(lazy a, lazy b) -> a — first completion wins, loser interrupted"),
-            ("within", "fiber.within(lazy action, deadline) -> a ! E, TimeoutError"),
-            ("partition", "fiber.partition(outcomes) -> ([a], [Outcome<a ! E>])"),
-        ],
-        "std/http" => &[
-            ("get", "http.get(url) -> HttpResponse ! HttpError — a non-2xx status is data, not a failure"),
-            ("post", "http.post(url, body) -> HttpResponse ! HttpError"),
-            ("send", "http.send(method, url, body, headers) -> HttpResponse ! HttpError — headers: [(String, String)]"),
-            ("openStream", "http.openStream(url) -> HttpStream ! HttpError — GET with a streamed body"),
-            ("read", "http.read(stream) -> String? ! HttpError — next chunk; None at end"),
-            ("close", "http.close(stream)"),
-        ],
-        "std/graphics" => &[
-            ("run", "graphics.run(width, height, title, frame) — runtime-owned loop"),
-            ("clear", "graphics.clear(r, g, b)"),
-            ("rect", "graphics.rect(x, y, w, h, r, g, b, a)"),
-            ("rectLines", "graphics.rectLines(x, y, w, h, thick, r, g, b, a)"),
-            ("circle", "graphics.circle(x, y, radius, r, g, b, a)"),
-            ("text", "graphics.text(s, x, y, size, r, g, b)"),
-            ("textWidth", "graphics.textWidth(s, size) -> Int"),
-            ("mouseX", "graphics.mouseX() -> Int"),
-            ("mouseY", "graphics.mouseY() -> Int"),
-            ("mousePressed", "graphics.mousePressed() -> Bool"),
-            ("shaderNew", "graphics.shaderNew(fragGlsl) -> Int — uniforms iTime, iRes"),
-            ("shaderUse", "graphics.shaderUse(handle)"),
-            ("shaderOff", "graphics.shaderOff()"),
-        ],
-        _ => &[],
-    };
-    members
+    inga_core::check::std_module_members(target)
         .iter()
         .map(|(name, detail)| CompletionItem {
             label: name.to_string(),
@@ -878,6 +835,12 @@ fn value_member_items(
                             items.push(field(&f.name, format!("field of {n}")));
                         }
                     }
+                }
+            }
+            // Builtin structs (HttpResponse, HttpError, ...) have no decl.
+            if items.is_empty() {
+                for (fname, fty) in inga_core::check::builtin_struct_fields(n) {
+                    items.push(field(fname, format!("{fty} — field of {n}")));
                 }
             }
         }
@@ -1331,6 +1294,20 @@ mod member_tests {
         assert!(labels(&items).contains(&"fork".to_string()));
         assert!(labels(&items).contains(&"parMap".to_string()));
         assert!(items[0].additional_text_edits.is_none());
+
+        // http: members complete with auto-import; resp. lists the
+        // builtin struct's fields (no decl to walk).
+        let src = "main :: () {\n    http.\n}\n";
+        let (server, uri) = server_with(&dir.join("m4.inga"), src);
+        let items = server.member_completion(&uri, src, offset_of(src, "http.")).unwrap();
+        assert!(labels(&items).contains(&"get".to_string()), "got: {:?}", labels(&items));
+        assert!(labels(&items).contains(&"openStream".to_string()));
+        assert!(items[0].additional_text_edits.is_some());
+
+        let src = "use std/http\n\nmain :: () {\n    provide Http\n    resp = http.get(\"http://x\") |> catch { HttpError -> HttpResponse(0, \"\") }\n    println(resp.)\n}\n";
+        let (server, uri) = server_with(&dir.join("m5.inga"), src);
+        let items = server.member_completion(&uri, src, offset_of(src, "resp.")).unwrap();
+        assert_eq!(labels(&items), vec!["status", "body"]);
 
         // file module alias: pub members only.
         let src = "use cards\n\nmain :: () {\n    cards.\n}\n";

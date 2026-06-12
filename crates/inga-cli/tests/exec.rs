@@ -1105,6 +1105,55 @@ main :: () {
 }
 
 #[test]
+fn route_params_flow_through_middleware() {
+    // The arm's capture flows into the handler via a lambda adapter that
+    // closes over it — the lambda is itself the contracted handler.
+    let out = run(r#"
+struct User = { Int id, String name }
+
+service Session {
+    User user
+}
+
+loggedIn :: Session {
+    User user
+}
+
+type Authed = (String) -> String uses Session
+
+userProfile :: (String q, Int id) -> String uses Session {
+    Session session
+    "user ${id}, viewed by ${session.user.name}"
+}
+
+withAuth :: (Authed inner) {
+    (q) -> {
+        match q {
+            "${String path}?token=${Int who}" -> {
+                provide loggedIn(User { id: who, name: "user-${who}" })
+                inner(path)
+            }
+            other -> "401"
+        }
+    }
+}
+
+main :: () {
+    router = (String q) -> {
+        match q {
+            "/user/${Int id}?${String rest}" ->
+                (((String p) -> userProfile(p, id)) |> withAuth)(q)
+            other -> "404"
+        }
+    }
+    println(router("/user/7?token=42"))
+    println(router("/nope"))
+}
+"#);
+    assert_eq!(out, "user 7, viewed by user-42\n404\n");
+}
+
+#[test]
 fn route_level_middleware() {
     // Each route picks its own middleware stack; auth only where needed,
     // and the auth middleware provides the Session per call.

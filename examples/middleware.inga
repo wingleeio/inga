@@ -9,6 +9,7 @@
 //   curl 'localhost:8080/admin?token=1'       -> admin-only route
 //   curl 'localhost:8080/admin?token=42'      -> 403
 //   curl localhost:8080/profile               -> 401
+//   curl 'localhost:8080/user/7?token=42'     -> route param + session
 
 use std/http
 use std/json
@@ -63,6 +64,11 @@ adminPanel :: (HttpRequest req) -> HttpResponse uses Session {
     HttpResponse(200, "admin console, hello ${session.user.name}")
 }
 
+userProfile :: (HttpRequest req, Int id) -> HttpResponse uses Session {
+    Session session
+    HttpResponse(200, "user ${id}, viewed by ${session.user.name}")
+}
+
 // ---- middlewares: handler in, handler out ------------------------------------
 
 withAuth :: (Authed inner) {
@@ -107,11 +113,14 @@ main :: () {
     // exactly the stack that route needs.
     router = (HttpRequest req) -> {
         match req.path {
-            "/"        -> home(req)
-            "/profile" -> (profile |> withAuth)(req)
-            "/admin"   -> (adminPanel |> withAdminAuth)(req)
-            _          -> HttpResponse(404, "try /, /profile, /admin")
+            "/"               -> home(req)
+            "/profile"        -> (profile |> withAuth)(req)
+            "/admin"          -> (adminPanel |> withAdminAuth)(req)
+            "/user/${Int id}" -> (((HttpRequest r) -> userProfile(r, id)) |> withAuth)(req)
+            _                 -> HttpResponse(404, "try /, /profile, /admin, /user/7")
         }
+        // Route captures flow into the handler through a lambda — it
+        // closes over `id` and is itself the Authed handler.
     }
 
     println("listening on :${port}")

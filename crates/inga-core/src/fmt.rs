@@ -724,7 +724,15 @@ impl Printer {
         }
         targets.reverse();
 
-        let base_str = self.render_expr(base, indent);
+        let mut base_str = self.render_expr(base, indent);
+        // A lambda (or match/if) head would swallow the `|>` into its own
+        // body when re-parsed — keep it parenthesized.
+        if matches!(
+            base.kind,
+            ExprKind::Lambda { .. } | ExprKind::Match { .. } | ExprKind::If { .. }
+        ) {
+            base_str = format!("({base_str})");
+        }
         let rendered_targets: Vec<String> =
             targets.iter().map(|t| self.render_pipe_target(t, indent + 1)).collect();
 

@@ -252,6 +252,14 @@ fn formatter_keeps_postfix_parens() {
     assert!(formatted.contains("(f |> mw)(5)"), "got:\n{formatted}");
     assert!(formatted.contains("((x) -> x + 1)(2)"), "got:\n{formatted}");
     assert!(formatted.contains("(a + b).0"), "got:\n{formatted}");
+    // A lambda at a pipe's head keeps its parens too — without them the
+    // pipe re-parses inside the lambda body.
+    let src2 = "main :: () {\n    r = (((Int x) -> f(x, 1)) |> mw)(5)\n    println(r)\n}\n";
+    let formatted2 = fmt::format(src2).unwrap();
+    assert!(
+        formatted2.contains("(((Int x) -> f(x, 1)) |> mw)(5)"),
+        "got:\n{formatted2}"
+    );
 }
 
 #[test]

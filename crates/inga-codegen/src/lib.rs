@@ -2776,6 +2776,62 @@ impl<'a> Cg<'a> {
                 self.pool_value(f, &out, &CType::Option(Box::new(CType::Str)));
                 out
             }
+            "bitAnd" | "bitOr" | "bitXor" | "shiftL" | "shiftR" if args.len() == 2 => {
+                let a = self.gen_expr(f, args[0]);
+                let b = self.gen_expr(f, args[1]);
+                let op = match name {
+                    "bitAnd" => "and",
+                    "bitOr" => "or",
+                    "bitXor" => "xor",
+                    "shiftL" => "shl",
+                    _ => "lshr",
+                };
+                let out = self.tmp();
+                f.line(format!("{out} = {op} i64 {a}, {b}"));
+                out
+            }
+            "bitNot" if args.len() == 1 => {
+                let a = self.gen_expr(f, args[0]);
+                let out = self.tmp();
+                f.line(format!("{out} = xor i64 {a}, -1"));
+                out
+            }
+            "byteAt" if args.len() == 2 => {
+                let s = self.gen_expr(f, args[0]);
+                let i = self.gen_expr(f, args[1]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_byte_at(i64 {s}, i64 {i})"));
+                self.pool_value(f, &out, &CType::Option(Box::new(CType::Int)));
+                out
+            }
+            "byteLen" if args.len() == 1 => {
+                let s = self.gen_expr(f, args[0]);
+                // The string header is its byte length.
+                self.load_slot_from_int(f, &s, 0)
+            }
+            "intToBytes" if args.len() == 2 => {
+                let n = self.gen_expr(f, args[0]);
+                let w = self.gen_expr(f, args[1]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_int_to_bytes(i64 {n}, i64 {w})"));
+                self.pool_value(f, &out, &CType::Str);
+                out
+            }
+            "bytesToInt" if args.len() == 3 => {
+                let s = self.gen_expr(f, args[0]);
+                let off = self.gen_expr(f, args[1]);
+                let w = self.gen_expr(f, args[2]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_bytes_to_int(i64 {s}, i64 {off}, i64 {w})"));
+                out
+            }
+            "fromBytes" if args.len() == 1 => {
+                let xs = self.gen_expr(f, args[0]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_bytes_from_list(i64 {xs})"));
+                self.pool_value(f, &out, &CType::Str);
+                out
+            }
             "contains" | "startsWith" | "endsWith" if args.len() == 2 => {
                 let s = self.gen_expr(f, args[0]);
                 let n = self.gen_expr(f, args[1]);
@@ -5048,6 +5104,10 @@ declare i64 @rt_fs_list(i64)
 declare i64 @rt_fs_remove(i64)
 declare i64 @rt_fs_create_dir(i64)
 declare i64 @rt_read_line()
+declare i64 @rt_byte_at(i64, i64)
+declare i64 @rt_int_to_bytes(i64, i64)
+declare i64 @rt_bytes_to_int(i64, i64, i64)
+declare i64 @rt_bytes_from_list(i64)
 declare i64 @rt_process_args()
 declare i64 @rt_process_cwd()
 declare void @rt_process_exit(i64)

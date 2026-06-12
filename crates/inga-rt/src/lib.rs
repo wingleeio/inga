@@ -2435,6 +2435,50 @@ pub extern "C" fn rt_str_join(list: i64, sep: i64) -> i64 {
     make_str(&out)
 }
 
+// ---- bytes -------------------------------------------------------------------------
+
+/// The i-th byte as Some(0–255); None (0) out of bounds.
+#[no_mangle]
+pub extern "C" fn rt_byte_at(s: i64, i: i64) -> i64 {
+    let bytes = unsafe { str_bytes(s) };
+    if i < 0 || i as usize >= bytes.len() {
+        return 0;
+    }
+    let p = rt_alloc(8) as *mut i64;
+    unsafe { *p = bytes[i as usize] as i64 };
+    p as i64
+}
+
+/// `n` as `width` little-endian bytes (width clamped to 1..=8).
+#[no_mangle]
+pub extern "C" fn rt_int_to_bytes(n: i64, width: i64) -> i64 {
+    let width = width.clamp(1, 8) as usize;
+    make_str(&n.to_le_bytes()[..width])
+}
+
+/// Little-endian read of `width` bytes at `offset`; bytes past the end
+/// read as 0.
+#[no_mangle]
+pub extern "C" fn rt_bytes_to_int(s: i64, offset: i64, width: i64) -> i64 {
+    let bytes = unsafe { str_bytes(s) };
+    let width = width.clamp(1, 8);
+    let mut out: u64 = 0;
+    for i in 0..width {
+        let idx = offset + i;
+        let b = if idx >= 0 && (idx as usize) < bytes.len() { bytes[idx as usize] } else { 0 };
+        out |= (b as u64) << (8 * i);
+    }
+    out as i64
+}
+
+/// [Int] (each taken mod 256) to a byte string.
+#[no_mangle]
+pub extern "C" fn rt_bytes_from_list(list: i64) -> i64 {
+    let items = unsafe { list_items(list) };
+    let bytes: Vec<u8> = items.iter().map(|&v| v as u8).collect();
+    make_str(&bytes)
+}
+
 // ---- sorting -----------------------------------------------------------------------
 
 /// kind 0 = raw i64 (Int/Bool/Duration), 1 = f64 bits, 2 = string.

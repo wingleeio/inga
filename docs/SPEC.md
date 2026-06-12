@@ -216,7 +216,10 @@ provides real implementations.
   `println print show readLine len map filter fold at concat reverse sort sortBy
   range` (lists), `split join slice indexOf contains startsWith endsWith
   replace toUpper toLower trim parseInt toFloat floor min max abs`
-  (strings/numbers), `getOrElse orFail` (options), `retry ignoreFailure
+  (strings/numbers), `bitAnd bitOr bitXor bitNot shiftL shiftR byteAt
+  byteLen intToBytes bytesToInt fromBytes` (bits/bytes — strings are byte
+  buffers, so these are the storage-format vocabulary),
+  `getOrElse orFail` (options), `retry ignoreFailure
   tap tapError then sleep` (effects), `assert assertEq` (tests),
   `MutMap Some env nowMillis nowMicros random`. Concurrency is **not** in the
   prelude — it lives in `std/fiber` (§6.5). Editors show each builtin's

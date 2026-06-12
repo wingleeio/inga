@@ -486,6 +486,20 @@ fn read_line_consumes_stdin_until_eof() {
 }
 
 #[test]
+fn bitwise_and_byte_vocabulary() {
+    let out = run(r#"
+main :: () {
+    println(bitAnd(12, 10), bitOr(12, 10), bitXor(12, 10), bitNot(0), shiftL(1, 10), shiftR(1024, 3))
+    page = intToBytes(81985529216486895, 8)
+    println(byteLen(page), bytesToInt(page, 0, 8))
+    println(byteAt(page, 0) |> getOrElse(-1), byteAt(page, 99) |> getOrElse(-1))
+    println(fromBytes([73, 78, 71, 65]), bytesToInt(intToBytes(513, 2), 0, 2))
+}
+"#);
+    assert_eq!(out, "8 14 6 -1 1024 128\n8 81985529216486895\n239 -1\nINGA 513\n");
+}
+
+#[test]
 fn string_predicates_and_transforms() {
     let out = run(r#"
 main :: () {

@@ -3029,6 +3029,72 @@ impl<'a> Checker<'a> {
                 }
                 Type::Option(Box::new(Type::Str))
             }
+            "bitAnd" | "bitOr" | "bitXor" | "shiftL" | "shiftR" => {
+                if !check_arity(self, 2) {
+                    return Some(Type::Int);
+                }
+                for arg in args {
+                    let t = self.check_expr(arg);
+                    self.unify_at(&Type::Int, &t, arg.span, "bitwise argument");
+                }
+                Type::Int
+            }
+            "bitNot" => {
+                if !check_arity(self, 1) {
+                    return Some(Type::Int);
+                }
+                let t = self.check_expr(args[0]);
+                self.unify_at(&Type::Int, &t, args[0].span, "bitwise argument");
+                Type::Int
+            }
+            "byteAt" => {
+                if !check_arity(self, 2) {
+                    return Some(Type::Option(Box::new(Type::Int)));
+                }
+                let s = self.check_expr(args[0]);
+                self.unify_at(&Type::Str, &s, args[0].span, "byteAt input");
+                let i = self.check_expr(args[1]);
+                self.unify_at(&Type::Int, &i, args[1].span, "byteAt index");
+                Type::Option(Box::new(Type::Int))
+            }
+            "byteLen" => {
+                if !check_arity(self, 1) {
+                    return Some(Type::Int);
+                }
+                let s = self.check_expr(args[0]);
+                self.unify_at(&Type::Str, &s, args[0].span, "byteLen input");
+                Type::Int
+            }
+            "intToBytes" => {
+                if !check_arity(self, 2) {
+                    return Some(Type::Str);
+                }
+                for arg in args {
+                    let t = self.check_expr(arg);
+                    self.unify_at(&Type::Int, &t, arg.span, "intToBytes argument");
+                }
+                Type::Str
+            }
+            "bytesToInt" => {
+                if !check_arity(self, 3) {
+                    return Some(Type::Int);
+                }
+                let s = self.check_expr(args[0]);
+                self.unify_at(&Type::Str, &s, args[0].span, "bytesToInt input");
+                for arg in &args[1..] {
+                    let t = self.check_expr(arg);
+                    self.unify_at(&Type::Int, &t, arg.span, "bytesToInt argument");
+                }
+                Type::Int
+            }
+            "fromBytes" => {
+                if !check_arity(self, 1) {
+                    return Some(Type::Str);
+                }
+                let xs = self.check_expr(args[0]);
+                self.unify_at(&Type::List(Box::new(Type::Int)), &xs, args[0].span, "fromBytes input");
+                Type::Str
+            }
             "contains" | "startsWith" | "endsWith" => {
                 if !check_arity(self, 2) {
                     return Some(Type::Bool);
@@ -4672,11 +4738,22 @@ pub fn builtin_doc(name: &str) -> Option<&'static str> {
     builtin_completions().into_iter().find(|(n, _)| *n == name).map(|(_, doc)| doc)
 }
 
-const BUILTIN_NAMES: [&str; 47] = [
+const BUILTIN_NAMES: [&str; 58] = [
     "println",
     "print",
     "show",
     "readLine",
+    "bitAnd",
+    "bitOr",
+    "bitXor",
+    "bitNot",
+    "shiftL",
+    "shiftR",
+    "byteAt",
+    "byteLen",
+    "intToBytes",
+    "bytesToInt",
+    "fromBytes",
     "map",
     "contains",
     "startsWith",
@@ -4758,6 +4835,17 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("toLower", "toLower(s) -> String"),
         ("sort", "sort(list) -> [a] — ascending; works on [Int], [Float], [String]"),
         ("sortBy", "sortBy(list, key) -> [a] — stable, ascending by key(item) -> Int"),
+        ("bitAnd", "bitAnd(a, b) -> Int"),
+        ("bitOr", "bitOr(a, b) -> Int"),
+        ("bitXor", "bitXor(a, b) -> Int"),
+        ("bitNot", "bitNot(a) -> Int"),
+        ("shiftL", "shiftL(a, n) -> Int — shift left n bits"),
+        ("shiftR", "shiftR(a, n) -> Int — logical shift right (the Int as 64 unsigned bits)"),
+        ("byteAt", "byteAt(s, i) -> Int? — the i-th byte (0–255); None out of bounds"),
+        ("byteLen", "byteLen(s) -> Int — length in bytes (len counts characters)"),
+        ("intToBytes", "intToBytes(n, width) -> String — n as `width` little-endian bytes"),
+        ("bytesToInt", "bytesToInt(s, offset, width) -> Int — little-endian; missing bytes read 0"),
+        ("fromBytes", "fromBytes(bytes) -> String — [Int] (each 0–255) to a byte string"),
         ("min", "min(a, b) -> a — Int, Float, or Duration"),
         ("max", "max(a, b) -> a — Int, Float, or Duration"),
         ("abs", "abs(n) -> n — Int or Float"),

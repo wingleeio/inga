@@ -1,23 +1,23 @@
-// Middleware that *provides* — the request pipeline as plain functions.
-//
-// `dashboard` says `uses Session`; nobody provides Session in main.
-// Instead `withAuth` authenticates each request and provides a Session
-// that exists only for that call: a callback type with a `uses` row (a
-// contract) receives its capabilities at each call, so a `provide`
-// around the call site reaches it.
+// Route-level middleware — each route picks its own stack, and the
+// middleware *provides*: `withAuth` authenticates a request and provides
+// a Session that exists only for that call, so handlers just say
+// `uses Session` and main never provides it.
 //
 //   inga run examples/middleware.inga
-//   curl 'localhost:8080/dash?token=42'
-//   curl 'localhost:8080/dash'
+//   curl localhost:8080/                      -> public, no auth
+//   curl 'localhost:8080/profile?token=42'    -> authed route
+//   curl 'localhost:8080/admin?token=1'       -> admin-only route
+//   curl 'localhost:8080/admin?token=42'      -> 403
+//   curl localhost:8080/profile               -> 401
 
 use std/http
 use std/json
 
 port = 8080
+adminId = 1
 
-// A handler that needs a Session — middleware supplies it per request.
-type Authed = (HttpRequest) -> HttpResponse uses Session
 type Handler = (HttpRequest) -> HttpResponse
+type Authed = (HttpRequest) -> HttpResponse uses Session
 
 struct User      = { Int id, String name }
 struct AuthError = { String why }
@@ -47,11 +47,23 @@ authenticate :: (String query) -> User ! AuthError {
     }
 }
 
-// The handler declares what it needs; middleware satisfies it per request.
-dashboard :: (HttpRequest req) -> HttpResponse uses Session {
+// ---- handlers: each declares what it needs ----------------------------------
+
+home :: (HttpRequest req) -> HttpResponse {
+    HttpResponse(200, "welcome, anyone")
+}
+
+profile :: (HttpRequest req) -> HttpResponse uses Session {
     Session session
     HttpResponse(200, json.encode(session.user))
 }
+
+adminPanel :: (HttpRequest req) -> HttpResponse uses Session {
+    Session session
+    HttpResponse(200, "admin console, hello ${session.user.name}")
+}
+
+// ---- middlewares: handler in, handler out ------------------------------------
 
 withAuth :: (Authed inner) {
     (req) -> {
@@ -65,6 +77,18 @@ withAuth :: (Authed inner) {
     }
 }
 
+withAdminAuth :: (Authed inner) {
+    (req) -> {
+        user = authenticate(req.query) |> catch { AuthError -> User { id: -1, name: "" } }
+        if user.id == adminId {
+            provide loggedIn(user)
+            inner(req)
+        } else {
+            HttpResponse(403, "admins only")
+        }
+    }
+}
+
 withLogging :: (Handler inner) {
     Logger log
     (req) -> {
@@ -74,9 +98,25 @@ withLogging :: (Handler inner) {
     }
 }
 
+// ---- the router: plain data flow ---------------------------------------------
+
 main :: () {
     provide Http, consoleLogger
-    app = dashboard |> withAuth |> withLogging
-    println("listening on :${port} — try /dash?token=42")
-    http.serve(port, app) |> catch { HttpError(status, m) -> println("server: ${m}") }
+
+    // Route-level stacks: auth only where it's needed.
+    profileRoute = profile |> withAuth
+    adminRoute = adminPanel |> withAdminAuth
+
+    router = (HttpRequest req) -> {
+        match req.path {
+            "/"        -> home(req)
+            "/profile" -> profileRoute(req)
+            "/admin"   -> adminRoute(req)
+            _          -> HttpResponse(404, "try /, /profile, /admin")
+        }
+    }
+
+    println("listening on :${port}")
+    http.serve(port, router |> withLogging)
+        |> catch { HttpError(status, m) -> println("server: ${m}") }
 }

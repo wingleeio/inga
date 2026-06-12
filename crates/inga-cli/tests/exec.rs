@@ -1059,6 +1059,69 @@ fn type_alias_cycles_error() {
 }
 
 #[test]
+fn route_level_middleware() {
+    // Each route picks its own middleware stack; auth only where needed,
+    // and the auth middleware provides the Session per call.
+    let out = run(r#"
+struct User = { Int id, String name }
+
+service Session {
+    User user
+}
+
+loggedIn :: Session {
+    User user
+}
+
+type Authed = (String) -> String uses Session
+type Handler = (String) -> String
+
+home :: (String q) -> String {
+    "welcome"
+}
+
+profile :: (String q) -> String uses Session {
+    Session session
+    "profile of ${session.user.name}"
+}
+
+withAuth :: (Authed inner) {
+    (q) -> {
+        match q {
+            "token=${Int id}" -> {
+                provide loggedIn(User { id: id, name: "user-${id}" })
+                inner(q)
+            }
+            other -> "401"
+        }
+    }
+}
+
+withLogging :: (Handler inner) {
+    (q) -> {
+        r = inner(q)
+        "[${r}]"
+    }
+}
+
+main :: () {
+    profileRoute = profile |> withAuth
+    router = (q) -> {
+        match q {
+            "home" -> home(q)
+            other -> profileRoute(q)
+        }
+    }
+    app = router |> withLogging
+    println(app("home"))
+    println(app("token=42"))
+    println(app("nope"))
+}
+"#);
+    assert_eq!(out, "[welcome]\n[profile of user-42]\n[401]\n");
+}
+
+#[test]
 fn provide_reaches_contracted_callbacks() {
     // The middleware pattern: a callback whose type declares `uses Session`
     // receives evidence at each call, so a `provide` around the call site

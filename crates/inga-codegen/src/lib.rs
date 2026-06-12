@@ -1080,6 +1080,9 @@ impl<'a> Cg<'a> {
                     if module == "fs" {
                         return self.gen_fs(f, name, args, span);
                     }
+                    if module == "process" {
+                        return self.gen_process(f, name, args, span);
+                    }
                     if let Some(v) = self.gen_qualified(f, module, name, args, span) {
                         return v;
                     }
@@ -1269,6 +1272,9 @@ impl<'a> Cg<'a> {
                 }
                 if module == "fs" {
                     return self.gen_fs(f, name, args, span);
+                }
+                if module == "process" {
+                    return self.gen_process(f, name, args, span);
                 }
                 if let Some(v) = self.gen_qualified(f, module, name, args, span) {
                     return v;
@@ -2764,6 +2770,116 @@ impl<'a> Cg<'a> {
                 self.pool_value(f, &out, &rcty);
                 out
             }
+            "contains" | "startsWith" | "endsWith" if args.len() == 2 => {
+                let s = self.gen_expr(f, args[0]);
+                let n = self.gen_expr(f, args[1]);
+                let rt = match name {
+                    "contains" => "rt_str_contains",
+                    "startsWith" => "rt_str_starts_with",
+                    _ => "rt_str_ends_with",
+                };
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @{rt}(i64 {s}, i64 {n})"));
+                out
+            }
+            "replace" if args.len() == 3 => {
+                let s = self.gen_expr(f, args[0]);
+                let old = self.gen_expr(f, args[1]);
+                let new = self.gen_expr(f, args[2]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_str_replace(i64 {s}, i64 {old}, i64 {new})"));
+                self.pool_value(f, &out, &CType::Str);
+                out
+            }
+            "toUpper" | "toLower" if args.len() == 1 => {
+                let s = self.gen_expr(f, args[0]);
+                let rt = if name == "toUpper" { "rt_str_upper" } else { "rt_str_lower" };
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @{rt}(i64 {s})"));
+                self.pool_value(f, &out, &CType::Str);
+                out
+            }
+            "join" if args.len() == 2 => {
+                let xs = self.gen_expr(f, args[0]);
+                let sep = self.gen_expr(f, args[1]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_str_join(i64 {xs}, i64 {sep})"));
+                self.pool_value(f, &out, &CType::Str);
+                out
+            }
+            "sort" if args.len() == 1 => {
+                let xs = self.gen_expr(f, args[0]);
+                let rcty = self.ctype_of_span(span);
+                let kind = match &rcty {
+                    CType::List(elem) => match **elem {
+                        CType::Float => 1,
+                        CType::Str => 2,
+                        _ => 0,
+                    },
+                    _ => 0,
+                };
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_sort(i64 {xs}, i64 {kind})"));
+                self.gen_dup_list_elems(f, &out, &rcty);
+                self.pool_value(f, &out, &rcty);
+                out
+            }
+            "sortBy" if args.len() == 2 => {
+                let xs = self.gen_expr(f, args[0]);
+                let key = self.gen_expr(f, args[1]);
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @rt_sort_by(i64 {xs}, i64 {key})"));
+                let ok = self.load_slot_from_int(f, &boxed, 0);
+                let (fail_l, ok_l) = (self.label("sort.fail"), self.label("sort.ok"));
+                let c = self.tmp();
+                f.line(format!("{c} = icmp eq i64 {ok}, 0"));
+                f.line(format!("br i1 {c}, label %{fail_l}, label %{ok_l}"));
+                f.start_block(&fail_l);
+                // The key's own failure re-raises here.
+                let errbox = self.load_slot_from_int(f, &boxed, 2);
+                self.emit_failure(f, &errbox);
+                f.start_block(&ok_l);
+                let out = self.load_slot_from_int(f, &boxed, 1);
+                let rcty = self.ctype_of_span(span);
+                self.gen_dup_list_elems(f, &out, &rcty);
+                self.pool_value(f, &out, &rcty);
+                out
+            }
+            "min" | "max" if args.len() == 2 => {
+                let a = self.gen_expr(f, args[0]);
+                let b = self.gen_expr(f, args[1]);
+                let out = self.tmp();
+                if self.ctype_of(args[0]) == CType::Float {
+                    let (fa, fb, c) = (self.tmp(), self.tmp(), self.tmp());
+                    f.line(format!("{fa} = bitcast i64 {a} to double"));
+                    f.line(format!("{fb} = bitcast i64 {b} to double"));
+                    let op = if name == "min" { "olt" } else { "ogt" };
+                    f.line(format!("{c} = fcmp {op} double {fa}, {fb}"));
+                    f.line(format!("{out} = select i1 {c}, i64 {a}, i64 {b}"));
+                } else {
+                    let c = self.tmp();
+                    let op = if name == "min" { "slt" } else { "sgt" };
+                    f.line(format!("{c} = icmp {op} i64 {a}, {b}"));
+                    f.line(format!("{out} = select i1 {c}, i64 {a}, i64 {b}"));
+                }
+                out
+            }
+            "abs" if args.len() == 1 => {
+                let a = self.gen_expr(f, args[0]);
+                let out = self.tmp();
+                if self.ctype_of(args[0]) == CType::Float {
+                    let (fa, fr) = (self.tmp(), self.tmp());
+                    f.line(format!("{fa} = bitcast i64 {a} to double"));
+                    f.line(format!("{fr} = call double @llvm.fabs.f64(double {fa})"));
+                    f.line(format!("{out} = bitcast double {fr} to i64"));
+                } else {
+                    let (neg, c) = (self.tmp(), self.tmp());
+                    f.line(format!("{neg} = sub i64 0, {a}"));
+                    f.line(format!("{c} = icmp slt i64 {a}, 0"));
+                    f.line(format!("{out} = select i1 {c}, i64 {neg}, i64 {a}"));
+                }
+                out
+            }
             "split" if args.len() == 2 => {
                 let s = self.gen_expr(f, args[0]);
                 let sep = self.gen_expr(f, args[1]);
@@ -3825,6 +3941,36 @@ impl<'a> Cg<'a> {
         self.emit_fail_value(f, &err, &CType::Struct("HttpError".to_string()), span);
         f.start_block(&ok_l);
         a
+    }
+
+    /// `process.*` — std/process: the running program's own context.
+    fn gen_process(&mut self, f: &mut FnCtx, name: &str, args: &[&Expr], span: Span) -> String {
+        match (name, args.len()) {
+            ("args", 0) => {
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_process_args()"));
+                self.pool_value(f, &out, &CType::List(Box::new(CType::Str)));
+                out
+            }
+            ("cwd", 0) => {
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_process_cwd()"));
+                self.pool_value(f, &out, &CType::Str);
+                out
+            }
+            ("exit", 1) => {
+                let code = self.gen_expr(f, args[0]);
+                f.line(format!("call void @rt_process_exit(i64 {code})"));
+                f.line("unreachable".to_string());
+                let dead = self.label("dead");
+                f.start_block(&dead);
+                "0".to_string()
+            }
+            _ => {
+                self.unsupported(span, "this `process` operation shape");
+                "0".to_string()
+            }
+        }
     }
 
     /// `fs.*` — std/fs: blocking file I/O on the calling fiber's thread.
@@ -4895,6 +5041,19 @@ declare i64 @rt_fs_exists(i64)
 declare i64 @rt_fs_list(i64)
 declare i64 @rt_fs_remove(i64)
 declare i64 @rt_fs_create_dir(i64)
+declare i64 @rt_process_args()
+declare i64 @rt_process_cwd()
+declare void @rt_process_exit(i64)
+declare i64 @rt_str_contains(i64, i64)
+declare i64 @rt_str_starts_with(i64, i64)
+declare i64 @rt_str_ends_with(i64, i64)
+declare i64 @rt_str_replace(i64, i64, i64)
+declare i64 @rt_str_upper(i64)
+declare i64 @rt_str_lower(i64)
+declare i64 @rt_str_join(i64, i64)
+declare i64 @rt_sort(i64, i64)
+declare i64 @rt_sort_by(i64, i64)
+declare double @llvm.fabs.f64(double)
 declare void @rt_http_close(i64)
 declare i64 @rt_random(i64)
 declare void @rt_gfx_run(i64, i64, i64, i64)

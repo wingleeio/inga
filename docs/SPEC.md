@@ -213,8 +213,9 @@ provides real implementations.
 - **Functions are values**: a top-level function passed where a callback is
   expected (`map(xs, double)`) closes over its evidence like a lambda.
 - **Builtins** (a deliberate, small prelude — no imports needed):
-  `println print show len map filter fold at concat reverse
-  range` (lists), `split slice indexOf trim parseInt toFloat floor`
+  `println print show len map filter fold at concat reverse sort sortBy
+  range` (lists), `split join slice indexOf contains startsWith endsWith
+  replace toUpper toLower trim parseInt toFloat floor min max abs`
   (strings/numbers), `getOrElse orFail` (options), `retry ignoreFailure
   tap tapError then sleep` (effects), `assert assertEq` (tests),
   `MutMap Some env nowMillis nowMicros random`. Concurrency is **not** in the
@@ -582,6 +583,18 @@ fs.createDir (String path) -> Unit ! IoError         uses Fs   like mkdir -p
 An Inga string is a length-prefixed byte buffer, so `fs.read` on a PNG
 and `http.get` on a PNG hand you the same kind of value — there is no
 separate bytes type to convert through. See `examples/notes.inga`.
+
+## 8.7 The program itself: `std/process`
+
+```
+process.args () -> [String]     command-line arguments after the program name
+process.cwd  () -> String       the working directory
+process.exit (Int code) -> Unit end the process now
+```
+
+Ambient like the `env` builtin — process metadata is not an effect worth
+a row. `inga run file.inga a b` forwards `a b` to the program, so
+`process.args()` behaves identically under `run` and in a built binary.
 
 ## 9. Tooling (all in this repo)
 

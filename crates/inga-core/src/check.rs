@@ -1815,6 +1815,7 @@ impl<'a> Checker<'a> {
             "std/http" => return self.check_http_call(member, member_span, args, span),
             "std/json" => return self.check_json_call(member, member_span, args, span),
             "std/fs" => return self.check_fs_call(member, member_span, args, span),
+            "std/process" => return self.check_process_call(member, member_span, args, span),
             _ => {}
         }
         let Some(target) = self.modules.iter().position(|m| m.key == import.target) else {
@@ -2511,6 +2512,62 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `process.*` — std/process: the program's own runtime context.
+    /// Ambient like `env` — process metadata is not an effect worth a row.
+    fn check_process_call(
+        &mut self,
+        member: &str,
+        member_span: Span,
+        args: &[&Expr],
+        span: Span,
+    ) -> Type {
+        let arity = |s: &mut Self, n: usize| -> bool {
+            if args.len() != n {
+                s.error(
+                    span,
+                    format!("`process.{member}` expects {n} argument(s), found {}", args.len()),
+                );
+                for arg in args {
+                    s.check_expr(arg);
+                }
+                return false;
+            }
+            true
+        };
+        match member {
+            "args" => {
+                if !arity(self, 0) {
+                    return Type::Unknown;
+                }
+                Type::List(Box::new(Type::Str))
+            }
+            "cwd" => {
+                if !arity(self, 0) {
+                    return Type::Unknown;
+                }
+                Type::Str
+            }
+            "exit" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                let t = self.check_expr(args[0]);
+                self.unify_at(&Type::Int, &t, args[0].span, "exit code");
+                Type::Unit
+            }
+            _ => {
+                self.error(
+                    member_span,
+                    format!("`std/process` has no member `{member}` (args, cwd, exit)"),
+                );
+                for arg in args {
+                    self.check_expr(arg);
+                }
+                Type::Unknown
+            }
+        }
+    }
+
     /// `json.*` — std/json: JSON text to and from Inga values.
     fn check_json_call(
         &mut self,
@@ -2965,6 +3022,123 @@ impl<'a> Checker<'a> {
                     self.unify_at(&Type::Str, &t, arg.span, "split argument");
                 }
                 Type::List(Box::new(Type::Str))
+            }
+            "contains" | "startsWith" | "endsWith" => {
+                if !check_arity(self, 2) {
+                    return Some(Type::Bool);
+                }
+                for arg in args {
+                    let t = self.check_expr(arg);
+                    self.unify_at(&Type::Str, &t, arg.span, "string argument");
+                }
+                Type::Bool
+            }
+            "replace" => {
+                if !check_arity(self, 3) {
+                    return Some(Type::Str);
+                }
+                for arg in args {
+                    let t = self.check_expr(arg);
+                    self.unify_at(&Type::Str, &t, arg.span, "replace argument");
+                }
+                Type::Str
+            }
+            "toUpper" | "toLower" => {
+                if !check_arity(self, 1) {
+                    return Some(Type::Str);
+                }
+                let t = self.check_expr(args[0]);
+                self.unify_at(&Type::Str, &t, args[0].span, "string argument");
+                Type::Str
+            }
+            "join" => {
+                if !check_arity(self, 2) {
+                    return Some(Type::Str);
+                }
+                let xs = self.check_expr(args[0]);
+                self.unify_at(&Type::List(Box::new(Type::Str)), &xs, args[0].span, "join input");
+                let sep = self.check_expr(args[1]);
+                self.unify_at(&Type::Str, &sep, args[1].span, "join separator");
+                Type::Str
+            }
+            "sort" => {
+                if !check_arity(self, 1) {
+                    return Some(Type::Unknown);
+                }
+                let elem = self.ctx.fresh();
+                let want = Type::List(Box::new(elem.clone()));
+                let xs = self.check_expr(args[0]);
+                self.unify_at(&want, &xs, args[0].span, "sort input");
+                match self.ctx.resolve(&elem) {
+                    Type::Int | Type::Float | Type::Str | Type::Bool | Type::Duration
+                    | Type::Var(_) | Type::Unknown => {}
+                    other => {
+                        let rendered = self.render(&other);
+                        self.error(
+                            args[0].span,
+                            format!("`sort` orders [Int], [Float], or [String]; found [{rendered}] — use `sortBy` with a key"),
+                        );
+                    }
+                }
+                want
+            }
+            "sortBy" => {
+                if !check_arity(self, 2) {
+                    return Some(Type::Unknown);
+                }
+                let a = self.ctx.fresh();
+                let want = Type::List(Box::new(a.clone()));
+                let xs = self.check_expr(args[0]);
+                self.unify_at(&want, &xs, args[0].span, "sortBy input");
+                let expected_f = Type::Func(Rc::new(FuncType {
+                    params: vec![a],
+                    ret: Type::Int,
+                    errors: BTreeSet::new(),
+                    caps: BTreeSet::new(),
+                }));
+                let func_ty = self.check_arg_expecting(args[1], &expected_f);
+                self.add_func_arg_rows(&func_ty);
+                self.unify_at(&expected_f, &func_ty, args[1].span, "sortBy key (returns Int)");
+                want
+            }
+            "min" | "max" => {
+                if !check_arity(self, 2) {
+                    return Some(Type::Unknown);
+                }
+                let lhs = self.check_expr(args[0]);
+                let rhs = self.check_expr(args[1]);
+                self.unify_at(&lhs, &rhs, args[1].span, "min/max arguments");
+                match self.ctx.resolve(&lhs) {
+                    Type::Int | Type::Float | Type::Duration | Type::Unknown => {}
+                    Type::Var(_) => {
+                        self.unify_at(&Type::Int, &lhs, args[0].span, "min/max argument");
+                    }
+                    other => {
+                        let rendered = self.render(&other);
+                        self.error(
+                            args[0].span,
+                            format!("`{name}` compares Int, Float, or Duration; found {rendered}"),
+                        );
+                    }
+                }
+                self.ctx.resolve(&lhs)
+            }
+            "abs" => {
+                if !check_arity(self, 1) {
+                    return Some(Type::Unknown);
+                }
+                let t = self.check_expr(args[0]);
+                match self.ctx.resolve(&t) {
+                    Type::Int | Type::Float | Type::Unknown => {}
+                    Type::Var(_) => {
+                        self.unify_at(&Type::Int, &t, args[0].span, "abs argument");
+                    }
+                    other => {
+                        let rendered = self.render(&other);
+                        self.error(args[0].span, format!("`abs` takes an Int or Float; found {rendered}"));
+                    }
+                }
+                self.ctx.resolve(&t)
             }
             "slice" => {
                 if !check_arity(self, 3) {
@@ -4255,6 +4429,13 @@ impl<'a> Checker<'a> {
                 ));
                 return;
             }
+            "std/process" => {
+                self.info.hovers.push((
+                    u.path_span,
+                    "std/process — the running program: process.args(), process.cwd(), process.exit(code)".to_string(),
+                ));
+                return;
+            }
             _ => {}
         }
         let ref_module = self.module_of(u.path_span);
@@ -4435,6 +4616,11 @@ pub fn std_module_members(target: &str) -> &'static [(&'static str, &'static str
             ("encode", "json.encode(value) -> String — JSON"),
             ("decode", "json.decode(raw, StructName) -> a ! DecodeError — parse JSON into a struct"),
         ],
+        "std/process" => &[
+            ("args", "process.args() -> [String] — command-line arguments (after the program name)"),
+            ("cwd", "process.cwd() -> String — the working directory"),
+            ("exit", "process.exit(code) -> Unit — end the process now"),
+        ],
         "std/fs" => &[
             ("read", "fs.read(path) -> String ! IoError uses Fs — the whole file; binary passes through"),
             ("write", "fs.write(path, contents) -> Unit ! IoError uses Fs — create or truncate"),
@@ -4480,11 +4666,23 @@ pub fn builtin_doc(name: &str) -> Option<&'static str> {
     builtin_completions().into_iter().find(|(n, _)| *n == name).map(|(_, doc)| doc)
 }
 
-const BUILTIN_NAMES: [&str; 34] = [
+const BUILTIN_NAMES: [&str; 46] = [
     "println",
     "print",
     "show",
     "map",
+    "contains",
+    "startsWith",
+    "endsWith",
+    "replace",
+    "toUpper",
+    "toLower",
+    "join",
+    "sort",
+    "sortBy",
+    "min",
+    "max",
+    "abs",
     "getOrElse",
     "orFail",
     "retry",
@@ -4543,6 +4741,18 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("concat", "concat(xs, ys) -> [a]"),
         ("reverse", "reverse(list) -> [a]"),
         ("split", "split(s, separator) -> [String]"),
+        ("join", "join(strings, separator) -> String"),
+        ("contains", "contains(s, needle) -> Bool"),
+        ("startsWith", "startsWith(s, prefix) -> Bool"),
+        ("endsWith", "endsWith(s, suffix) -> Bool"),
+        ("replace", "replace(s, old, new) -> String — every occurrence"),
+        ("toUpper", "toUpper(s) -> String"),
+        ("toLower", "toLower(s) -> String"),
+        ("sort", "sort(list) -> [a] — ascending; works on [Int], [Float], [String]"),
+        ("sortBy", "sortBy(list, key) -> [a] — stable, ascending by key(item) -> Int"),
+        ("min", "min(a, b) -> a — Int, Float, or Duration"),
+        ("max", "max(a, b) -> a — Int, Float, or Duration"),
+        ("abs", "abs(n) -> n — Int or Float"),
         ("slice", "slice(s, start, end) -> String — by character index"),
         ("indexOf", "indexOf(s, needle) -> Int — -1 when absent"),
         ("trim", "trim(s) -> String"),

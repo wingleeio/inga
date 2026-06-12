@@ -58,7 +58,7 @@ fn read_file(path: &str) -> Result<String, ExitCode> {
 
 fn cmd_run(args: &[String]) -> ExitCode {
     let Some(path) = args.first() else {
-        eprintln!("usage: inga run <file.inga>");
+        eprintln!("usage: inga run <file.inga> [program args...]");
         return ExitCode::FAILURE;
     };
     let loaded = match load_program(Path::new(path)) {
@@ -79,12 +79,13 @@ fn cmd_run(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    run_ir(&ir, path)
+    run_ir(&ir, path, &args[1..])
 }
 
-/// Link IR to a temp binary, execute it with inherited stdio, clean up,
-/// and forward the child's exit status.
-fn run_ir(ir: &str, src_path: &str) -> ExitCode {
+/// Link IR to a temp binary, execute it with inherited stdio (remaining
+/// CLI words become the program's `process.args()`), clean up, and
+/// forward the child's exit status.
+fn run_ir(ir: &str, src_path: &str, program_args: &[String]) -> ExitCode {
     let stem = Path::new(src_path).file_stem().and_then(|s| s.to_str()).unwrap_or("out");
     let dir = std::env::temp_dir().join(format!("inga-run-{}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -96,7 +97,7 @@ fn run_ir(ir: &str, src_path: &str) -> ExitCode {
         eprintln!("{msg}");
         return ExitCode::FAILURE;
     }
-    let status = std::process::Command::new(&bin).status();
+    let status = std::process::Command::new(&bin).args(program_args).status();
     let _ = std::fs::remove_dir_all(&dir);
     match status {
         Ok(s) if s.success() => ExitCode::SUCCESS,

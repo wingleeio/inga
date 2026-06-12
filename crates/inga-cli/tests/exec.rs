@@ -467,6 +467,51 @@ main :: () {
 }
 
 #[test]
+fn string_predicates_and_transforms() {
+    let out = run(r#"
+main :: () {
+    println(contains("hello world", "lo w"), startsWith("hello", "he"), endsWith("hello", "xllo"))
+    println(replace("a-b-c", "-", "+"), toUpper("mixUp"), toLower("MixUp"))
+    println(join(["a", "b", "c"], ", "), join([], "-"))
+}
+"#);
+    assert_eq!(out, "true true false\na+b+c MIXUP mixup\na, b, c \n");
+}
+
+#[test]
+fn sort_and_sort_by() {
+    let out = run(r#"
+struct Card = { String name, Int rank }
+
+main :: () {
+    println(sort([3, 1, 2]), sort([2.5, 1.5]), sort(["pear", "apple"]))
+    cards = [Card("ace", 14), Card("two", 2), Card("ten", 10)]
+    println(sortBy(cards, (c) -> c.rank) |> map((c) -> c.name))
+    println(min(3, 7), max(3, 7), min(1.5, 0.5), abs(-4), abs(-2.5))
+}
+"#);
+    assert_eq!(
+        out,
+        "[1, 2, 3] [1.5, 2.5] [\"apple\", \"pear\"]\n[\"two\", \"ten\", \"ace\"]\n3 7 0.5 4 2.5\n"
+    );
+}
+
+#[test]
+fn process_args_and_exit() {
+    let path = write_temp(
+        "use std/process\n\nmain :: () {\n    println(process.args())\n    first = at(process.args(), 0) |> getOrElse(\"\")\n    if first == \"die\" {\n        process.exit(3)\n    }\n    println(\"alive, cwd nonempty:\", len(process.cwd()) > 0)\n}\n",
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_inga"))
+        .args(["run".as_ref(), path.as_os_str(), "die".as_ref(), "x".as_ref()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[\"die\", \"x\"]\n");
+    let out = Command::new(env!("CARGO_BIN_EXE_inga")).arg("run").arg(&path).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[]\nalive, cwd nonempty: true\n");
+}
+
+#[test]
 fn http_serve_answers_requests() {
     let out = run_env(
         r#"

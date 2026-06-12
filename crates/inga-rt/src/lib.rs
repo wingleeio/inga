@@ -2322,6 +2322,135 @@ pub extern "C" fn rt_fs_create_dir(path: i64) -> i64 {
     }
 }
 
+// ---- process ----------------------------------------------------------------------
+
+/// Command-line arguments after the program name.
+#[no_mangle]
+pub extern "C" fn rt_process_args() -> i64 {
+    let items: Vec<i64> = std::env::args().skip(1).map(|a| make_str(a.as_bytes())).collect();
+    make_list(&items)
+}
+
+#[no_mangle]
+pub extern "C" fn rt_process_cwd() -> i64 {
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    make_str(cwd.as_bytes())
+}
+
+#[no_mangle]
+pub extern "C" fn rt_process_exit(code: i64) {
+    std::process::exit(code as i32);
+}
+
+// ---- strings: predicates and transforms -------------------------------------------
+
+fn str_pair<'a>(a: i64, b: i64) -> (&'a [u8], &'a [u8]) {
+    unsafe { (str_bytes(a), str_bytes(b)) }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_str_contains(s: i64, needle: i64) -> i64 {
+    let (s, n) = str_pair(s, needle);
+    (n.is_empty() || s.windows(n.len().max(1)).any(|w| w == n)) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn rt_str_starts_with(s: i64, prefix: i64) -> i64 {
+    let (s, p) = str_pair(s, prefix);
+    s.starts_with(p) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn rt_str_ends_with(s: i64, suffix: i64) -> i64 {
+    let (s, p) = str_pair(s, suffix);
+    s.ends_with(p) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn rt_str_replace(s: i64, old: i64, new: i64) -> i64 {
+    let (s, old) = str_pair(s, old);
+    let new = unsafe { str_bytes(new) };
+    if old.is_empty() {
+        return make_str(s);
+    }
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if s[i..].starts_with(old) {
+            out.extend_from_slice(new);
+            i += old.len();
+        } else {
+            out.push(s[i]);
+            i += 1;
+        }
+    }
+    make_str(&out)
+}
+
+#[no_mangle]
+pub extern "C" fn rt_str_upper(s: i64) -> i64 {
+    let s = unsafe { std::str::from_utf8_unchecked(str_bytes(s)) };
+    make_str(s.to_uppercase().as_bytes())
+}
+
+#[no_mangle]
+pub extern "C" fn rt_str_lower(s: i64) -> i64 {
+    let s = unsafe { std::str::from_utf8_unchecked(str_bytes(s)) };
+    make_str(s.to_lowercase().as_bytes())
+}
+
+#[no_mangle]
+pub extern "C" fn rt_str_join(list: i64, sep: i64) -> i64 {
+    let sep = unsafe { str_bytes(sep) };
+    let mut out: Vec<u8> = Vec::new();
+    for (i, &item) in unsafe { list_items(list) }.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(sep);
+        }
+        out.extend_from_slice(unsafe { str_bytes(item) });
+    }
+    make_str(&out)
+}
+
+// ---- sorting -----------------------------------------------------------------------
+
+/// kind 0 = raw i64 (Int/Bool/Duration), 1 = f64 bits, 2 = string.
+#[no_mangle]
+pub extern "C" fn rt_sort(list: i64, kind: i64) -> i64 {
+    let mut items = unsafe { list_items(list) }.to_vec();
+    match kind {
+        1 => items.sort_by(|&a, &b| {
+            let (x, y) = (f64::from_bits(a as u64), f64::from_bits(b as u64));
+            x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        2 => items.sort_by(|&a, &b| unsafe { str_bytes(a).cmp(str_bytes(b)) }),
+        _ => items.sort(),
+    }
+    make_list(&items)
+}
+
+/// Stable sort by an Int key closure. Returns `{ok, list, errbox}` — a
+/// failing key ends the sort and re-raises at the call site.
+#[no_mangle]
+pub extern "C" fn rt_sort_by(list: i64, closure: i64) -> i64 {
+    let items = unsafe { list_items(list) }.to_vec();
+    let key: extern "C" fn(*const i64, i64) -> RtPair =
+        unsafe { std::mem::transmute(*(closure as *const i64)) };
+    let mut keyed = Vec::with_capacity(items.len());
+    for &v in &items {
+        let pair = key(closure as *const i64, v);
+        if pair.e != 0 {
+            return http_box(0, 0, pair.e);
+        }
+        keyed.push((pair.v, v));
+    }
+    keyed.sort_by_key(|&(k, _)| k);
+    let sorted: Vec<i64> = keyed.into_iter().map(|(_, v)| v).collect();
+    http_box(1, make_list(&sorted), 0)
+}
+
 // ---- JSON encode/decode over descriptors ----------------------------------------
 
 fn encode_desc(v: i64, d: &mut Desc, out: &mut String) {

@@ -301,9 +301,16 @@ impl<'a> Checker<'a> {
         };
         // Builtin structs available to every program (raised by `decode`,
         // `assert`/`assertEq`, and std/http) — shapes from one shared table.
-        for name in
-            [DECODE_ERROR, ASSERT_FAILED, "HttpResponse", HTTP_ERROR, "HttpStream", "HttpRequest", IO_ERROR]
-        {
+        for name in [
+            DECODE_ERROR,
+            ASSERT_FAILED,
+            "HttpResponse",
+            HTTP_ERROR,
+            "HttpStream",
+            "HttpRequest",
+            IO_ERROR,
+            "File",
+        ] {
             let fields = builtin_struct_fields(name)
                 .iter()
                 .map(|(f, t)| {
@@ -2499,10 +2506,63 @@ impl<'a> Checker<'a> {
                 self.add_error_row(IO_ERROR);
                 Type::Unit
             }
+            "open" => {
+                if !arity(self, 2) {
+                    return Type::Unknown;
+                }
+                str_arg(self, 0);
+                str_arg(self, 1);
+                self.add_cap_row(FS_SERVICE);
+                self.add_error_row(IO_ERROR);
+                Type::Named("File".into())
+            }
+            "readAt" => {
+                if !arity(self, 3) {
+                    return Type::Unknown;
+                }
+                let t = self.check_expr(args[0]);
+                self.unify_at(&Type::Named("File".into()), &t, args[0].span, "fs file");
+                for arg in &args[1..] {
+                    let t = self.check_expr(arg);
+                    self.unify_at(&Type::Int, &t, arg.span, "fs argument");
+                }
+                self.add_cap_row(FS_SERVICE);
+                self.add_error_row(IO_ERROR);
+                Type::Str
+            }
+            "writeAt" => {
+                if !arity(self, 3) {
+                    return Type::Unknown;
+                }
+                let t = self.check_expr(args[0]);
+                self.unify_at(&Type::Named("File".into()), &t, args[0].span, "fs file");
+                let off = self.check_expr(args[1]);
+                self.unify_at(&Type::Int, &off, args[1].span, "fs offset");
+                let bytes = self.check_expr(args[2]);
+                self.unify_at(&Type::Str, &bytes, args[2].span, "fs bytes");
+                self.add_cap_row(FS_SERVICE);
+                self.add_error_row(IO_ERROR);
+                Type::Unit
+            }
+            "size" | "sync" | "close" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                let t = self.check_expr(args[0]);
+                self.unify_at(&Type::Named("File".into()), &t, args[0].span, "fs file");
+                self.add_cap_row(FS_SERVICE);
+                if member != "close" {
+                    self.add_error_row(IO_ERROR);
+                }
+                match member {
+                    "size" => Type::Int,
+                    _ => Type::Unit,
+                }
+            }
             _ => {
                 self.error(
                     member_span,
-                    format!("`std/fs` has no member `{member}` (read, write, append, exists, list, remove, createDir)"),
+                    format!("`std/fs` has no member `{member}` (read, write, append, exists, list, remove, createDir, open, readAt, writeAt, size, sync, close)"),
                 );
                 for arg in args {
                     self.check_expr(arg);
@@ -4658,6 +4718,7 @@ pub fn builtin_struct_fields(name: &str) -> &'static [(&'static str, &'static st
         "HttpStream" => &[("handle", "Int"), ("status", "Int")],
         "DecodeError" | "AssertionError" => &[("message", "String")],
         "IoError" => &[("path", "String"), ("message", "String")],
+        "File" => &[("handle", "Int")],
         _ => &[],
     }
 }
@@ -4701,6 +4762,12 @@ pub fn std_module_members(target: &str) -> &'static [(&'static str, &'static str
             ("list", "fs.list(dir) -> [String] ! IoError uses Fs — entry names, sorted"),
             ("remove", "fs.remove(path) -> Unit ! IoError uses Fs — file or directory tree"),
             ("createDir", "fs.createDir(path) -> Unit ! IoError uses Fs — like mkdir -p"),
+            ("open", "fs.open(path, mode) -> File ! IoError uses Fs — mode r | w | a | rw; positional I/O via readAt/writeAt"),
+            ("readAt", "fs.readAt(file, offset, len) -> String ! IoError uses Fs — up to len bytes; shorter at end of file"),
+            ("writeAt", "fs.writeAt(file, offset, bytes) -> Unit ! IoError uses Fs"),
+            ("size", "fs.size(file) -> Int ! IoError uses Fs — in bytes"),
+            ("sync", "fs.sync(file) -> Unit ! IoError uses Fs — fsync to stable storage"),
+            ("close", "fs.close(file) uses Fs"),
         ],
         "std/http" => &[
             ("get", "http.get(url) -> HttpResponse ! HttpError uses Http — a non-2xx status is data, not a failure"),

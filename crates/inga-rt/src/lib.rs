@@ -2236,8 +2236,8 @@ pub extern "C" fn rt_http_serve(port: i64, closure: i64) -> i64 {
 }
 
 // ---- file system -----------------------------------------------------------------
-// Every fallible call returns the http-style `{ok, value, message}` box;
-// codegen unpacks it and raises IoError { path, message } on failure.
+// Every fallible call returns `{ok, value, message}`; on failure the
+// value slot carries the path, and codegen raises IoError { path, message }.
 
 fn fs_path<'a>(path: i64) -> &'a str {
     unsafe { std::str::from_utf8_unchecked(str_bytes(path)) }
@@ -2247,8 +2247,8 @@ fn fs_ok(value: i64) -> i64 {
     http_box(1, value, 0)
 }
 
-fn fs_fail(e: impl std::fmt::Display) -> i64 {
-    http_box(0, 0, make_str(e.to_string().as_bytes()))
+fn fs_fail(path: &str, e: impl std::fmt::Display) -> i64 {
+    http_box(0, make_str(path.as_bytes()), make_str(e.to_string().as_bytes()))
 }
 
 #[no_mangle]
@@ -2257,7 +2257,7 @@ pub extern "C" fn rt_fs_read(path: i64) -> i64 {
     // pass through untouched (same as http bodies).
     match std::fs::read(fs_path(path)) {
         Ok(bytes) => fs_ok(make_str(&bytes)),
-        Err(e) => fs_fail(e),
+        Err(e) => fs_fail(fs_path(path), e),
     }
 }
 
@@ -2265,7 +2265,7 @@ pub extern "C" fn rt_fs_read(path: i64) -> i64 {
 pub extern "C" fn rt_fs_write(path: i64, contents: i64) -> i64 {
     match std::fs::write(fs_path(path), unsafe { str_bytes(contents) }) {
         Ok(()) => fs_ok(0),
-        Err(e) => fs_fail(e),
+        Err(e) => fs_fail(fs_path(path), e),
     }
 }
 
@@ -2279,7 +2279,7 @@ pub extern "C" fn rt_fs_append(path: i64, contents: i64) -> i64 {
         .and_then(|mut f| f.write_all(unsafe { str_bytes(contents) }));
     match result {
         Ok(()) => fs_ok(0),
-        Err(e) => fs_fail(e),
+        Err(e) => fs_fail(fs_path(path), e),
     }
 }
 
@@ -2300,7 +2300,7 @@ pub extern "C" fn rt_fs_list(path: i64) -> i64 {
             let items: Vec<i64> = names.iter().map(|n| make_str(n.as_bytes())).collect();
             fs_ok(make_list(&items))
         }
-        Err(e) => fs_fail(e),
+        Err(e) => fs_fail(fs_path(path), e),
     }
 }
 
@@ -2310,7 +2310,7 @@ pub extern "C" fn rt_fs_remove(path: i64) -> i64 {
     let result = if p.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) };
     match result {
         Ok(()) => fs_ok(0),
-        Err(e) => fs_fail(e),
+        Err(e) => fs_fail(fs_path(path), e),
     }
 }
 
@@ -2318,7 +2318,109 @@ pub extern "C" fn rt_fs_remove(path: i64) -> i64 {
 pub extern "C" fn rt_fs_create_dir(path: i64) -> i64 {
     match std::fs::create_dir_all(fs_path(path)) {
         Ok(()) => fs_ok(0),
-        Err(e) => fs_fail(e),
+        Err(e) => fs_fail(fs_path(path), e),
+    }
+}
+
+// ---- file handles ------------------------------------------------------------------
+// Open files live in a registry; the Inga-side `File { Int handle }`
+// struct is just the key. readAt/writeAt are positional (no seek state),
+// so handles are safe to share across fibers.
+
+static FILES: std::sync::Mutex<Option<std::collections::HashMap<i64, (std::fs::File, String)>>> =
+    std::sync::Mutex::new(None);
+static NEXT_FILE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+
+fn with_file<T>(
+    handle: i64,
+    op: impl FnOnce(&std::fs::File) -> std::io::Result<T>,
+) -> Result<T, (String, String)> {
+    let guard = FILES.lock().unwrap();
+    let Some((file, path)) = guard.as_ref().and_then(|m| m.get(&handle)) else {
+        return Err(("<closed>".into(), "file handle is closed".into()));
+    };
+    op(file).map_err(|e| (path.clone(), e.to_string()))
+}
+
+/// Modes: "r" read, "w" create+truncate, "a" append, "rw" read/write
+/// (created if missing, not truncated).
+#[no_mangle]
+pub extern "C" fn rt_fs_open(path: i64, mode: i64) -> i64 {
+    let p = fs_path(path);
+    let mode = unsafe { std::str::from_utf8_unchecked(str_bytes(mode)) };
+    let mut opts = std::fs::OpenOptions::new();
+    match mode {
+        "r" => opts.read(true),
+        "w" => opts.write(true).create(true).truncate(true),
+        "a" => opts.append(true).create(true),
+        "rw" => opts.read(true).write(true).create(true),
+        other => return fs_fail(p, format!("unknown open mode `{other}` (r, w, a, rw)")),
+    };
+    match opts.open(p) {
+        Ok(file) => {
+            let handle = NEXT_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            FILES
+                .lock()
+                .unwrap()
+                .get_or_insert_with(Default::default)
+                .insert(handle, (file, p.to_string()));
+            fs_ok(handle)
+        }
+        Err(e) => fs_fail(p, e),
+    }
+}
+
+/// Up to `len` bytes at `offset`; shorter (or empty) at end of file.
+#[no_mangle]
+pub extern "C" fn rt_fs_read_at(handle: i64, offset: i64, len: i64) -> i64 {
+    use std::os::unix::fs::FileExt;
+    let mut buf = vec![0u8; len.max(0) as usize];
+    let result = with_file(handle, |file| {
+        let mut total = 0usize;
+        while total < buf.len() {
+            match file.read_at(&mut buf[total..], (offset + total as i64) as u64)? {
+                0 => break,
+                n => total += n,
+            }
+        }
+        Ok(total)
+    });
+    match result {
+        Ok(n) => fs_ok(make_str(&buf[..n])),
+        Err((path, e)) => fs_fail(&path, e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_fs_write_at(handle: i64, offset: i64, bytes: i64) -> i64 {
+    use std::os::unix::fs::FileExt;
+    let data = unsafe { str_bytes(bytes) };
+    match with_file(handle, |file| file.write_all_at(data, offset as u64)) {
+        Ok(()) => fs_ok(0),
+        Err((path, e)) => fs_fail(&path, e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_fs_size(handle: i64) -> i64 {
+    match with_file(handle, |file| file.metadata().map(|m| m.len() as i64)) {
+        Ok(n) => fs_ok(n),
+        Err((path, e)) => fs_fail(&path, e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_fs_sync(handle: i64) -> i64 {
+    match with_file(handle, |file| file.sync_all()) {
+        Ok(()) => fs_ok(0),
+        Err((path, e)) => fs_fail(&path, e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_fs_close(handle: i64) {
+    if let Some(m) = FILES.lock().unwrap().as_mut() {
+        m.remove(&handle);
     }
 }
 

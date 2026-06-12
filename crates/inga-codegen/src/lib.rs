@@ -190,6 +190,7 @@ impl<'a> Cg<'a> {
             vec!["method".into(), "path".into(), "query".into(), "body".into()],
         );
         self.struct_meta.insert("IoError".into(), vec!["path".into(), "message".into()]);
+        self.struct_meta.insert("File".into(), vec!["handle".into()]);
         for (i, tag) in [
             "DecodeError",
             "AssertionError",
@@ -4037,12 +4038,17 @@ impl<'a> Cg<'a> {
 
     /// `fs.*` — std/fs: blocking file I/O on the calling fiber's thread.
     fn gen_fs(&mut self, f: &mut FnCtx, name: &str, args: &[&Expr], span: Span) -> String {
+        // Handle ops: the File struct's slot 0 is the registry handle.
+        let handle_of = |s: &mut Self, f: &mut FnCtx, file: &Expr| {
+            let v = s.gen_expr(f, file);
+            s.load_slot_from_int(f, &v, 0)
+        };
         match (name, args.len()) {
             ("read", 1) => {
                 let path = self.gen_expr(f, args[0]);
                 let boxed = self.tmp();
                 f.line(format!("{boxed} = call i64 @rt_fs_read(i64 {path})"));
-                let v = self.gen_fs_unpack(f, &boxed, &path, span);
+                let v = self.gen_fs_unpack(f, &boxed, span);
                 self.pool_value(f, &v, &CType::Str);
                 v
             }
@@ -4052,7 +4058,7 @@ impl<'a> Cg<'a> {
                 let rt = if name == "write" { "rt_fs_write" } else { "rt_fs_append" };
                 let boxed = self.tmp();
                 f.line(format!("{boxed} = call i64 @{rt}(i64 {path}, i64 {contents})"));
-                self.gen_fs_unpack(f, &boxed, &path, span);
+                self.gen_fs_unpack(f, &boxed, span);
                 "0".to_string()
             }
             ("exists", 1) => {
@@ -4065,7 +4071,7 @@ impl<'a> Cg<'a> {
                 let path = self.gen_expr(f, args[0]);
                 let boxed = self.tmp();
                 f.line(format!("{boxed} = call i64 @rt_fs_list(i64 {path})"));
-                let v = self.gen_fs_unpack(f, &boxed, &path, span);
+                let v = self.gen_fs_unpack(f, &boxed, span);
                 self.pool_value(f, &v, &CType::List(Box::new(CType::Str)));
                 v
             }
@@ -4074,7 +4080,56 @@ impl<'a> Cg<'a> {
                 let rt = if name == "remove" { "rt_fs_remove" } else { "rt_fs_create_dir" };
                 let boxed = self.tmp();
                 f.line(format!("{boxed} = call i64 @{rt}(i64 {path})"));
-                self.gen_fs_unpack(f, &boxed, &path, span);
+                self.gen_fs_unpack(f, &boxed, span);
+                "0".to_string()
+            }
+            ("open", 2) => {
+                let path = self.gen_expr(f, args[0]);
+                let mode = self.gen_expr(f, args[1]);
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @rt_fs_open(i64 {path}, i64 {mode})"));
+                let handle = self.gen_fs_unpack(f, &boxed, span);
+                let sp = self.gen_alloc(f, 1);
+                self.store_slot(f, &sp, 0, &handle);
+                let out = self.ptr_to_int(f, &sp);
+                self.pool_value(f, &out, &CType::Struct("File".into()));
+                out
+            }
+            ("readAt", 3) => {
+                let h = handle_of(self, f, args[0]);
+                let off = self.gen_expr(f, args[1]);
+                let len = self.gen_expr(f, args[2]);
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @rt_fs_read_at(i64 {h}, i64 {off}, i64 {len})"));
+                let v = self.gen_fs_unpack(f, &boxed, span);
+                self.pool_value(f, &v, &CType::Str);
+                v
+            }
+            ("writeAt", 3) => {
+                let h = handle_of(self, f, args[0]);
+                let off = self.gen_expr(f, args[1]);
+                let bytes = self.gen_expr(f, args[2]);
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @rt_fs_write_at(i64 {h}, i64 {off}, i64 {bytes})"));
+                self.gen_fs_unpack(f, &boxed, span);
+                "0".to_string()
+            }
+            ("size", 1) => {
+                let h = handle_of(self, f, args[0]);
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @rt_fs_size(i64 {h})"));
+                self.gen_fs_unpack(f, &boxed, span)
+            }
+            ("sync", 1) => {
+                let h = handle_of(self, f, args[0]);
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @rt_fs_sync(i64 {h})"));
+                self.gen_fs_unpack(f, &boxed, span);
+                "0".to_string()
+            }
+            ("close", 1) => {
+                let h = handle_of(self, f, args[0]);
+                f.line(format!("call void @rt_fs_close(i64 {h})"));
                 "0".to_string()
             }
             _ => {
@@ -4084,9 +4139,9 @@ impl<'a> Cg<'a> {
         }
     }
 
-    /// Unpack `{ok, value, message}`: on ok return `value`; else build and
-    /// raise IoError { path, message }.
-    fn gen_fs_unpack(&mut self, f: &mut FnCtx, boxed: &str, path: &str, span: Span) -> String {
+    /// Unpack `{ok, value, message}`: on ok return `value`; on failure the
+    /// value slot carries the path — build and raise IoError { path, message }.
+    fn gen_fs_unpack(&mut self, f: &mut FnCtx, boxed: &str, span: Span) -> String {
         let ok = self.load_slot_from_int(f, boxed, 0);
         let value = self.load_slot_from_int(f, boxed, 1);
         let (fail_l, ok_l) = (self.label("fs.fail"), self.label("fs.ok"));
@@ -4096,9 +4151,7 @@ impl<'a> Cg<'a> {
         f.start_block(&fail_l);
         let msg = self.load_slot_from_int(f, boxed, 2);
         let errp = self.gen_alloc(f, 2);
-        // The error keeps the path alive alongside the surrounding code.
-        self.dup_value(f, &path.to_string(), &CType::Str);
-        self.store_slot(f, &errp, 0, path);
+        self.store_slot(f, &errp, 0, &value);
         self.store_slot(f, &errp, 1, &msg);
         let err = self.ptr_to_int(f, &errp);
         self.emit_fail_value(f, &err, &CType::Struct("IoError".to_string()), span);
@@ -5103,6 +5156,12 @@ declare i64 @rt_fs_exists(i64)
 declare i64 @rt_fs_list(i64)
 declare i64 @rt_fs_remove(i64)
 declare i64 @rt_fs_create_dir(i64)
+declare i64 @rt_fs_open(i64, i64)
+declare i64 @rt_fs_read_at(i64, i64, i64)
+declare i64 @rt_fs_write_at(i64, i64, i64)
+declare i64 @rt_fs_size(i64)
+declare i64 @rt_fs_sync(i64)
+declare void @rt_fs_close(i64)
 declare i64 @rt_read_line()
 declare i64 @rt_byte_at(i64, i64)
 declare i64 @rt_int_to_bytes(i64, i64)

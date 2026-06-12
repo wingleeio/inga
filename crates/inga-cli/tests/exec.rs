@@ -629,6 +629,32 @@ main :: () {
 }
 
 #[test]
+fn fs_handles_do_positional_io() {
+    let out = run(r#"
+use std/fs
+
+main :: () {
+    provide Fs
+    path = "/tmp/inga-exec-pages.db"
+    fs.remove(path) |> ignoreFailure
+    file = fs.open(path, "rw") |> catch { IoError -> File(-1) }
+    fs.writeAt(file, 8, "${intToBytes(2, 4)}${intToBytes(8888, 4)}") |> ignoreFailure
+    fs.writeAt(file, 0, "${intToBytes(1, 4)}${intToBytes(7777, 4)}") |> ignoreFailure
+    fs.sync(file) |> ignoreFailure
+    println(fs.size(file) |> catch { IoError -> -1 })
+    p2 = fs.readAt(file, 8, 8) |> catch { IoError -> "" }
+    println(bytesToInt(p2, 0, 4), bytesToInt(p2, 4, 4))
+    short = fs.readAt(file, 12, 100) |> catch { IoError -> "" }
+    println(byteLen(short))
+    fs.close(file)
+    println(fs.readAt(file, 0, 8) |> catch { IoError(p, m) -> m })
+    fs.remove(path) |> ignoreFailure
+}
+"#);
+    assert_eq!(out, "16\n2 8888\n4\nfile handle is closed\n");
+}
+
+#[test]
 fn fs_needs_the_capability() {
     let errs = check_errors(
         "use std/fs\n\nmain :: () {\n    println(fs.read(\"/x\") |> catch { IoError -> \"\" })\n}\n",

@@ -587,6 +587,22 @@ An Inga string is a length-prefixed byte buffer, so `fs.read` on a PNG
 and `http.get` on a PNG hand you the same kind of value — there is no
 separate bytes type to convert through. See `examples/notes.inga`.
 
+**File handles** are the random-access tier — `File { Int handle }`,
+positional reads/writes (no seek state, so a handle is safe to share
+across fibers), and `sync` for write-ahead discipline:
+
+```
+fs.open    (String path, String mode) -> File ! IoError   r | w | a | rw
+fs.readAt  (File, Int offset, Int len) -> String ! IoError up to len bytes; shorter at EOF
+fs.writeAt (File, Int offset, String bytes) -> Unit ! IoError
+fs.size    (File) -> Int ! IoError
+fs.sync    (File) -> Unit ! IoError                        fsync
+fs.close   (File)
+```
+
+With `intToBytes`/`bytesToInt` (§2 builtins) this is enough to write a
+pager: fixed-size pages, little-endian headers, fsync at commit points.
+
 ## 8.7 The program itself: `std/process`
 
 ```

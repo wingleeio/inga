@@ -72,11 +72,19 @@ memoryCache :: Cache {                       // an implementation
     set :: (key, value, ttl) { store.set(key, value) }
 }
 fetchAndCache :: (id) { ... }                // a function
+maxRetries = 3                               // a constant (also `Int port = 8080`)
 ```
 
 - Type-before-name everywhere: `(String id)` in parameters, `{ Int id }` in
   fields, `Cache cache` for capability bindings, `String msg` in patterns.
   Omitted types are inferred.
+- **Constants** are top-level `name = expr` (optionally typed:
+  `Int port = 8080`), evaluated once at startup in declaration order — a
+  constant may reference earlier constants, not later ones. Initializers
+  are pure: an uncaught `!` row or a `uses` row is a compile error (a
+  `catch` inside the initializer is fine). Values are deep-frozen, so
+  fibers read them without coordination. `pub` exports them like any
+  declaration.
 - `Name?` is an option type, `[Name]` a list type, `(Int, String)` a
   tuple type, `(Int) -> Bool` a function type (for callbacks), and the two
   builtin generic types are written the way hover renders them:

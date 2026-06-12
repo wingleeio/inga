@@ -167,6 +167,13 @@ all 151 gen-1 pokémon with real sprites — pages fetch on background fibers
 (`fiber.poll` per frame, the render fiber never parks), sprite PNGs become
 textures via `graphics.imageNew`, and prev/next page through the API.
 
+The disk works the same way: `std/fs` is the file system, `uses Fs` in a
+signature is how you know a function touches it, and failures raise
+`IoError { path, message }` — the path rides in the error.
+`fs.read/write/append/exists/list/remove/createDir`, all blocking on the
+calling fiber, all binary-safe (a file body and an http body are the same
+kind of string). Try it: `inga run examples/notes.inga`.
+
 ## Graphics, and a game
 
 Inga has GL-backed graphics bindings — the `std/graphics` module (window, rects,
@@ -210,7 +217,7 @@ crates/inga-lsp       language server (lsp-server / lsp-types)
 editors/vscode        VS Code extension + TextMate grammar
 editors/zed           Zed extension (tree-sitter highlighting + LSP)
 tree-sitter-inga      tree-sitter grammar (used by the Zed extension)
-examples/             hello.inga, retry.inga, shapes.inga, arena.inga, fibers.inga, fiber_errors.inga, http_client.inga, pokedex.inga, modules.inga (+ geometry.inga), user_service.inga
+examples/             hello.inga, retry.inga, shapes.inga, arena.inga, fibers.inga, fiber_errors.inga, http_client.inga, pokedex.inga, notes.inga, modules.inga (+ geometry.inga), user_service.inga
 games/                balatro.inga (+ game, util, cards, jokers, poker, state, logic_test) — a Balatro-style deckbuilder
 bench/                the same workloads in Inga, JavaScript, and Rust (see bench/README.md)
 docs/SPEC.md          language design: semantics, effect rows, execution strategy

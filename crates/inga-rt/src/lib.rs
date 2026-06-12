@@ -2112,6 +2112,93 @@ pub extern "C" fn rt_http_close(handle: i64) {
     }
 }
 
+// ---- file system -----------------------------------------------------------------
+// Every fallible call returns the http-style `{ok, value, message}` box;
+// codegen unpacks it and raises IoError { path, message } on failure.
+
+fn fs_path<'a>(path: i64) -> &'a str {
+    unsafe { std::str::from_utf8_unchecked(str_bytes(path)) }
+}
+
+fn fs_ok(value: i64) -> i64 {
+    http_box(1, value, 0)
+}
+
+fn fs_fail(e: impl std::fmt::Display) -> i64 {
+    http_box(0, 0, make_str(e.to_string().as_bytes()))
+}
+
+#[no_mangle]
+pub extern "C" fn rt_fs_read(path: i64) -> i64 {
+    // An Inga string is a length-prefixed byte buffer, so binary files
+    // pass through untouched (same as http bodies).
+    match std::fs::read(fs_path(path)) {
+        Ok(bytes) => fs_ok(make_str(&bytes)),
+        Err(e) => fs_fail(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_fs_write(path: i64, contents: i64) -> i64 {
+    match std::fs::write(fs_path(path), unsafe { str_bytes(contents) }) {
+        Ok(()) => fs_ok(0),
+        Err(e) => fs_fail(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_fs_append(path: i64, contents: i64) -> i64 {
+    use std::io::Write;
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(fs_path(path))
+        .and_then(|mut f| f.write_all(unsafe { str_bytes(contents) }));
+    match result {
+        Ok(()) => fs_ok(0),
+        Err(e) => fs_fail(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_fs_exists(path: i64) -> i64 {
+    std::path::Path::new(fs_path(path)).exists() as i64
+}
+
+#[no_mangle]
+pub extern "C" fn rt_fs_list(path: i64) -> i64 {
+    match std::fs::read_dir(fs_path(path)) {
+        Ok(entries) => {
+            let mut names: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect();
+            names.sort();
+            let items: Vec<i64> = names.iter().map(|n| make_str(n.as_bytes())).collect();
+            fs_ok(make_list(&items))
+        }
+        Err(e) => fs_fail(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_fs_remove(path: i64) -> i64 {
+    let p = std::path::Path::new(fs_path(path));
+    let result = if p.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) };
+    match result {
+        Ok(()) => fs_ok(0),
+        Err(e) => fs_fail(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_fs_create_dir(path: i64) -> i64 {
+    match std::fs::create_dir_all(fs_path(path)) {
+        Ok(()) => fs_ok(0),
+        Err(e) => fs_fail(e),
+    }
+}
+
 // ---- JSON encode/decode over descriptors ----------------------------------------
 
 fn encode_desc(v: i64, d: &mut Desc, out: &mut String) {

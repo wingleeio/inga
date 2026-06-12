@@ -522,6 +522,37 @@ open. Bodies decode with `json.decode(resp.body, User)` (std/json). The
 client is blocking (rustls underneath) — exactly right for
 thread-per-fiber, and the M:N reactor adopts these calls in phase 2.
 
+## 8.6 File system: `std/fs`
+
+```inga
+use std/fs
+
+main :: () {
+    provide Fs
+    fs.write("/tmp/out.txt", body) |> catch { IoError(path, m) -> println("${path}: ${m}") }
+}
+```
+
+Same shape as `std/http`: every operation carries `uses Fs`, satisfied
+by `provide Fs`; the service is `shared`, so file work crosses into
+fibers; calls block the calling fiber's thread. Failures raise
+`IoError { String path, String message }` — the path that failed rides
+in the error.
+
+```
+fs.read      (String path) -> String ! IoError       uses Fs   whole file; binary-safe
+fs.write     (String path, String contents) -> Unit ! IoError  create or truncate
+fs.append    (String path, String contents) -> Unit ! IoError  create if missing
+fs.exists    (String path) -> Bool                   uses Fs   (no error row)
+fs.list      (String dir) -> [String] ! IoError      uses Fs   entry names, sorted
+fs.remove    (String path) -> Unit ! IoError         uses Fs   file or directory tree
+fs.createDir (String path) -> Unit ! IoError         uses Fs   like mkdir -p
+```
+
+An Inga string is a length-prefixed byte buffer, so `fs.read` on a PNG
+and `http.get` on a PNG hand you the same kind of value — there is no
+separate bytes type to convert through. See `examples/notes.inga`.
+
 ## 9. Tooling (all in this repo)
 
 | Tool | Where | Notes |

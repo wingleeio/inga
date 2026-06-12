@@ -458,6 +458,41 @@ main :: () {
 }
 
 #[test]
+fn fs_round_trip_and_typed_errors() {
+    let out = run(r#"
+use std/fs
+
+main :: () {
+    provide Fs
+    dir = "/tmp/inga-exec-fs"
+    fs.remove(dir) |> ignoreFailure
+    fs.createDir(dir) |> ignoreFailure
+    fs.write("${dir}/a.txt", "hello") |> ignoreFailure
+    fs.append("${dir}/a.txt", ", world") |> ignoreFailure
+    println(fs.read("${dir}/a.txt") |> catch { IoError -> "?" })
+    println(fs.exists("${dir}/a.txt"), fs.exists("${dir}/missing"))
+    fs.write("${dir}/b.txt", "x") |> ignoreFailure
+    println(fs.list(dir) |> catch { IoError -> [] })
+    println(fs.read("${dir}/missing") |> catch { IoError(p, m) -> "caught: ${p}" })
+    fs.remove(dir) |> ignoreFailure
+    println(fs.exists(dir))
+}
+"#);
+    assert_eq!(
+        out,
+        "hello, world\ntrue false\n[\"a.txt\", \"b.txt\"]\ncaught: /tmp/inga-exec-fs/missing\nfalse\n"
+    );
+}
+
+#[test]
+fn fs_needs_the_capability() {
+    let errs = check_errors(
+        "use std/fs\n\nmain :: () {\n    println(fs.read(\"/x\") |> catch { IoError -> \"\" })\n}\n",
+    );
+    assert!(errs.iter().any(|e| e.contains("requires the service `Fs`")), "{errs:?}");
+}
+
+#[test]
 fn json_is_a_module_not_a_builtin() {
     let errs = check_errors("main :: () {\n    println(encode(1))\n}\n");
     assert!(errs.iter().any(|e| e.contains("unknown name `encode`")), "{errs:?}");

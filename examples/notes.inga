@@ -1,0 +1,40 @@
+// A tiny notes file — std/fs in one screen: `uses Fs` is how you know a
+// function touches the disk, and IoError carries the path that failed.
+// Run it: inga run examples/notes.inga
+
+use std/fs
+
+struct Note = { Int id, String text }
+
+notesDir :: () -> String {
+    "/tmp/inga-notes"
+}
+
+addNote :: (Int id, String text) -> Unit ! IoError uses Fs {
+    note = Note { id: id, text: text }
+    fs.write("${notesDir()}/${id}.txt", note.text)
+}
+
+readNote :: (String name) -> String uses Fs {
+    body = fs.read("${notesDir()}/${name}") |> catch { IoError -> "?" }
+    "${name}: ${body}"
+}
+
+readAll :: () -> [String] ! IoError uses Fs {
+    fs.list(notesDir()) |> map(readNote)
+}
+
+main :: () {
+    provide Fs
+    fs.remove(notesDir()) |> ignoreFailure
+    fs.createDir(notesDir()) |> catch { IoError(p, m) -> println("cannot create ${p}: ${m}") }
+
+    addNote(1, "ship std/fs") |> ignoreFailure
+    addNote(2, "then an http server") |> ignoreFailure
+
+    readAll()
+        |> catch { IoError(p, m) -> ["error reading ${p}: ${m}"] }
+        |> map((line) -> println(line))
+
+    fs.remove(notesDir()) |> ignoreFailure
+}

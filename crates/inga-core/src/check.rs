@@ -36,6 +36,10 @@ pub const FIBERS_SERVICE: &str = "Fibers";
 /// `provide Http`. Shared, so requests cross fiber boundaries.
 pub const HTTP_SERVICE: &str = "Http";
 pub const HTTP_ERROR: &str = "HttpError";
+/// The capability every `std/fs` operation needs; satisfied by
+/// `provide Fs`. Shared, so file access crosses fiber boundaries.
+pub const FS_SERVICE: &str = "Fs";
+pub const IO_ERROR: &str = "IoError";
 
 /// Surface names of primitive types that can appear in a `!` row.
 pub const PRIMITIVE_TAGS: [&str; 5] = ["Int", "Float", "Bool", "String", "Duration"];
@@ -297,7 +301,7 @@ impl<'a> Checker<'a> {
         };
         // Builtin structs available to every program (raised by `decode`,
         // `assert`/`assertEq`, and std/http) — shapes from one shared table.
-        for name in [DECODE_ERROR, ASSERT_FAILED, "HttpResponse", HTTP_ERROR, "HttpStream"] {
+        for name in [DECODE_ERROR, ASSERT_FAILED, "HttpResponse", HTTP_ERROR, "HttpStream", IO_ERROR] {
             let fields = builtin_struct_fields(name)
                 .iter()
                 .map(|(f, t)| {
@@ -319,16 +323,18 @@ impl<'a> Checker<'a> {
                 },
             );
         }
-        checker.services.insert(
-            HTTP_SERVICE.to_string(),
-            ServiceInfo {
-                methods: Vec::new(),
-                name_span: Span::default(),
-                module: CORE_MODULE,
-                is_pub: true,
-                shared: true,
-            },
-        );
+        for name in [HTTP_SERVICE, FS_SERVICE] {
+            checker.services.insert(
+                name.to_string(),
+                ServiceInfo {
+                    methods: Vec::new(),
+                    name_span: Span::default(),
+                    module: CORE_MODULE,
+                    is_pub: true,
+                    shared: true,
+                },
+            );
+        }
         // Fieldless builtins raised by the fiber machinery.
         for name in [INTERRUPTED, TIMEOUT] {
             checker.structs.insert(
@@ -1806,6 +1812,7 @@ impl<'a> Checker<'a> {
             "std/fiber" => return self.check_fiber_call(member, member_span, args, span),
             "std/http" => return self.check_http_call(member, member_span, args, span),
             "std/json" => return self.check_json_call(member, member_span, args, span),
+            "std/fs" => return self.check_fs_call(member, member_span, args, span),
             _ => {}
         }
         let Some(target) = self.modules.iter().position(|m| m.key == import.target) else {
@@ -2386,6 +2393,91 @@ impl<'a> Checker<'a> {
                 self.error(
                     member_span,
                     format!("`std/http` has no member `{member}` (get, post, send, openStream, read, close)"),
+                );
+                for arg in args {
+                    self.check_expr(arg);
+                }
+                Type::Unknown
+            }
+        }
+    }
+
+    /// `fs.*` — std/fs: blocking file I/O. Failures raise IoError; the
+    /// `Fs` capability names the file system in the row, like `Http`.
+    fn check_fs_call(
+        &mut self,
+        member: &str,
+        member_span: Span,
+        args: &[&Expr],
+        span: Span,
+    ) -> Type {
+        let arity = |s: &mut Self, n: usize| -> bool {
+            if args.len() != n {
+                s.error(
+                    span,
+                    format!("`fs.{member}` expects {n} argument(s), found {}", args.len()),
+                );
+                for arg in args {
+                    s.check_expr(arg);
+                }
+                return false;
+            }
+            true
+        };
+        let str_arg = |s: &mut Self, i: usize| {
+            let t = s.check_expr(args[i]);
+            s.unify_at(&Type::Str, &t, args[i].span, "fs argument");
+        };
+        match member {
+            "read" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                str_arg(self, 0);
+                self.add_cap_row(FS_SERVICE);
+                self.add_error_row(IO_ERROR);
+                Type::Str
+            }
+            "write" | "append" => {
+                if !arity(self, 2) {
+                    return Type::Unknown;
+                }
+                str_arg(self, 0);
+                str_arg(self, 1);
+                self.add_cap_row(FS_SERVICE);
+                self.add_error_row(IO_ERROR);
+                Type::Unit
+            }
+            "exists" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                str_arg(self, 0);
+                self.add_cap_row(FS_SERVICE);
+                Type::Bool
+            }
+            "list" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                str_arg(self, 0);
+                self.add_cap_row(FS_SERVICE);
+                self.add_error_row(IO_ERROR);
+                Type::List(Box::new(Type::Str))
+            }
+            "remove" | "createDir" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                str_arg(self, 0);
+                self.add_cap_row(FS_SERVICE);
+                self.add_error_row(IO_ERROR);
+                Type::Unit
+            }
+            _ => {
+                self.error(
+                    member_span,
+                    format!("`std/fs` has no member `{member}` (read, write, append, exists, list, remove, createDir)"),
                 );
                 for arg in args {
                     self.check_expr(arg);
@@ -3701,6 +3793,23 @@ impl<'a> Checker<'a> {
                 provided.insert(HTTP_SERVICE.to_string());
                 continue;
             }
+            if item.name == "Fs" {
+                if let Some(args) = &item.args {
+                    self.error(item.name_span, "`Fs` takes no arguments: `provide Fs`");
+                    for arg in args {
+                        self.check_expr(arg);
+                    }
+                }
+                if self.record_info {
+                    self.info.hovers.push((
+                        item.name_span,
+                        "Fs — the built-in file system; satisfies `Fs` for this scope"
+                            .to_string(),
+                    ));
+                }
+                provided.insert(FS_SERVICE.to_string());
+                continue;
+            }
             if item.name == "Runtime" {
                 // The fiber runtime: `provide Runtime(n)` (n workers; default
                 // = cores). Satisfies the builtin `Fibers` capability.
@@ -4115,6 +4224,13 @@ impl<'a> Checker<'a> {
                 ));
                 return;
             }
+            "std/fs" => {
+                self.info.hovers.push((
+                    u.path_span,
+                    "std/fs — file system: fs.read/write/append/exists/list/remove/createDir; needs `provide Fs`".to_string(),
+                ));
+                return;
+            }
             _ => {}
         }
         let ref_module = self.module_of(u.path_span);
@@ -4261,6 +4377,7 @@ pub fn builtin_struct_fields(name: &str) -> &'static [(&'static str, &'static st
         "HttpError" => &[("status", "Int"), ("message", "String")],
         "HttpStream" => &[("handle", "Int"), ("status", "Int")],
         "DecodeError" | "AssertionError" => &[("message", "String")],
+        "IoError" => &[("path", "String"), ("message", "String")],
         _ => &[],
     }
 }
@@ -4290,6 +4407,15 @@ pub fn std_module_members(target: &str) -> &'static [(&'static str, &'static str
         "std/json" => &[
             ("encode", "json.encode(value) -> String — JSON"),
             ("decode", "json.decode(raw, StructName) -> a ! DecodeError — parse JSON into a struct"),
+        ],
+        "std/fs" => &[
+            ("read", "fs.read(path) -> String ! IoError uses Fs — the whole file; binary passes through"),
+            ("write", "fs.write(path, contents) -> Unit ! IoError uses Fs — create or truncate"),
+            ("append", "fs.append(path, contents) -> Unit ! IoError uses Fs — create if missing"),
+            ("exists", "fs.exists(path) -> Bool uses Fs"),
+            ("list", "fs.list(dir) -> [String] ! IoError uses Fs — entry names, sorted"),
+            ("remove", "fs.remove(path) -> Unit ! IoError uses Fs — file or directory tree"),
+            ("createDir", "fs.createDir(path) -> Unit ! IoError uses Fs — like mkdir -p"),
         ],
         "std/http" => &[
             ("get", "http.get(url) -> HttpResponse ! HttpError uses Http — a non-2xx status is data, not a failure"),

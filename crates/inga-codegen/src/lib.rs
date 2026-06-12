@@ -185,12 +185,14 @@ impl<'a> Cg<'a> {
             .insert("HttpError".into(), vec!["status".into(), "message".into()]);
         self.struct_meta
             .insert("HttpStream".into(), vec!["handle".into(), "status".into()]);
+        self.struct_meta.insert("IoError".into(), vec!["path".into(), "message".into()]);
         for (i, tag) in [
             "DecodeError",
             "AssertionError",
             "InterruptedError",
             "TimeoutError",
             "HttpError",
+            "IoError",
             "Int",
             "Float",
             "Bool",
@@ -1071,6 +1073,9 @@ impl<'a> Cg<'a> {
                     if module == "json" {
                         return self.gen_json(f, name, args, span);
                     }
+                    if module == "fs" {
+                        return self.gen_fs(f, name, args, span);
+                    }
                     if let Some(v) = self.gen_qualified(f, module, name, args, span) {
                         return v;
                     }
@@ -1257,6 +1262,9 @@ impl<'a> Cg<'a> {
                 }
                 if module == "json" {
                     return self.gen_json(f, name, args, span);
+                }
+                if module == "fs" {
+                    return self.gen_fs(f, name, args, span);
                 }
                 if let Some(v) = self.gen_qualified(f, module, name, args, span) {
                     return v;
@@ -2087,6 +2095,10 @@ impl<'a> Cg<'a> {
         for item in impls {
             if item.name == "Http" {
                 f.evidence.insert("Http".to_string(), "0".to_string());
+                continue;
+            }
+            if item.name == "Fs" {
+                f.evidence.insert("Fs".to_string(), "0".to_string());
                 continue;
             }
             if item.name == "Runtime" {
@@ -3779,6 +3791,77 @@ impl<'a> Cg<'a> {
         a
     }
 
+    /// `fs.*` — std/fs: blocking file I/O on the calling fiber's thread.
+    fn gen_fs(&mut self, f: &mut FnCtx, name: &str, args: &[&Expr], span: Span) -> String {
+        match (name, args.len()) {
+            ("read", 1) => {
+                let path = self.gen_expr(f, args[0]);
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @rt_fs_read(i64 {path})"));
+                let v = self.gen_fs_unpack(f, &boxed, &path, span);
+                self.pool_value(f, &v, &CType::Str);
+                v
+            }
+            ("write", 2) | ("append", 2) => {
+                let path = self.gen_expr(f, args[0]);
+                let contents = self.gen_expr(f, args[1]);
+                let rt = if name == "write" { "rt_fs_write" } else { "rt_fs_append" };
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @{rt}(i64 {path}, i64 {contents})"));
+                self.gen_fs_unpack(f, &boxed, &path, span);
+                "0".to_string()
+            }
+            ("exists", 1) => {
+                let path = self.gen_expr(f, args[0]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_fs_exists(i64 {path})"));
+                out
+            }
+            ("list", 1) => {
+                let path = self.gen_expr(f, args[0]);
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @rt_fs_list(i64 {path})"));
+                let v = self.gen_fs_unpack(f, &boxed, &path, span);
+                self.pool_value(f, &v, &CType::List(Box::new(CType::Str)));
+                v
+            }
+            ("remove", 1) | ("createDir", 1) => {
+                let path = self.gen_expr(f, args[0]);
+                let rt = if name == "remove" { "rt_fs_remove" } else { "rt_fs_create_dir" };
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @{rt}(i64 {path})"));
+                self.gen_fs_unpack(f, &boxed, &path, span);
+                "0".to_string()
+            }
+            _ => {
+                self.unsupported(span, "this `fs` operation shape");
+                "0".to_string()
+            }
+        }
+    }
+
+    /// Unpack `{ok, value, message}`: on ok return `value`; else build and
+    /// raise IoError { path, message }.
+    fn gen_fs_unpack(&mut self, f: &mut FnCtx, boxed: &str, path: &str, span: Span) -> String {
+        let ok = self.load_slot_from_int(f, boxed, 0);
+        let value = self.load_slot_from_int(f, boxed, 1);
+        let (fail_l, ok_l) = (self.label("fs.fail"), self.label("fs.ok"));
+        let c = self.tmp();
+        f.line(format!("{c} = icmp eq i64 {ok}, 0"));
+        f.line(format!("br i1 {c}, label %{fail_l}, label %{ok_l}"));
+        f.start_block(&fail_l);
+        let msg = self.load_slot_from_int(f, boxed, 2);
+        let errp = self.gen_alloc(f, 2);
+        // The error keeps the path alive alongside the surrounding code.
+        self.dup_value(f, &path.to_string(), &CType::Str);
+        self.store_slot(f, &errp, 0, path);
+        self.store_slot(f, &errp, 1, &msg);
+        let err = self.ptr_to_int(f, &errp);
+        self.emit_fail_value(f, &err, &CType::Struct("IoError".to_string()), span);
+        f.start_block(&ok_l);
+        value
+    }
+
     /// Race two handles: first completion in shape-tie order wins, the
     /// loser is interrupted, the winner's result re-raises/returns here.
     fn gen_race_join(&mut self, f: &mut FnCtx, ha: &str, hb: &str, span: Span) -> String {
@@ -4768,6 +4851,13 @@ declare void @rt_gfx_image(i64, i64, i64, i64, i64)
 declare i64 @rt_http_send(i64, i64, i64, i64)
 declare i64 @rt_http_open(i64)
 declare i64 @rt_http_read(i64)
+declare i64 @rt_fs_read(i64)
+declare i64 @rt_fs_write(i64, i64)
+declare i64 @rt_fs_append(i64, i64)
+declare i64 @rt_fs_exists(i64)
+declare i64 @rt_fs_list(i64)
+declare i64 @rt_fs_remove(i64)
+declare i64 @rt_fs_create_dir(i64)
 declare void @rt_http_close(i64)
 declare i64 @rt_random(i64)
 declare void @rt_gfx_run(i64, i64, i64, i64)

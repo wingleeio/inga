@@ -127,6 +127,10 @@ pub struct RowFact {
 pub struct Facts {
     /// Top-level constants, in declaration (= initialization) order.
     pub consts: Vec<(String, CType)>,
+    /// Function parameters annotated with a function type carrying a `uses`
+    /// row: (function, param index) -> the declared caps. Such callbacks
+    /// receive evidence at each call instead of capturing it at creation.
+    pub param_contracts: HashMap<(String, usize), Vec<String>>,
     pub funcs: HashMap<String, RowFact>,
     /// Keyed by (service, method): the union row across all implementations.
     pub methods: HashMap<(String, String), RowFact>,
@@ -708,6 +712,19 @@ impl<'a> Checker<'a> {
                 }
                 Decl::Func(d) => {
                     let mut tyvars = HashMap::new();
+                    for (i, p) in d.sig.params.iter().enumerate() {
+                        if let Some(TypeExpr::Func { caps, .. }) = &p.ty {
+                            if !caps.is_empty() {
+                                let mut names: Vec<String> =
+                                    caps.iter().map(|(n, _)| n.clone()).collect();
+                                names.sort();
+                                self.info
+                                    .facts
+                                    .param_contracts
+                                    .insert((d.name.clone(), i), names);
+                            }
+                        }
+                    }
                     let params: Vec<Type> = d
                         .sig
                         .params

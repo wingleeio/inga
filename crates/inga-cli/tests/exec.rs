@@ -1010,6 +1010,86 @@ fn named_field_construction_is_checked() {
 }
 
 #[test]
+fn provide_reaches_contracted_callbacks() {
+    // The middleware pattern: a callback whose type declares `uses Session`
+    // receives evidence at each call, so a `provide` around the call site
+    // (inside another function, inside a lambda) reaches it. main never
+    // provides Session.
+    let out = run(r#"
+struct User = { Int id, String name }
+
+service Session {
+    User user
+}
+
+loggedIn :: Session {
+    User user
+}
+
+dashboard :: (String path) -> String uses Session {
+    Session session
+    "${session.user.name} at ${path}"
+}
+
+withAuth :: (((String) -> String uses Session) inner) {
+    (req) -> {
+        match req {
+            "${String path}?u=${String name}" -> {
+                provide loggedIn(User { id: 1, name: name })
+                inner(path)
+            }
+            other -> "401"
+        }
+    }
+}
+
+main :: () {
+    app = dashboard |> withAuth
+    println(app("/home?u=wing"))
+    println(app("/nope"))
+}
+"#);
+    assert_eq!(out, "wing at /home\n401\n");
+}
+
+#[test]
+fn contracted_lambda_acquires_at_call_site() {
+    // A lambda passed to a contracted parameter can bind the capability in
+    // its body — the evidence arrives with the call.
+    let out = run(r#"
+service Greeter {
+    hello :: () -> String
+}
+
+en :: Greeter {
+    hello :: () {
+        "hello"
+    }
+}
+
+fr :: Greeter {
+    hello :: () {
+        "bonjour"
+    }
+}
+
+twice :: ((() -> String uses Greeter) f) -> String {
+    a = { provide en; f() }
+    b = { provide fr; f() }
+    "${a} / ${b}"
+}
+
+main :: () {
+    println(twice(() -> {
+        Greeter g
+        g.hello()
+    }))
+}
+"#);
+    assert_eq!(out, "hello / bonjour\n");
+}
+
+#[test]
 fn parameterized_impls_provide_args() {
     let out = run(r#"
 struct User = { Int id, String name }

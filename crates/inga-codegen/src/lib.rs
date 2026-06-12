@@ -545,6 +545,11 @@ impl<'a> Cg<'a> {
         }
         let param_ctys =
             self.info.facts.func_params.get(&decl.name).cloned().unwrap_or_default();
+        for (i, param) in decl.sig.params.iter().enumerate() {
+            if let Some(caps) = self.info.facts.param_contracts.get(&(decl.name.clone(), i)) {
+                f.param_contracts.insert(param.name.clone(), caps.clone());
+            }
+        }
         let mut param_slots = Vec::new();
         for (i, param) in decl.sig.params.iter().enumerate() {
             let reg = format!("%p.{}", param.name);
@@ -1206,6 +1211,29 @@ impl<'a> Cg<'a> {
                 }
             }
         }
+        // Calling a callback with a `uses` contract: evidence for the
+        // declared caps travels with the call, from this scope's provides.
+        if let ExprKind::Var(name) = &callee.kind {
+            if let Some(caps) = f.param_contracts.get(name).cloned() {
+                let callee_v = self.gen_expr(f, callee);
+                let mut ev = Vec::new();
+                for cap in &caps {
+                    match f.evidence.get(cap) {
+                        Some(e) => ev.push(e.clone()),
+                        None => {
+                            self.unsupported(
+                                span,
+                                &format!("calling `{name}` without `{cap}` provided"),
+                            );
+                            ev.push("0".to_string());
+                        }
+                    }
+                }
+                let arg_vals: Vec<String> = args.iter().map(|a| self.gen_expr(f, a)).collect();
+                let result_cty = self.ctype_of_span(span);
+                return self.gen_contract_call(f, &callee_v, &ev, &arg_vals, &result_cty);
+            }
+        }
         // Calling a function value (closure).
         let callee_v = self.gen_expr(f, callee);
         let arg_vals: Vec<String> = args.iter().map(|a| self.gen_expr(f, a)).collect();
@@ -1288,7 +1316,19 @@ impl<'a> Cg<'a> {
         }
         for (i, arg) in args.iter().enumerate() {
             let lazy = decl.sig.params.get(i).is_some_and(|p| p.lazy);
-            let v = if lazy { self.gen_thunk(f, arg) } else { self.gen_expr(f, arg) };
+            let contract = self
+                .info
+                .facts
+                .param_contracts
+                .get(&(decl.name.clone(), i))
+                .cloned();
+            let v = if let Some(caps) = contract {
+                self.gen_contract_closure(f, arg, &caps, span)
+            } else if lazy {
+                self.gen_thunk(f, arg)
+            } else {
+                self.gen_expr(f, arg)
+            };
             call_args.push(format!("i64 {v}"));
         }
         let name = format!("@ing.fn.{}", decl.name);
@@ -2563,6 +2603,12 @@ impl<'a> Cg<'a> {
         self.label += 1;
         let fn_name = format!("@ing.cl{}", self.label);
         let mut inner = FnCtx::new(true);
+        // A captured contracted callback keeps its calling convention
+        // (the lambda's own params shadow any inherited name).
+        inner.param_contracts = f.param_contracts.clone();
+        for p in params {
+            inner.param_contracts.remove(&p.name);
+        }
         let mut inner_params = vec!["ptr %env".to_string()];
         for p in params {
             inner_params.push(format!("i64 %p.{}", p.name));
@@ -2630,6 +2676,265 @@ impl<'a> Cg<'a> {
         let out = self.ptr_to_int(f, &ptr);
         self.pool_value(f, &out, &CType::Func);
         (out, ptr, capture_ctys)
+    }
+
+    /// Call a contract closure: `fn(env, evidence…, args…)`.
+    fn gen_contract_call(
+        &mut self,
+        f: &mut FnCtx,
+        closure: &str,
+        evidence: &[String],
+        args: &[String],
+        result_cty: &CType,
+    ) -> String {
+        let p = self.tmp();
+        f.line(format!("{p} = inttoptr i64 {closure} to ptr"));
+        let fp_i = self.tmp();
+        f.line(format!("{fp_i} = load i64, ptr {p}"));
+        let fp = self.tmp();
+        f.line(format!("{fp} = inttoptr i64 {fp_i} to ptr"));
+        let mut call_args = vec![format!("ptr {p}")];
+        for e in evidence {
+            call_args.push(format!("i64 {e}"));
+        }
+        for a in args {
+            call_args.push(format!("i64 {a}"));
+        }
+        let r = self.tmp();
+        f.line(format!("{r} = call {{ i64, i64 }} {fp}({})", call_args.join(", ")));
+        let out = self.check_failure(f, &r);
+        self.pool_value(f, &out, &result_cty.clone());
+        out
+    }
+
+    /// A value flowing into a `uses`-contracted callback parameter: build a
+    /// closure whose fn takes evidence for the declared caps at every call
+    /// (so a `provide` around the call site reaches it — middleware style).
+    fn gen_contract_closure(
+        &mut self,
+        f: &mut FnCtx,
+        expr: &Expr,
+        caps: &[String],
+        span: Span,
+    ) -> String {
+        match &expr.kind {
+            ExprKind::Lambda { params, body } => {
+                self.gen_contract_lambda(f, params, body, caps)
+            }
+            ExprKind::Var(name) if f.lookup(name).is_some() => {
+                // A local: only another parameter with the identical
+                // contract shares the ABI and can pass through.
+                if f.param_contracts.get(name).map(|c| c.as_slice()) == Some(caps) {
+                    self.gen_expr(f, expr)
+                } else {
+                    self.unsupported(
+                        span,
+                        "passing this value to a `uses`-contracted callback parameter (pass a lambda, a function name, or a parameter with the same contract)",
+                    );
+                    "0".to_string()
+                }
+            }
+            ExprKind::Var(name) => {
+                let Some(decl) = self.funcs.get(name.as_str()).copied() else {
+                    self.unsupported(span, "this `uses`-contracted callback");
+                    return "0".to_string();
+                };
+                self.gen_contract_fn_wrapper(f, decl, caps, span)
+            }
+            _ => {
+                self.unsupported(
+                    span,
+                    "this expression as a `uses`-contracted callback (pass a lambda or a function name)",
+                );
+                "0".to_string()
+            }
+        }
+    }
+
+    /// A lambda flowing into a contracted parameter: like gen_closure_parts,
+    /// but the contract's evidence arrives as call parameters (overriding
+    /// anything captured at creation), so the *call site's* provides win.
+    fn gen_contract_lambda(
+        &mut self,
+        f: &mut FnCtx,
+        params: &[Param],
+        body: &Expr,
+        caps: &[String],
+    ) -> String {
+        let mut captured: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let param_names: std::collections::HashSet<&str> =
+            params.iter().map(|p| p.name.as_str()).collect();
+        collect_vars(body, &mut |name| {
+            if !param_names.contains(name)
+                && f.lookup(name).is_some()
+                && seen.insert(name.to_string())
+            {
+                captured.push(name.to_string());
+            }
+        });
+        let evidence: Vec<(String, String)> =
+            f.evidence.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let capture_ctys: Vec<CType> = captured
+            .iter()
+            .map(|name| f.lookup(name).map(|l| l.cty).unwrap_or(CType::Int))
+            .collect();
+
+        self.label += 1;
+        let fn_name = format!("@ing.cl{}", self.label);
+        let mut inner = FnCtx::new(true);
+        inner.param_contracts = f.param_contracts.clone();
+        for p in params {
+            inner.param_contracts.remove(&p.name);
+        }
+        let mut inner_params = vec!["ptr %env".to_string()];
+        for (i, _) in caps.iter().enumerate() {
+            inner_params.push(format!("i64 %ev.{i}"));
+        }
+        for p in params {
+            inner_params.push(format!("i64 %p.{}", p.name));
+        }
+        for (i, name) in captured.iter().enumerate() {
+            let slot = inner.alloca(self, name);
+            let gep = self.tmp();
+            inner.line(format!("{gep} = getelementptr i64, ptr %env, i64 {}", 1 + i));
+            let v = self.tmp();
+            inner.line(format!("{v} = load i64, ptr {gep}"));
+            inner.line(format!("store i64 {v}, ptr {slot}"));
+            inner
+                .scopes
+                .last_mut()
+                .unwrap()
+                .insert(name.clone(), LocalVar { slot, lazy: false, cty: capture_ctys[i].clone() });
+        }
+        for (i, (service, _)) in evidence.iter().enumerate() {
+            let gep = self.tmp();
+            inner.line(format!(
+                "{gep} = getelementptr i64, ptr %env, i64 {}",
+                1 + captured.len() + i
+            ));
+            let v = self.tmp();
+            inner.line(format!("{v} = load i64, ptr {gep}"));
+            inner.evidence.insert(service.clone(), v);
+        }
+        // The contract's evidence params take precedence over captures.
+        for (i, cap) in caps.iter().enumerate() {
+            inner.evidence.insert(cap.clone(), format!("%ev.{i}"));
+        }
+        for p in params {
+            let slot = inner.alloca(self, &p.name);
+            inner.line(format!("store i64 %p.{}, ptr {slot}", p.name));
+            inner
+                .scopes
+                .last_mut()
+                .unwrap()
+                .insert(p.name.clone(), LocalVar { slot, lazy: false, cty: CType::Int });
+        }
+        let v = self.gen_expr(&mut inner, body);
+        let body_cty = self.ctype_of(body);
+        inner.ret(self, &v, Some(&body_cty));
+        self.emit_fn(&fn_name, &inner_params, inner);
+
+        let slots = (1 + captured.len() + evidence.len()) as i64;
+        let ptr = self.gen_alloc(f, slots);
+        self.store_slot(f, &ptr, 0, &format!("ptrtoint (ptr {fn_name} to i64)"));
+        for (i, name) in captured.iter().enumerate() {
+            let local = f.lookup(name).unwrap();
+            let v = self.tmp();
+            f.line(format!("{v} = load i64, ptr {}", local.slot));
+            let cty = capture_ctys[i].clone();
+            self.dup_value(f, &v, &cty);
+            self.store_slot(f, &ptr, 1 + i as i64, &v);
+        }
+        for (i, (_, reg)) in evidence.iter().enumerate() {
+            self.store_slot(f, &ptr, (1 + captured.len() + i) as i64, reg);
+        }
+        self.ptr_to_int(f, &ptr)
+    }
+
+    /// Wrap a top-level function as a contract closure: evidence for caps in
+    /// the contract arrives per call; any remaining caps the function needs
+    /// are captured now, from the creation scope.
+    fn gen_contract_fn_wrapper(
+        &mut self,
+        f: &mut FnCtx,
+        decl: &'a FuncDecl,
+        caps: &[String],
+        span: Span,
+    ) -> String {
+        let row = self.func_row(&decl.name);
+        let fallible = self.func_fallible(decl);
+        let captured: Vec<String> = row
+            .caps
+            .iter()
+            .filter(|c| !caps.contains(c))
+            .cloned()
+            .collect();
+
+        self.label += 1;
+        let fn_name = format!("@ing.cw{}", self.label);
+        let mut inner = FnCtx::new(true);
+        let mut inner_params = vec!["ptr %env".to_string()];
+        for (i, _) in caps.iter().enumerate() {
+            inner_params.push(format!("i64 %ev.{i}"));
+        }
+        for (i, _) in decl.sig.params.iter().enumerate() {
+            inner_params.push(format!("i64 %a{i}"));
+        }
+        // Captured evidence loads from the env record.
+        let mut captured_regs = Vec::new();
+        for (i, _) in captured.iter().enumerate() {
+            let gep = self.tmp();
+            inner.line(format!("{gep} = getelementptr i64, ptr %env, i64 {}", 1 + i));
+            let v = self.tmp();
+            inner.line(format!("{v} = load i64, ptr {gep}"));
+            captured_regs.push(v);
+        }
+        let mut call_args = Vec::new();
+        for cap in &row.caps {
+            if let Some(i) = caps.iter().position(|c| c == cap) {
+                call_args.push(format!("i64 %ev.{i}"));
+            } else {
+                let i = captured.iter().position(|c| c == cap).unwrap();
+                call_args.push(format!("i64 {}", captured_regs[i]));
+            }
+        }
+        for (i, _) in decl.sig.params.iter().enumerate() {
+            call_args.push(format!("i64 %a{i}"));
+        }
+        let target = format!("@ing.fn.{}", decl.name);
+        if fallible {
+            let r = self.tmp();
+            inner.line(format!("{r} = call {{ i64, i64 }} {target}({})", call_args.join(", ")));
+            inner.line(format!("ret {{ i64, i64 }} {r}"));
+        } else {
+            let r = self.tmp();
+            inner.line(format!("{r} = call i64 {target}({})", call_args.join(", ")));
+            let a = self.tmp();
+            inner.line(format!("{a} = insertvalue {{ i64, i64 }} undef, i64 {r}, 0"));
+            let b = self.tmp();
+            inner.line(format!("{b} = insertvalue {{ i64, i64 }} {a}, i64 0, 1"));
+            inner.line(format!("ret {{ i64, i64 }} {b}"));
+        }
+        self.emit_fn(&fn_name, &inner_params, inner);
+
+        let ptr = self.gen_alloc(f, (1 + captured.len()) as i64);
+        self.store_slot(f, &ptr, 0, &format!("ptrtoint (ptr {fn_name} to i64)"));
+        for (i, cap) in captured.iter().enumerate() {
+            match f.evidence.get(cap) {
+                Some(e) => {
+                    let e = e.clone();
+                    self.store_slot(f, &ptr, 1 + i as i64, &e);
+                }
+                None => {
+                    self.unsupported(
+                        span,
+                        &format!("`{}` needs `{cap}`, which is neither in the callback's contract nor provided here", decl.name),
+                    );
+                }
+            }
+        }
+        self.ptr_to_int(f, &ptr)
     }
 
     fn gen_closure_call(
@@ -5342,6 +5647,9 @@ struct FnCtx {
     /// "store args into the param slots, jump back to the loop head".
     tco: Option<(String, Vec<String>, Vec<bool>)>,
     tail_spans: std::collections::HashSet<(u32, u32)>,
+    /// Parameters whose annotated function type carries a `uses` row:
+    /// name -> declared caps (sorted). Calls pass evidence per call.
+    param_contracts: HashMap<String, Vec<String>>,
     fallible: bool,
     needs_propagate: bool,
     needs_panic: bool,
@@ -5362,6 +5670,7 @@ impl FnCtx {
             pool: Vec::new(),
             tco: None,
             tail_spans: std::collections::HashSet::new(),
+            param_contracts: HashMap::new(),
             fallible,
             needs_propagate: false,
             needs_panic: false,

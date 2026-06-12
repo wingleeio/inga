@@ -186,6 +186,30 @@ match req.path {
 Try it, then curl localhost:8080/visit and localhost:8080/users/42:
 `inga run examples/server.inga`.
 
+And middleware is just functions — including middleware that **provides**.
+A callback type may carry a `uses` row; such callbacks get their
+capabilities at each call, so a `provide` around the call site reaches
+them:
+
+```inga
+withAuth :: (((HttpRequest) -> HttpResponse uses Session) inner) {
+    (req) -> {
+        provide loggedIn(authenticate(req))   // a parameterized impl: per-request state
+        inner(req)                            // the handler's `uses Session`, satisfied here
+    }
+}
+
+main :: () {
+    app = dashboard |> withAuth |> withLogging   // main never provides Session
+    http.serve(8080, app)
+}
+```
+
+Sessions live exactly as long as one request, setup failures are typed
+errors at the provide site, and `service Session { User user }` exposes
+the value directly (`session.user`, no getter). Try it:
+`inga run examples/middleware.inga`, then curl /dash?token=42.
+
 The disk works the same way: `std/fs` is the file system, `uses Fs` in a
 signature is how you know a function touches it, and failures raise
 `IoError { path, message }` — the path rides in the error.
@@ -253,7 +277,7 @@ crates/inga-lsp       language server (lsp-server / lsp-types)
 editors/vscode        VS Code extension + TextMate grammar
 editors/zed           Zed extension (tree-sitter highlighting + LSP)
 tree-sitter-inga      tree-sitter grammar (used by the Zed extension)
-examples/             hello.inga, retry.inga, shapes.inga, arena.inga, fibers.inga, fiber_errors.inga, http_client.inga, pokedex.inga, notes.inga, server.inga, picker.inga, modules.inga (+ geometry.inga), user_service.inga
+examples/             hello.inga, retry.inga, shapes.inga, arena.inga, fibers.inga, fiber_errors.inga, http_client.inga, pokedex.inga, notes.inga, server.inga, middleware.inga, picker.inga, modules.inga (+ geometry.inga), user_service.inga
 games/                balatro.inga (+ game, util, cards, jokers, poker, state, logic_test) — a Balatro-style deckbuilder
 bench/                the same workloads in Inga, JavaScript, and Rust (see bench/README.md)
 docs/SPEC.md          language design: semantics, effect rows, execution strategy

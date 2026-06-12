@@ -1,0 +1,78 @@
+// Middleware that *provides* — the request pipeline as plain functions.
+//
+// `dashboard` says `uses Session`; nobody provides Session in main.
+// Instead `withAuth` authenticates each request and provides a Session
+// that exists only for that call: a callback type with a `uses` row (a
+// contract) receives its capabilities at each call, so a `provide`
+// around the call site reaches it.
+//
+//   inga run examples/middleware.inga
+//   curl 'localhost:8080/dash?token=42'
+//   curl 'localhost:8080/dash'
+
+use std/http
+use std/json
+
+port = 8080
+
+struct User      = { Int id, String name }
+struct AuthError = { String why }
+
+service Session {
+    User user
+}
+
+loggedIn :: Session {
+    User user
+}
+
+service Logger {
+    info :: (String m)
+}
+
+consoleLogger :: Logger {
+    info :: (m) {
+        println("[log] ${m}")
+    }
+}
+
+authenticate :: (String query) -> User ! AuthError {
+    match query {
+        "token=${Int id}" -> User { id: id, name: "user-${id}" }
+        _                 -> fail AuthError("missing or bad token")
+    }
+}
+
+// The handler declares what it needs; middleware satisfies it per request.
+dashboard :: (HttpRequest req) -> HttpResponse uses Session {
+    Session session
+    HttpResponse(200, json.encode(session.user))
+}
+
+withAuth :: ((HttpRequest) -> HttpResponse uses Session inner) {
+    (req) -> {
+        user = authenticate(req.query) |> catch { AuthError(why) -> User { id: -1, name: why } }
+        if user.id < 0 {
+            HttpResponse(401, user.name)
+        } else {
+            provide loggedIn(user)
+            inner(req)
+        }
+    }
+}
+
+withLogging :: ((HttpRequest) -> HttpResponse inner) {
+    Logger log
+    (req) -> {
+        resp = inner(req)
+        log.info("${req.method} ${req.path} -> ${resp.status}")
+        resp
+    }
+}
+
+main :: () {
+    provide Http, consoleLogger
+    app = dashboard |> withAuth |> withLogging
+    println("listening on :${port} — try /dash?token=42")
+    http.serve(port, app) |> catch { HttpError(status, m) -> println("server: ${m}") }
+}

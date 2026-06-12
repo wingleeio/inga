@@ -244,6 +244,33 @@ a fallible or capability-using setup adds to *that* function's rows —
 an Effect-style layer whose construction errors are typed and must be
 handled (or carried) like any other.
 
+**Capability contracts on callbacks.** A function-type annotation may
+carry a `uses` row — `(HttpRequest) -> HttpResponse uses Session` — and
+a callback parameter of that type receives evidence for those services
+*at every call*, instead of capturing it where the callback was created.
+A `provide` around the call site therefore reaches the callback, which
+is the middleware pattern:
+
+```inga
+withAuth :: (((HttpRequest) -> HttpResponse uses Session) inner) {
+    (req) -> {
+        provide loggedIn(authenticate(req))
+        inner(req)                 // Session = the one provided just above
+    }
+}
+
+main :: () {
+    app = dashboard |> withAuth    // main never provides Session
+    http.serve(8080, app)
+}
+```
+
+A lambda passed to a contracted parameter may bind the contract's
+services in its body (the evidence arrives with the call), so the same
+lambda runs under different provides at different call sites. Callbacks
+*without* a `uses` annotation keep creation-time capture — graphics
+frame closures, serve handlers, and fork thunks are unchanged.
+
 This is Effect.ts `Layer`/`Context` reduced to two keywords. There are no
 globals and no implicit singletons; tests provide fakes the same way `main`
 provides real implementations.

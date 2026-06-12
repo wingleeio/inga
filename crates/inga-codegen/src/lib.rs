@@ -701,6 +701,22 @@ impl<'a> Cg<'a> {
                     .get(name)
                     .cloned()
                     .unwrap_or_default();
+                let Some(base) = base else {
+                    // Named-field construction: every field present (checked),
+                    // evaluated in source order, stored at its declared slot.
+                    let ptr = self.gen_alloc(f, decl_fields.len() as i64);
+                    for (fname, _, value) in fields {
+                        let v = self.gen_expr(f, value);
+                        if let Some(i) = decl_fields.iter().position(|x| x == fname) {
+                            let vcty = self.ctype_of(value);
+                            self.dup_value(f, &v, &vcty);
+                            self.store_slot(f, &ptr, i as i64, &v);
+                        }
+                    }
+                    let out_int = self.ptr_to_int(f, &ptr);
+                    self.pool_value(f, &out_int, &CType::Struct(name.clone()));
+                    return out_int;
+                };
                 let b = self.gen_expr(f, base);
                 let ptr = self.gen_alloc(f, decl_fields.len() as i64);
                 // Copy every field (taking a reference), then overwrite.
@@ -4593,7 +4609,9 @@ fn collect_vars(expr: &Expr, visit: &mut impl FnMut(&str)) {
         ExprKind::Tuple(items) => items.iter().for_each(|e| collect_vars(e, visit)),
         ExprKind::TupleIndex { recv, .. } => collect_vars(recv, visit),
         ExprKind::RecordUpdate { base, fields, .. } => {
-            collect_vars(base, visit);
+            if let Some(base) = base {
+                collect_vars(base, visit);
+            }
             fields.iter().for_each(|(_, _, e)| collect_vars(e, visit));
         }
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => {}

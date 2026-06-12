@@ -672,6 +672,45 @@ main :: () {
 }
 
 #[test]
+fn named_field_construction() {
+    let out = run(r#"
+struct Pokemon = { Int id, String name, Bool shiny }
+
+main :: () {
+    p = Pokemon {
+        id: 1
+        name: "Bulbasaur"
+        shiny: false
+    }
+    q = Pokemon { name: "Pikachu", shiny: true, id: 25 }
+    r = Pokemon { ..q, name: "Raichu" }
+    println(p)
+    println(q.name, q.id, r.name)
+}
+"#);
+    assert_eq!(out, "Pokemon(id: 1, name: \"Bulbasaur\", shiny: false)\nPikachu 25 Raichu\n");
+}
+
+#[test]
+fn named_field_construction_is_checked() {
+    let errs = check_errors(
+        "struct Pokemon = { Int id, String name, Bool shiny }\n\nmain :: () {\n    p = Pokemon { id: 1 }\n    q = Pokemon { id: 2, id: 3, name: \"x\", shiny: false, level: 9 }\n    println(p.name, q.name)\n}\n",
+    );
+    assert!(errs.iter().any(|e| e.contains("missing fields `name`, `shiny`")), "{errs:?}");
+    assert!(errs.iter().any(|e| e.contains("field `id` is given twice")), "{errs:?}");
+    assert!(errs.iter().any(|e| e.contains("`Pokemon` has no field `level`")), "{errs:?}");
+}
+
+#[test]
+fn match_on_bare_variant_is_not_a_record_literal() {
+    // `match Red {` must still parse as a match block, not `Red { ... }`.
+    let out = run(
+        "enum Color = Red | Green\n\nmain :: () {\n    match Red {\n        Red -> println(\"red\")\n        Green -> println(\"green\")\n    }\n}\n",
+    );
+    assert_eq!(out, "red\n");
+}
+
+#[test]
 fn arena_scopes_copy_their_value_out() {
     let out = run(
         "struct Stats = { Int count, [Int] kept }\n\nsummarize :: ([Int] xs) -> Stats {\n    provide Arena(64.kb)\n    evens = filter(xs, (x) -> x % 2 == 0)\n    Stats(len(evens), evens)\n}\n\nmain :: () {\n    println(summarize(range(6)))\n}\n",

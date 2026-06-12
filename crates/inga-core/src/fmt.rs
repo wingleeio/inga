@@ -409,8 +409,10 @@ impl Printer {
                 format!("{}.{index}", self.render_expr(recv, indent))
             }
             ExprKind::RecordUpdate { name, base, fields, .. } => {
-                let base_str = self.render_expr(base, indent);
-                let mut parts = vec![format!("..{base_str}")];
+                let mut parts = Vec::new();
+                if let Some(base) = base {
+                    parts.push(format!("..{}", self.render_expr(base, indent)));
+                }
                 for (fname, _, value) in fields {
                     parts.push(format!("{fname}: {}", self.render_expr(value, indent)));
                 }

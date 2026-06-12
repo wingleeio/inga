@@ -209,8 +209,9 @@ pub enum ExprKind {
     Tuple(Vec<Expr>),
     /// `pair.0` — tuple element access.
     TupleIndex { recv: Box<Expr>, index: i64, index_span: Span },
+    /// `User { name: expr }` — named-field construction — or
     /// `User { ..base, name: expr }` — functional record update.
-    RecordUpdate { name: String, name_span: Span, base: Box<Expr>, fields: Vec<(String, Span, Expr)> },
+    RecordUpdate { name: String, name_span: Span, base: Option<Box<Expr>>, fields: Vec<(String, Span, Expr)> },
     /// `f(a, b)`
     Call { callee: Box<Expr>, args: Vec<Expr> },
     /// `recv.name(a, b)`

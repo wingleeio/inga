@@ -106,6 +106,19 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// At `Upper {` — does the brace open a record literal/update rather
+    /// than a block? Yes for `{ ..` (update) and `{ field:` (construction).
+    fn lbrace_opens_record(&self) -> bool {
+        let mut n = 1; // past the `{`
+        while matches!(self.nth(n).kind, TokenKind::Newline) {
+            n += 1;
+        }
+        if self.nth(n).kind == TokenKind::Dot && self.nth(n + 1).kind == TokenKind::Dot {
+            return true;
+        }
+        matches!(self.nth(n).kind, TokenKind::Ident(_)) && self.nth(n + 1).kind == TokenKind::Colon
+    }
+
     /// If the next non-newline token satisfies `pred`, consume the newlines
     /// and return true (expression continuation).
     fn continue_past_newlines(&mut self, pred: impl Fn(&TokenKind) -> bool) -> bool {
@@ -1075,22 +1088,36 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Ident(name) => {
                 self.bump();
-                // `User { ..base, field: value }` — record update (the `..`
-                // disambiguates from blocks and patterns).
-                if is_upper(&name)
-                    && self.at(&TokenKind::LBrace)
-                    && self.nth(1).kind == TokenKind::Dot
-                    && self.nth(2).kind == TokenKind::Dot
-                {
+                // `User { name: value }` — named-field construction — or
+                // `User { ..base, field: value }` — record update. The `..`
+                // or the `field:` lookahead disambiguates from blocks,
+                // match bodies, and patterns.
+                if is_upper(&name) && self.at(&TokenKind::LBrace) && self.lbrace_opens_record() {
                     self.bump(); // {
-                    self.bump(); // .
-                    self.bump(); // .
-                    let base = self.parse_expr();
+                    self.skip_newlines();
+                    let base = if self.at(&TokenKind::Dot) {
+                        self.bump(); // .
+                        self.bump(); // .
+                        Some(Box::new(self.parse_expr()))
+                    } else {
+                        None
+                    };
                     let mut fields = Vec::new();
-                    while self.at(&TokenKind::Comma) {
-                        self.bump();
-                        self.skip_newlines();
-                        if self.at(&TokenKind::RBrace) {
+                    loop {
+                        // Separators: a comma, a newline, or both.
+                        let mut separated = base.is_none() && fields.is_empty();
+                        if self.at(&TokenKind::Comma) {
+                            self.bump();
+                            separated = true;
+                        }
+                        if self.at(&TokenKind::Newline) {
+                            self.skip_newlines();
+                            separated = true;
+                        }
+                        if self.at(&TokenKind::RBrace) || self.at(&TokenKind::Eof) {
+                            break;
+                        }
+                        if !separated {
                             break;
                         }
                         let (fname, fspan) = self.expect_ident("a field name");
@@ -1101,14 +1128,13 @@ impl<'a> Parser<'a> {
                         self.skip_newlines();
                         let value = self.parse_expr();
                         fields.push((fname, fspan, value));
-                        self.skip_newlines();
                     }
                     self.expect(&TokenKind::RBrace, "`}`");
                     return Expr {
                         kind: ExprKind::RecordUpdate {
                             name,
                             name_span: start,
-                            base: Box::new(base),
+                            base,
                             fields,
                         },
                         span: start.to(self.prev_span()),

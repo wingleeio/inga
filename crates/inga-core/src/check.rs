@@ -1356,15 +1356,23 @@ impl<'a> Checker<'a> {
                     self.gate(name, m, p, *name_span);
                     Type::Named(name.clone())
                 } else {
-                    self.error(*name_span, format!("unknown struct `{name}` in record update"));
+                    let what = if base.is_some() { "record update" } else { "construction" };
+                    self.error(*name_span, format!("unknown struct `{name}` in {what}"));
                     Type::Unknown
                 };
-                let base_ty = self.check_expr(base);
-                self.unify_at(&result, &base_ty, base.span, "record update base");
+                if let Some(base) = base {
+                    let base_ty = self.check_expr(base);
+                    self.unify_at(&result, &base_ty, base.span, "record update base");
+                }
                 let decl_fields =
                     self.structs.get(name).map(|i| i.fields.clone()).unwrap_or_default();
+                let mut seen: Vec<&str> = Vec::new();
                 for (fname, fspan, value) in fields {
                     let value_ty = self.check_expr(value);
+                    if seen.contains(&fname.as_str()) {
+                        self.error(*fspan, format!("field `{fname}` is given twice"));
+                    }
+                    seen.push(fname);
                     match decl_fields.iter().find(|(f, _)| f == fname) {
                         Some((_, fty)) => {
                             self.unify_at(fty, &value_ty, value.span, "record update field");
@@ -1372,6 +1380,23 @@ impl<'a> Checker<'a> {
                         None => {
                             self.error(*fspan, format!("`{name}` has no field `{fname}`"));
                         }
+                    }
+                }
+                if base.is_none() {
+                    let missing: Vec<String> = decl_fields
+                        .iter()
+                        .filter(|(f, _)| !seen.contains(&f.as_str()))
+                        .map(|(f, _)| format!("`{f}`"))
+                        .collect();
+                    if !missing.is_empty() {
+                        self.error(
+                            *name_span,
+                            format!(
+                                "`{name}` is missing {} {} (use `{name} {{ ..base, … }}` to copy the rest from an existing value)",
+                                if missing.len() == 1 { "field" } else { "fields" },
+                                missing.join(", ")
+                            ),
+                        );
                     }
                 }
                 result

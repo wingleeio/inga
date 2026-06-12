@@ -93,6 +93,15 @@ fetchAndCache :: (id) { ... }                // a function
 - Constructors are positional in field order: `User(42, "Wing")`,
   `Circle(2.0)`; a fieldless variant is a value (`Dot`). A bare struct name
   is a *type tag* for `decode(raw, User)`.
+- **Named-field construction** spells the fields out, in any order, comma-
+  or newline-separated — every field must appear exactly once:
+
+  ```inga
+  user = User {
+      name: "Wing"
+      id: 42
+  }
+  ```
 - Tuples are positional: `t = (1, "one")`, `t.0`, and `(n, s)` in patterns.
   **Record update** copies a struct with overrides:
   `User { ..u, name: "new" }`.
@@ -551,6 +560,7 @@ expr      := pipe; pipe := or ('|>' (call | 'catch' arms))*
            | match | if | fail | provide | lambda
            | '(' expr ',' expr,* ')'            -- tuple ('.0' indexes)
            | Upper '{' '..' expr (',' name ':' expr)* '}'   -- record update
+           | Upper '{' (name ':' expr) ((','|NL) name ':' expr)* '}'  -- named-field construction
            | literals…
 arms      := '{' (pattern '->' expr)+ '}'
 pattern   := '_' | name | literal | Upper name              -- typed bind

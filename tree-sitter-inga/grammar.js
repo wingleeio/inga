@@ -255,17 +255,31 @@ module.exports = grammar({
     match_expression: $ =>
       seq('match', field('value', $._expression), '{', repeat($.arm), '}'),
 
+    // `User { name: v }` — named-field construction — or
     // `User { ..u, name: v }` — copy `u`, overriding the listed fields.
+    // Fields separate with commas or newlines (whitespace here).
     record_update: $ =>
       seq(
         field('type', $.type_identifier),
         '{',
-        '..',
-        $._expression,
-        repeat(seq(',', field('field', $.identifier), ':', $._expression)),
-        optional(','),
+        choice(
+          seq(
+            '..',
+            $._expression,
+            repeat(seq(',', $.field_initializer)),
+            optional(',')
+          ),
+          seq(
+            $.field_initializer,
+            repeat(seq(optional(','), $.field_initializer)),
+            optional(',')
+          )
+        ),
         '}'
       ),
+
+    field_initializer: $ =>
+      seq(field('field', $.identifier), ':', $._expression),
 
     arm: $ => seq($._pattern, '->', $._expression, optional(',')),
 

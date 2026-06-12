@@ -451,6 +451,8 @@ graphics.textWidth(s, size) -> Int          graphics.mouseX() / graphics.mouseY(
 graphics.mousePressed() -> Bool
 graphics.shaderNew(fragGlsl) -> Int         // compile GLSL ES; uniforms iTime, iRes
 graphics.shaderUse(handle)             graphics.shaderOff()
+graphics.imageNew(pngBytes) -> Int          // decode image bytes (e.g. an http body); -1 on failure
+graphics.image(handle, x, y, w, h)          // draw scaled; nearest-filtered (crisp pixels)
 ```
 
 Inverting the loop (`graphics.run` calls the closure, rather than the program

@@ -161,8 +161,10 @@ fetchPrice :: (String sym) -> Float ! HttpError, TimeoutError uses Http, Fibers 
 ```
 
 Try it: `inga run examples/http_client.inga` — or
-[`examples/pokedex.inga`](examples/pokedex.inga), which fetches the real
-PokeAPI in parallel and draws the results as a pokédex with `std/graphics`.
+[`examples/pokedex.inga`](examples/pokedex.inga): a paginated pokédex of
+all 151 gen-1 pokémon with real sprites — pages fetch on background fibers
+(`fiber.poll` per frame, the render fiber never parks), sprite PNGs become
+textures via `graphics.imageNew`, and prev/next page through the API.
 
 ## Graphics, and a game
 

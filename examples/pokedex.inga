@@ -1,9 +1,13 @@
-// INGA-DEX — a pokédex from the real PokeAPI, drawn with std/graphics.
+// INGA-DEX — a paginated pokédex from the real PokeAPI, sprites included.
 //
-// The whole std library in one program: six pokémon fetched in parallel
-// (`fiber.parMap` + `settle`, so one bad fetch can't sink the batch), the
-// JSON decoded straight into a struct, and the results rendered as cards
-// with a per-frame `provide Arena` keeping the draw path allocation-free.
+// The whole std library in one program:
+//   - pages of six pokémon fetched in parallel (`fiber.parMap`) — JSON
+//     decoded straight into a struct, sprite PNGs fetched as raw bytes;
+//   - the render fiber NEVER parks: a page loads on a background fiber
+//     and the frame `fiber.poll`s it, drawing a loading note meanwhile;
+//   - sprites become textures with `graphics.imageNew` (on the GL thread,
+//     once, when the page lands) and draw with `graphics.image`;
+//   - prev/next buttons page through gen 1; pages cache in MutMaps.
 //
 //   inga run examples/pokedex.inga   (needs network access)
 
@@ -13,23 +17,56 @@ use std/http
 
 struct Pokemon = { Int id, String name, Int height, Int weight, Int base_experience }
 
-fetchPokemon :: (String name) -> Pokemon ! HttpError, DecodeError uses Http {
-    resp = http.get("https://pokeapi.co/api/v2/pokemon/${name}")
+perPage :: () -> Int {
+    6
+}
+
+maxId :: () -> Int {
+    151 // gen 1
+}
+
+lastPage :: () -> Int {
+    (maxId() - 1) / perPage()
+}
+
+// ---- fetching ---------------------------------------------------------------
+
+fetchPokemon :: (Int id) -> Pokemon ! HttpError, DecodeError uses Http {
+    resp = http.get("https://pokeapi.co/api/v2/pokemon/${id}")
     if resp.status != 200 {
-        fail HttpError(resp.status, name)
+        fail HttpError(resp.status, "pokemon ${id}")
     }
     decode(resp.body, Pokemon)
+}
+
+// The sprite endpoint serves PNG bytes; an Inga string is a length-prefixed
+// byte buffer, so a binary body passes through untouched.
+fetchSprite :: (Int id) -> String ! HttpError uses Http {
+    resp = http.get("https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/${id}.png")
+    if resp.status != 200 {
+        fail HttpError(resp.status, "sprite ${id}")
+    }
+    resp.body
+}
+
+// One page: the six pokémon and their sprite bytes, all in flight at once.
+fetchPage :: (Int page) -> ([Pokemon], [String]) ! HttpError, DecodeError uses Http, Fibers {
+    first = page * perPage() + 1
+    count = if first + perPage() - 1 > maxId() {
+        (maxId() - first) + 1
+    } else {
+        perPage()
+    }
+    ids = map(range(count), (k) -> first + k)
+    pokes = fiber.parMap(ids, fetchPokemon)
+    sprites = fiber.parMap(ids, fetchSprite)
+    (pokes, sprites)
 }
 
 // ---- drawing helpers --------------------------------------------------------
 
 rgbRect :: (Int x, Int y, Int w, Int h, Int packed, Int a) {
     graphics.rect(x, y, w, h, packed / 65536, packed / 256 % 256, packed % 256, a)
-}
-
-roundRect :: (Int x, Int y, Int w, Int h, Int packed, Int a) {
-    rgbRect(x + 2, y, w - 4, h, packed, a)
-    rgbRect(x, y + 2, w, h - 4, packed, a)
 }
 
 textC :: (String s, Int x, Int y, Int size, Int packed) {
@@ -46,6 +83,25 @@ hit :: (Int x, Int y, Int w, Int h) -> Bool {
     mx >= x && mx <= x + w && my >= y && my <= y + h
 }
 
+button :: (String label, Int x, Int y, Int w, Int h, Bool enabled) -> Bool {
+    hovered = enabled && hit(x, y, w, h)
+    bg = if !enabled {
+        2702361
+    } else if hovered {
+        5208386
+    } else {
+        3621186
+    }
+    rgbRect(x, y, w, h, bg, 245)
+    fg = if enabled {
+        16119285
+    } else {
+        7239297
+    }
+    centerText(label, x + w / 2, y + h / 2 + 6, 18, fg)
+    enabled && hovered && graphics.mousePressed()
+}
+
 cardColor :: (Int i) -> Int {
     match i % 6 {
         0 -> 16240684
@@ -55,78 +111,152 @@ cardColor :: (Int i) -> Int {
         4 -> 16340359
         _ -> 7559063
     }
-    // electric yellow
-    // fire orange
-    // grass green
-    // water blue
-    // psychic pink
-    // ghost purple
+    // yellow
+    // orange
+    // green
+    // blue
+    // pink
+    // purple
 }
 
-// One stat row: label, value text, and a bar scaled against `max`.
 statBar :: (Int x, Int y, String label, String value, Int amount, Int max, Int packed) {
-    textC(label, x, y, 14, 9342618)
-    textC(value, x + 150, y, 14, 15921906)
-    w = amount * 170 / max
-    rgbRect(x, y + 8, 170, 8, 2434352, 255)
-    rgbRect(x, y + 8, if w > 170 {
-        170
+    textC(label, x, y, 13, 9342618)
+    textC(value, x + 40, y, 13, 15921906)
+    w = amount * 124 / max
+    rgbRect(x, y + 7, 124, 7, 2434352, 255)
+    rgbRect(x, y + 7, if w > 124 {
+        124
     } else {
         w
-    }, 8, packed, 255)
+    }, 7, packed, 255)
 }
 
-drawCard :: (Pokemon p, Int i) {
-    col = i % 3
-    row = i / 3
-    lift = if hit(40 + col * 300, 60 + row * 230, 280, 210) {
+drawCard :: (Pokemon p, Int i, Int sprite) {
+    lift = if hit(40 + i % 3 * 300, 66 + i / 3 * 220, 280, 200) {
         4
     } else {
         0
     }
-    x = 40 + col * 300
-    y = 60 + row * 230 - lift
+    x = 40 + i % 3 * 300
+    y = 66 + i / 3 * 220 - lift
     color = cardColor(i)
-    graphics.rect(x + 4, y + 6, 280, 210, 8, 10, 14, 120)
-    roundRect(x, y, 280, 210, 1973790, 250)
-    rgbRect(x, y, 280, 44, color, 255)
-    textC(p.name, x + 14, y + 30, 26, 1973790)
-    centerText("#${p.id}", x + 248, y + 29, 18, 1973790)
-    statBar(x + 14, y + 70, "height", "${p.height / 10}.${p.height % 10} m", p.height, 25, color)
-    statBar(x + 14, y + 104, "weight", "${p.weight / 10}.${p.weight % 10} kg", p.weight, 1200, color)
-    statBar(x + 14, y + 138, "base xp", "${p.base_experience}", p.base_experience, 350, color)
-    centerText("the inga-dex", x + 140, y + 196, 12, 5395026)
+    graphics.rect(x + 4, y + 6, 280, 200, 8, 10, 14, 120)
+    rgbRect(x, y, 280, 200, 1973790, 250)
+    rgbRect(x, y, 280, 38, color, 255)
+    textC(p.name, x + 12, y + 26, 22, 1973790)
+    centerText("#${p.id}", x + 252, y + 25, 16, 1973790)
+    if sprite >= 0 {
+        graphics.image(sprite, x + 4, y + 52, 140, 140)
+    }
+    statBar(x + 148, y + 72, "ht", "${p.height / 10}.${p.height % 10} m", p.height, 25, color)
+    statBar(x + 148, y + 108, "wt", "${p.weight / 10}.${p.weight % 10} kg", p.weight, 1200, color)
+    statBar(x + 148, y + 144, "xp", "${p.base_experience}", p.base_experience, 350, color)
 }
 
-frame :: ([Pokemon] pokes, Int failures) {
-    provide Arena(256.kb)
-    graphics.clear(24, 26, 32)
-    centerText("INGA-DEX", 480, 38, 32, 14423100)
-    map(range(len(pokes)), (i) -> match at(pokes, i) {
-        Some(p) -> {
-            drawCard(p, i)
-            0
-        }
-        None    -> 0
-    })
-    if failures > 0 {
-        centerText("${failures} fetch(es) failed", 480, 528, 14, 15355446)
+// ---- the dex ----------------------------------------------------------------
+
+// Kick off a background load for `page` unless it is cached, failed, or
+// already in flight. The render fiber never waits: `frame` polls.
+ensurePage :: (Int page, pending, cache, failed) uses Http, Fibers {
+    if cache.get(page) == None && pending.get(page) == None && failed.get(page) == None {
+        pending.set(page, fetchPage(page) |> fiber.fork)
     }
 }
 
+// Poll the in-flight page; when it lands, turn the sprite bytes into
+// textures (here, on the GL thread) and cache the page.
+pollPage :: (Int page, pending, cache, sprites, failed) uses Fibers {
+    match pending.get(page) {
+        Some(f) -> {
+            polled = fiber.poll(f)
+                |> catch {
+                    HttpError(status, m) -> {
+                        println("page ${page + 1} failed (${status}): ${m}")
+                        failed.set(page, 1)
+                        pending.delete(page)
+                        None
+                    }
+                    DecodeError(m) -> {
+                        println("page ${page + 1} decode failed: ${m}")
+                        failed.set(page, 1)
+                        pending.delete(page)
+                        None
+                    }
+                }
+            match polled {
+                Some(loaded) -> {
+                    pokes = loaded.0
+                    map(range(len(pokes)), (k) -> {
+                        id = match at(pokes, k) {
+                            Some(p) -> p.id
+                            None    -> 0
+                        }
+                        data = at(loaded.1, k) |> getOrElse("")
+                        sprites.set(id, graphics.imageNew(data))
+                        0
+                    })
+                    cache.set(page, pokes)
+                    pending.delete(page)
+                    0
+                }
+                None         -> 0
+            }
+            0
+        }
+        None    -> 0
+    }
+}
+
+frame :: (ui, pending, cache, sprites, failed) uses Http, Fibers {
+    provide Arena(256.kb)
+    graphics.clear(24, 26, 32)
+    page = ui.get("page") |> getOrElse(0)
+    centerText("INGA-DEX", 480, 36, 30, 14423100)
+
+    pollPage(page, pending, cache, sprites, failed)
+    match cache.get(page) {
+        Some(pokes) -> {
+            map(range(len(pokes)), (i) -> {
+                match at(pokes, i) {
+                    Some(p) -> {
+                        drawCard(p, i, sprites.get(p.id) |> getOrElse(-1))
+                        0
+                    }
+                    None    -> 0
+                }
+            })
+            0
+        }
+        None -> {
+            msg = if failed.get(page) == None {
+                "loading page ${page + 1}..."
+            } else {
+                "page ${page + 1} failed to load"
+            }
+            centerText(msg, 480, 280, 22, 9342618)
+            0
+        }
+    }
+
+    idle = pending.get(page) == None
+    if button("< prev", 320, 498, 100, 32, idle && page > 0) {
+        ui.set("page", page - 1)
+        ensurePage(page - 1, pending, cache, failed)
+    }
+    if button("next >", 540, 498, 100, 32, idle && page < lastPage()) {
+        ui.set("page", page + 1)
+        ensurePage(page + 1, pending, cache, failed)
+    }
+    centerText("page ${page + 1} / ${lastPage() + 1}", 480, 521, 14, 9342618)
+}
+
 main :: () {
-    provide Http, Runtime(6)
-    names = ["pikachu", "charizard", "bulbasaur", "squirtle", "mewtwo", "gengar"]
-    println("fetching ${len(names)} pokemon in parallel...")
-    outcomes = fiber.parMap(names, (n) -> fetchPokemon(n) |> fiber.settle)
-    parts = fiber.partition(outcomes)
-    pokes = parts.0
-    map(parts.1, (o) -> match o {
-        Ok(p)                        -> println("unexpected:", p.name)
-        Failed(HttpError(status, m)) -> println("fetch failed (${status}):", m)
-        Failed(DecodeError(m))       -> println("decode failed:", m)
-    })
-    println("got ${len(pokes)}; opening the dex")
-    failures = len(parts.1)
-    graphics.run(960, 540, "INGA-DEX", () -> frame(pokes, failures))
+    provide Http, Runtime(8)
+    ui = MutMap()
+    pending = MutMap()
+    cache = MutMap()
+    sprites = MutMap()
+    failed = MutMap()
+    ensurePage(0, pending, cache, failed)
+    graphics.run(960, 540, "INGA-DEX", () -> frame(ui, pending, cache, sprites, failed))
 }

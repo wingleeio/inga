@@ -941,6 +941,53 @@ use std::cell::RefCell;
 
 thread_local! {
     static MATERIALS: RefCell<Vec<macroquad::material::Material>> = const { RefCell::new(Vec::new()) };
+    static TEXTURES: RefCell<Vec<macroquad::texture::Texture2D>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Decode PNG bytes (an Inga string is a length-prefixed byte buffer, so
+/// binary bodies pass through untouched) into a texture; returns a handle,
+/// or -1 when the data does not decode.
+#[no_mangle]
+pub extern "C" fn rt_gfx_image_new(data: i64) -> i64 {
+    let bytes = unsafe { str_bytes(data) }.to_vec();
+    let tex = std::panic::catch_unwind(|| {
+        // Format auto-detection covers PNG/JPEG/GIF (whatever the image
+        // crate build supports).
+        macroquad::texture::Texture2D::from_file_with_format(&bytes, None)
+    });
+    match tex {
+        Ok(t) => {
+            // Pixel sprites stay crisp when scaled.
+            t.set_filter(macroquad::texture::FilterMode::Nearest);
+            TEXTURES.with(|ts| {
+                ts.borrow_mut().push(t);
+                ts.borrow().len() as i64 - 1
+            })
+        }
+        Err(_) => {
+            eprintln!("graphics.imageNew: could not decode image data");
+            -1
+        }
+    }
+}
+
+/// Draw a loaded image scaled to (w, h). Unknown handles draw nothing.
+#[no_mangle]
+pub extern "C" fn rt_gfx_image(handle: i64, x: i64, y: i64, w: i64, h: i64) {
+    TEXTURES.with(|ts| {
+        if let Some(tex) = ts.borrow().get(handle as usize) {
+            macroquad::texture::draw_texture_ex(
+                tex,
+                x as f32,
+                y as f32,
+                macroquad::color::WHITE,
+                macroquad::texture::DrawTextureParams {
+                    dest_size: Some(macroquad::math::Vec2::new(w as f32, h as f32)),
+                    ..Default::default()
+                },
+            );
+        }
+    });
 }
 
 /// Compile a fragment shader; returns a handle, or -1 on compile error.

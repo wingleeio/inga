@@ -2365,6 +2365,8 @@ impl<'a> Cg<'a> {
         }
         let (rt_name, arity, has_ret) = match name {
             "shaderNew" => ("rt_gfx_shader_new", 1, true),
+            "imageNew" => ("rt_gfx_image_new", 1, true),
+            "image" => ("rt_gfx_image", 5, false),
             "shaderUse" => ("rt_gfx_shader_use", 1, false),
             "shaderOff" => ("rt_gfx_shader_off", 0, false),
             "clear" => ("rt_gfx_clear", 3, false),
@@ -4679,6 +4681,8 @@ declare void @rt_fiber_abandon(i64)
 declare i64 @rt_fiber_race(i64, i64)
 declare i64 @rt_make_errbox(i64, i64)
 declare void @rt_freeze_header(i64)
+declare i64 @rt_gfx_image_new(i64)
+declare void @rt_gfx_image(i64, i64, i64, i64, i64)
 declare i64 @rt_http_send(i64, i64, i64, i64)
 declare i64 @rt_http_open(i64)
 declare i64 @rt_http_read(i64)

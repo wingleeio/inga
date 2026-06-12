@@ -2398,13 +2398,15 @@ impl<'a> Checker<'a> {
             "mouseX" | "mouseY" => Some((vec![], Type::Int)),
             "mousePressed" => Some((vec![], Type::Bool)),
             "shaderNew" => Some((vec![Type::Str], Type::Int)),
+            "imageNew" => Some((vec![Type::Str], Type::Int)),
+            "image" => Some((vec![Type::Int; 5], Type::Unit)),
             "shaderUse" => Some((vec![Type::Int], Type::Unit)),
             "shaderOff" => Some((vec![], Type::Unit)),
             _ => {
                 self.error(
                     name_span,
                     format!(
-                        "unknown graphics call `graphics.{name}` (run, clear, rect, rectLines, circle, text, textWidth, mouseX, mouseY, mousePressed, shaderNew, shaderUse, shaderOff)"
+                        "unknown graphics call `graphics.{name}` (run, clear, rect, rectLines, circle, text, textWidth, mouseX, mouseY, mousePressed, shaderNew, shaderUse, shaderOff, imageNew, image)"
                     ),
                 );
                 for arg in args {
@@ -4226,6 +4228,8 @@ pub fn std_module_members(target: &str) -> &'static [(&'static str, &'static str
             ("mouseX", "graphics.mouseX() -> Int"),
             ("mouseY", "graphics.mouseY() -> Int"),
             ("mousePressed", "graphics.mousePressed() -> Bool"),
+            ("imageNew", "graphics.imageNew(pngBytes) -> Int — decode PNG bytes (e.g. an http body) into a texture; -1 on failure"),
+            ("image", "graphics.image(handle, x, y, w, h) — draw a loaded image scaled to (w, h)"),
             ("shaderNew", "graphics.shaderNew(fragGlsl) -> Int — compile GLSL ES; uniforms iTime, iRes"),
             ("shaderUse", "graphics.shaderUse(handle)"),
             ("shaderOff", "graphics.shaderOff()"),

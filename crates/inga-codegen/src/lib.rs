@@ -134,6 +134,10 @@ struct Cg<'a> {
     /// When set, emit a test-runner `main` that calls these zero-parameter
     /// functions and reports per-test results instead of calling `ing.fn.main`.
     test_main: Option<Vec<String>>,
+    /// The next closure record allocates from the global heap (fork thunks
+    /// and parMap callables cross fibers; a region allocation would die
+    /// with its scope while the fiber still reads it).
+    closure_alloc_global: bool,
 }
 
 impl<'a> Cg<'a> {
@@ -158,6 +162,7 @@ impl<'a> Cg<'a> {
             label: 0,
             errors: Vec::new(),
             test_main: None,
+            closure_alloc_global: false,
         }
     }
 
@@ -2192,6 +2197,20 @@ impl<'a> Cg<'a> {
         self.gen_closure_parts(f, params, body).0
     }
 
+    /// Like gen_closure_parts, but the closure record comes from the global
+    /// heap — required when the closure crosses a fiber boundary.
+    fn gen_closure_parts_global(
+        &mut self,
+        f: &mut FnCtx,
+        params: &[Param],
+        body: &Expr,
+    ) -> (String, String, Vec<CType>) {
+        self.closure_alloc_global = true;
+        let out = self.gen_closure_parts(f, params, body);
+        self.closure_alloc_global = false;
+        out
+    }
+
     /// Build a closure and also report its environment pointer and capture
     /// types (slot `1 + i` holds capture `i`) — `spawn` freezes them.
     fn gen_closure_parts(
@@ -2266,8 +2285,14 @@ impl<'a> Cg<'a> {
 
         // Allocate the closure record at the creation site. Captured heap
         // values are dup'ed — the record owns its references (released only
-        // when closures gain their own drop glue; a known leak).
-        let ptr = self.gen_alloc(f, (1 + captured.len() + evidence.len()) as i64);
+        // when closures gain their own drop glue; a known leak). Records
+        // that cross fibers must not live in a region (see fork).
+        let slots = (1 + captured.len() + evidence.len()) as i64;
+        let ptr = if self.closure_alloc_global {
+            self.gen_alloc_global(f, slots)
+        } else {
+            self.gen_alloc(f, slots)
+        };
         self.store_slot(f, &ptr, 0, &format!("ptrtoint (ptr {fn_name} to i64)"));
         for (i, name) in captured.iter().enumerate() {
             let local = f.lookup(name).unwrap();
@@ -2874,7 +2899,7 @@ impl<'a> Cg<'a> {
     /// Build a thunk for a by-name forked action, freeze its captures, and
     /// start a fiber. Returns the (unpooled) handle.
     fn gen_fork_handle(&mut self, f: &mut FnCtx, action: &Expr) -> String {
-        let (thunk, env, capture_ctys) = self.gen_closure_parts(f, &[], action);
+        let (thunk, env, capture_ctys) = self.gen_closure_parts_global(f, &[], action);
         self.freeze_captures(f, &env, &capture_ctys, action.span);
         let out = self.tmp();
         f.line(format!("{out} = call i64 @rt_fiber_fork(i64 {thunk})"));
@@ -3196,7 +3221,7 @@ impl<'a> Cg<'a> {
                 let ms = self.gen_expr(f, args[1]);
                 let shim = self.sleeper_shim();
                 let timeout_tag = self.tag_ids.get("TimeoutError").copied().unwrap_or(0);
-                let envp = self.gen_alloc(f, 3);
+                let envp = self.gen_alloc_global(f, 3);
                 self.store_slot(f, &envp, 0, &format!("ptrtoint (ptr {shim} to i64)"));
                 self.store_slot(f, &envp, 1, &ms);
                 self.store_slot(f, &envp, 2, &timeout_tag.to_string());
@@ -3325,7 +3350,7 @@ impl<'a> Cg<'a> {
         // The callable: a closure value whose captures we can freeze.
         let closure = match &func_expr.kind {
             ExprKind::Lambda { params, body } => {
-                let (c, env, capture_ctys) = self.gen_closure_parts(f, params, body);
+                let (c, env, capture_ctys) = self.gen_closure_parts_global(f, params, body);
                 self.freeze_captures(f, &env, &capture_ctys, func_expr.span);
                 c
             }
@@ -3383,7 +3408,7 @@ impl<'a> Cg<'a> {
         // env = {shim, closure, item}; the item slot is frozen by descriptor
         // (copying it out of any arena first).
         let envp = self.tmp();
-        f.line(format!("{envp} = call ptr @rt_alloc(i64 24)"));
+        f.line(format!("{envp} = call ptr @rt_alloc_global(i64 24)"));
         let s0 = self.tmp();
         f.line(format!("{s0} = getelementptr i64, ptr {envp}, i64 0"));
         f.line(format!("store i64 ptrtoint (ptr {shim} to i64), ptr {s0}"));
@@ -4023,6 +4048,15 @@ impl<'a> Cg<'a> {
     fn gen_alloc(&mut self, f: &mut FnCtx, slots: i64) -> String {
         let p = self.tmp();
         f.line(format!("{p} = call ptr @rt_alloc(i64 {})", slots * 8));
+        p
+    }
+
+    /// Allocate from the RC heap even inside an arena scope — for blocks
+    /// that cross fiber boundaries (a region dies with its frame; a fiber
+    /// reading a region-allocated thunk env after that is a use-after-free).
+    fn gen_alloc_global(&mut self, f: &mut FnCtx, slots: i64) -> String {
+        let p = self.tmp();
+        f.line(format!("{p} = call ptr @rt_alloc_global(i64 {})", slots * 8));
         p
     }
 

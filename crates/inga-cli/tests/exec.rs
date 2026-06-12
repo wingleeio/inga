@@ -968,3 +968,28 @@ fn then_transforms_the_value_mid_pipe() {
         "got: {errs:?}"
     );
 }
+
+#[test]
+fn forking_inside_an_arena_scope_is_safe() {
+    // Regression: a fork's thunk environment must come from the global
+    // heap. When the fork happens inside `provide Arena`, a
+    // region-allocated env dies with the scope while the fiber still
+    // reads it. MallocScribble poisons freed memory so the old bug
+    // crashes deterministically instead of by timing.
+    let src = "use std/fiber\n\nslowSum :: (Int n, Int acc) -> Int {\n    if n == 0 {\n        acc\n    } else {\n        slowSum(n - 1, acc + n)\n    }\n}\n\nkick :: (Int n, pending) uses Fibers {\n    provide Arena(64.kb)\n    note = \"${n}-${n * 2}\"\n    pending.set(n, slowSum(n * 100000, 0) |> fiber.fork)\n    println(\"kicked\", note)\n}\n\nmain :: () {\n    provide Runtime(4)\n    pending = MutMap()\n    kick(7, pending)\n    sleep(30.millis)\n    match pending.get(7) {\n        Some(f) -> println(fiber.join(f))\n        None -> println(\"missing\")\n    }\n    nums = {\n        provide Arena(64.kb)\n        fiber.parMap([1, 2, 3], (k) -> slowSum(k * 1000, 0))\n    }\n    println(len(nums))\n}\n";
+    let path = write_temp(src);
+    let out = Command::new(env!("CARGO_BIN_EXE_inga")).arg("run").arg(&path)
+        .env("MallocScribble", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "fork-in-arena crashed: {}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("kicked 7-14"), "got: {stdout}");
+    assert!(stdout.contains("245000350000"), "got: {stdout}");
+    assert!(stdout.contains("\n3\n"), "got: {stdout}");
+}

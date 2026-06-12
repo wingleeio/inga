@@ -585,7 +585,7 @@ fn emit_tokens(src: &str, tokens: &[Token], cursor: &mut usize, out: &mut String
                 out.push_str(text);
                 out.push_str(RESET);
             }
-            TokenKind::Str(parts) => {
+            TokenKind::Str(parts, _) => {
                 emit_string(src, text, start, parts, out);
             }
             TokenKind::Int(_) | TokenKind::Float(_) => {

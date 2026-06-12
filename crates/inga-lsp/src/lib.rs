@@ -1074,7 +1074,7 @@ fn collect_semantic_tokens(
     for (i, token) in tokens.iter().enumerate() {
         let token_type = match &token.kind {
             TokenKind::Comment(_) => T_COMMENT,
-            TokenKind::Str(parts) => {
+            TokenKind::Str(parts, _) => {
                 // Emit non-overlapping string segments around the `${...}`
                 // holes; hole contents classify themselves.
                 let mut cursor = token.span.start;

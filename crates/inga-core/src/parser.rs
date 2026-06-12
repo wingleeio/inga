@@ -1059,7 +1059,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Expr { kind: ExprKind::Bool(false), span: start }
             }
-            TokenKind::Str(parts) => {
+            TokenKind::Str(parts, triple) => {
                 self.bump();
                 let mut pieces = Vec::new();
                 for part in parts {
@@ -1071,7 +1071,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
-                Expr { kind: ExprKind::Str(pieces), span: start }
+                Expr { kind: ExprKind::Str(pieces, triple), span: start }
             }
             TokenKind::Ident(name) => {
                 self.bump();
@@ -1351,7 +1351,7 @@ impl<'a> Parser<'a> {
                     Pattern { kind: PatternKind::Wildcard, span: start }
                 }
             }
-            TokenKind::Str(parts) => {
+            TokenKind::Str(parts, _) => {
                 self.bump();
                 let text = match parts.as_slice() {
                     [StrPart::Text(t)] => t.clone(),

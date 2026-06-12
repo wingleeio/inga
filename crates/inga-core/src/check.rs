@@ -1309,7 +1309,7 @@ impl<'a> Checker<'a> {
             ExprKind::Int(_) => Type::Int,
             ExprKind::Float(_) => Type::Float,
             ExprKind::Bool(_) => Type::Bool,
-            ExprKind::Str(pieces) => {
+            ExprKind::Str(pieces, _) => {
                 for piece in pieces {
                     if let StrPiece::Expr(e) = piece {
                         self.check_expr(e);
@@ -2691,6 +2691,13 @@ impl<'a> Checker<'a> {
                 self.unify_at(&a, &b, args[1].span, "assertEq operands");
                 self.add_error_row(ASSERT_FAILED);
                 Type::Unit
+            }
+            "env" => {
+                if check_arity(self, 1) {
+                    let t = self.check_expr(args[0]);
+                    self.unify_at(&Type::Str, &t, args[0].span, "env name");
+                }
+                Type::Option(Box::new(Type::Str))
             }
             "sleep" => {
                 if check_arity(self, 1) {
@@ -4244,7 +4251,7 @@ pub fn builtin_doc(name: &str) -> Option<&'static str> {
     builtin_completions().into_iter().find(|(n, _)| *n == name).map(|(_, doc)| doc)
 }
 
-const BUILTIN_NAMES: [&str; 35] = [
+const BUILTIN_NAMES: [&str; 36] = [
     "println",
     "print",
     "show",
@@ -4258,6 +4265,7 @@ const BUILTIN_NAMES: [&str; 35] = [
     "tap",
     "tapError",
     "then",
+    "env",
     "sleep",
     "assert",
     "assertEq",
@@ -4299,6 +4307,7 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("then", "then(value, f) -> b — transform the value mid-pipe: x |> then((u) -> u.name); rows of f merge like any call"),
         ("tap", "tap(value, f) -> value — run a side effect on the value mid-pipe, pass it along untouched"),
         ("tapError", "tapError(lazy action, f) -> a — run a side effect on a failure, then re-raise it (the row is preserved)"),
+        ("env", "env(name) -> String? — read an environment variable"),
         ("sleep", "sleep(duration) -> Unit"),
         ("assert", "assert(condition) -> Unit ! AssertionError — for `inga test`"),
         ("assertEq", "assertEq(actual, expected) -> Unit ! AssertionError — for `inga test`"),

@@ -993,3 +993,29 @@ fn forking_inside_an_arena_scope_is_safe() {
     assert!(stdout.contains("245000350000"), "got: {stdout}");
     assert!(stdout.contains("\n3\n"), "got: {stdout}");
 }
+
+#[test]
+fn multiline_strings_and_env() {
+    // """ strings: raw quotes and newlines, interpolation, Swift-style
+    // dedent by the closing delimiter (a first line keeps nothing, deeper
+    // indentation survives, the opener's newline is dropped).
+    let out = run(
+        "main :: () {\n    name = \"Inga\"\n    msg = \"\"\"\n        Hello, ${name}!\n            deeper line\n        \"quoted\" raw\n        \"\"\"\n    println(msg)\n    println(len(\"\"\"\n        ab\n        \"\"\"))\n}\n",
+    );
+    assert_eq!(out, "Hello, Inga!\n    deeper line\n\"quoted\" raw\n2\n");
+
+    // env(name) -> String?
+    let src = "main :: () {\n    match env(\"INGA_EXEC_TEST_VAR\") {\n        Some(v) -> println(\"got\", v)\n        None -> println(\"unset\")\n    }\n    println(env(\"INGA_DEFINITELY_UNSET_XYZ\") |> getOrElse(\"fallback\"))\n}\n";
+    let path = write_temp(src);
+    let out = Command::new(env!("CARGO_BIN_EXE_inga"))
+        .arg("run")
+        .arg(&path)
+        .env("INGA_EXEC_TEST_VAR", "from-the-env")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "got from-the-env\nfallback\n"
+    );
+}

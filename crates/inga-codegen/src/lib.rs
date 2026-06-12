@@ -673,7 +673,7 @@ impl<'a> Cg<'a> {
                 (x.to_bits() as i64).to_string()
             }
             ExprKind::Bool(b) => if *b { "1" } else { "0" }.to_string(),
-            ExprKind::Str(pieces) => self.gen_interp(f, pieces, expr.span),
+            ExprKind::Str(pieces, _) => self.gen_interp(f, pieces, expr.span),
             ExprKind::Var(name) => self.gen_var(f, name, expr.span),
             ExprKind::Tuple(items) => {
                 let ptr = self.gen_alloc(f, items.len() as i64);
@@ -2486,7 +2486,7 @@ impl<'a> Cg<'a> {
                         // The fold: len of an interpolation is the sum of the
                         // pieces' lengths — no string is materialized. (V8's
                         // rope strings do the same thing at run time.)
-                        if let ExprKind::Str(pieces) = &args[0].kind {
+                        if let ExprKind::Str(pieces, _) = &args[0].kind {
                             if let Some(v) = self.gen_len_fold(f, pieces) {
                                 return Some(v);
                             }
@@ -2626,6 +2626,13 @@ impl<'a> Cg<'a> {
                 out
             }
             "retry" if args.len() == 2 => return Some(self.gen_retry(f, args[0], args[1])),
+            "env" if args.len() == 1 => {
+                let name = self.gen_expr(f, args[0]);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_env(i64 {name})"));
+                self.pool_value(f, &out, &CType::Option(Box::new(CType::Str)));
+                out
+            }
             "sleep" if args.len() == 1 => {
                 let v = self.gen_expr(f, args[0]);
                 f.line(format!("call void @rt_sleep_millis(i64 {v})"));
@@ -4590,7 +4597,7 @@ fn collect_vars(expr: &Expr, visit: &mut impl FnMut(&str)) {
             fields.iter().for_each(|(_, _, e)| collect_vars(e, visit));
         }
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => {}
-        ExprKind::Str(pieces) => {
+        ExprKind::Str(pieces, _) => {
             for p in pieces {
                 if let StrPiece::Expr(e) = p {
                     collect_vars(e, visit);
@@ -4670,6 +4677,7 @@ declare void @rt_print(i64)
 declare void @rt_println(i64)
 declare i64 @rt_now_millis()
 declare i64 @rt_now_micros()
+declare i64 @rt_env(i64)
 declare void @rt_sleep_millis(i64)
 declare void @rt_panic(i64)
 declare i64 @rt_map_new()

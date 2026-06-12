@@ -333,10 +333,25 @@ module.exports = grammar({
     // ---- literals --------------------------------------------------------------
 
     string: $ =>
-      seq(
-        '"',
-        repeat(choice($.escape_sequence, $.interpolation, token.immediate(prec(1, /[^"\\$]+/)), '$')),
-        '"'
+      choice(
+        seq(
+          '"""',
+          repeat(
+            choice(
+              $.escape_sequence,
+              $.interpolation,
+              token.immediate(prec(1, /([^"\\$]|"[^"]|""[^"])+/)),
+              '$',
+              '"'
+            )
+          ),
+          '"""'
+        ),
+        seq(
+          '"',
+          repeat(choice($.escape_sequence, $.interpolation, token.immediate(prec(1, /[^"\\$]+/)), '$')),
+          '"'
+        )
       ),
 
     escape_sequence: $ => token.immediate(/\\[ntr0"\\$]/),

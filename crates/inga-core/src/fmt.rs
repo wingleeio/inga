@@ -399,7 +399,7 @@ impl Printer {
             ExprKind::Int(n) => n.to_string(),
             ExprKind::Float(f) => render_float(*f),
             ExprKind::Bool(b) => b.to_string(),
-            ExprKind::Str(pieces) => self.render_str(pieces, indent),
+            ExprKind::Str(pieces, triple) => self.render_str(pieces, indent, *triple),
             ExprKind::Var(name) => name.clone(),
             ExprKind::Tuple(items) => {
                 let inner: Vec<String> = items.iter().map(|e| self.render_expr(e, indent)).collect();
@@ -537,7 +537,10 @@ impl Printer {
         }
     }
 
-    fn render_str(&mut self, pieces: &[StrPiece], indent: usize) -> String {
+    fn render_str(&mut self, pieces: &[StrPiece], indent: usize, triple: bool) -> String {
+        if triple {
+            return self.render_triple_str(pieces, indent);
+        }
         let mut out = String::from("\"");
         for piece in pieces {
             match piece {
@@ -562,6 +565,47 @@ impl Printer {
             }
         }
         out.push('"');
+        out
+    }
+
+    /// `"""` form: real newlines, bare quotes; content re-indented one
+    /// level past the opener, closing delimiter at that same indent (the
+    /// lexer strips it back out, so this round-trips).
+    fn render_triple_str(&mut self, pieces: &[StrPiece], indent: usize) -> String {
+        let pad = "    ".repeat(indent + 1);
+        let mut body = String::new();
+        for piece in pieces {
+            match piece {
+                StrPiece::Text(text) => {
+                    for c in text.chars() {
+                        match c {
+                            '\\' => body.push_str("\\\\"),
+                            '\r' => body.push_str("\\r"),
+                            '$' => body.push_str("\\$"),
+                            '\0' => body.push_str("\\0"),
+                            c => body.push(c),
+                        }
+                    }
+                }
+                StrPiece::Expr(e) => {
+                    body.push_str("${");
+                    body.push_str(&self.render_expr(e, indent + 1));
+                    body.push('}');
+                }
+            }
+        }
+        let mut out = String::from("\"\"\"\n");
+        for line in body.split('\n') {
+            if line.is_empty() {
+                out.push('\n');
+            } else {
+                out.push_str(&pad);
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out.push_str(&pad);
+        out.push_str("\"\"\"");
         out
     }
 

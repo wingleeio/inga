@@ -202,7 +202,7 @@ pub enum ExprKind {
     Float(f64),
     Bool(bool),
     /// String literal; interpolation holes are sub-expressions.
-    Str(Vec<StrPiece>),
+    Str(Vec<StrPiece>, bool),
     Var(String),
     List(Vec<Expr>),
     /// `(1, "x")` — a tuple (two or more elements).

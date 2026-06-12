@@ -208,7 +208,7 @@ provides real implementations.
   range` (lists), `split slice indexOf trim parseInt toFloat floor`
   (strings/numbers), `getOrElse orFail` (options), `retry ignoreFailure
   tap tapError then sleep` (effects), `assert assertEq` (tests),
-  `MutMap Some nowMillis nowMicros random`. Concurrency is **not** in the
+  `MutMap Some env nowMillis nowMicros random`. Concurrency is **not** in the
   prelude — it lives in `std/fiber` (§6.5). Editors show each builtin's
   signature on hover.
 
@@ -560,4 +560,8 @@ pattern   := '_' | name | literal | Upper name              -- typed bind
 
 Statements end at newlines; expressions continue across a newline before
 `|>`, binary operators (except `-` and `!`), and `.` chains. String literals
-interpolate with `${expr}`. Comments are `//` and `/* */`.
+interpolate with `${expr}`; `"""` opens a **multiline string** (raw quotes
+and newlines, interpolation and escapes still active) with Swift-style
+dedent — the indentation of the closing `"""` is stripped from every line,
+and a newline right after the opener is dropped. Comments are `//` and
+`/* */`.

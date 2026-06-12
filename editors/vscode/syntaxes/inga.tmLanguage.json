@@ -6,6 +6,7 @@
     { "include": "#comments" },
     { "include": "#declarations" },
     { "include": "#keywords" },
+    { "include": "#strings-triple" },
     { "include": "#strings" },
     { "include": "#numbers" },
     { "include": "#types" },
@@ -98,6 +99,15 @@
           "name": "support.function.constructor.inga",
           "match": "\\bSome\\b"
         }
+      ]
+    },
+    "strings-triple": {
+      "name": "string.quoted.triple.inga",
+      "begin": "\"\"\"",
+      "end": "\"\"\"",
+      "patterns": [
+        { "name": "constant.character.escape.inga", "match": "\\\\[ntr0\"\\\\$]" },
+        { "name": "meta.embedded.line.inga", "begin": "\\$\\{", "end": "\\}", "patterns": [{ "include": "$self" }] }
       ]
     },
     "strings": {

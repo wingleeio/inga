@@ -16,7 +16,7 @@ pub enum TokenKind {
     Ident(String),
     Int(i64),
     Float(f64),
-    Str(Vec<StrPart>),
+    Str(Vec<StrPart>, bool),
 
     // Trivia (kept in the stream; the parser skips it, the formatter uses it)
     Comment(String),
@@ -104,7 +104,7 @@ impl TokenKind {
             TokenKind::Ident(name) => format!("`{name}`"),
             TokenKind::Int(_) => "integer literal".into(),
             TokenKind::Float(_) => "float literal".into(),
-            TokenKind::Str(_) => "string literal".into(),
+            TokenKind::Str(..) => "string literal".into(),
             TokenKind::Comment(_) => "comment".into(),
             TokenKind::Newline => "end of line".into(),
             TokenKind::Eof => "end of file".into(),

@@ -1809,6 +1809,21 @@ fn fiber_record(boxed: i64) -> &'static FiberRecord {
     }
 }
 
+/// Read an environment variable: `Some(value)` boxed, or 0 for None.
+#[no_mangle]
+pub extern "C" fn rt_env(name: i64) -> i64 {
+    let n = unsafe { std::str::from_utf8_unchecked(str_bytes(name)) };
+    match std::env::var(n) {
+        Ok(v) => {
+            let s = make_str(v.as_bytes());
+            let boxed = rt_alloc(8) as *mut i64;
+            unsafe { *boxed = s };
+            boxed as i64
+        }
+        Err(_) => 0,
+    }
+}
+
 /// Freeze a single block header (its refcount stops; it is never freed) —
 /// used for closure records crossing fiber boundaries.
 #[no_mangle]

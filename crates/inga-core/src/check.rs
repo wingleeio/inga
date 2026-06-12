@@ -301,7 +301,9 @@ impl<'a> Checker<'a> {
         };
         // Builtin structs available to every program (raised by `decode`,
         // `assert`/`assertEq`, and std/http) — shapes from one shared table.
-        for name in [DECODE_ERROR, ASSERT_FAILED, "HttpResponse", HTTP_ERROR, "HttpStream", IO_ERROR] {
+        for name in
+            [DECODE_ERROR, ASSERT_FAILED, "HttpResponse", HTTP_ERROR, "HttpStream", "HttpRequest", IO_ERROR]
+        {
             let fields = builtin_struct_fields(name)
                 .iter()
                 .map(|(f, t)| {
@@ -2389,10 +2391,32 @@ impl<'a> Checker<'a> {
                 self.add_cap_row(HTTP_SERVICE);
                 Type::Unit
             }
+            "serve" => {
+                if !arity(self, 2) {
+                    return Type::Unknown;
+                }
+                let port_ty = self.check_expr(args[0]);
+                self.unify_at(&Type::Int, &port_ty, args[0].span, "http.serve port");
+                let expected = Type::Func(Rc::new(FuncType {
+                    params: vec![Type::Named("HttpRequest".into())],
+                    ret: Type::Named("HttpResponse".into()),
+                    errors: BTreeSet::new(),
+                    caps: BTreeSet::new(),
+                }));
+                let handler_ty = self.check_arg_expecting(args[1], &expected);
+                self.unify_at(&expected, &handler_ty, args[1].span, "http.serve handler");
+                // The handler's rows surface here: a failing handler makes
+                // `serve` fallible (it answers that client 500, then
+                // re-raises) — catch inside the handler to keep serving.
+                self.add_func_arg_rows(&handler_ty);
+                self.add_cap_row(HTTP_SERVICE);
+                self.add_error_row(HTTP_ERROR);
+                Type::Unit
+            }
             _ => {
                 self.error(
                     member_span,
-                    format!("`std/http` has no member `{member}` (get, post, send, openStream, read, close)"),
+                    format!("`std/http` has no member `{member}` (get, post, send, openStream, read, close, serve)"),
                 );
                 for arg in args {
                     self.check_expr(arg);
@@ -4213,7 +4237,7 @@ impl<'a> Checker<'a> {
             "std/http" => {
                 self.info.hovers.push((
                     u.path_span,
-                    "std/http — HTTP client: http.get/post/send/openStream/read/close; needs `provide Http`".to_string(),
+                    "std/http — HTTP client and server: http.get/post/send/openStream/read/close/serve; needs `provide Http`".to_string(),
                 ));
                 return;
             }
@@ -4374,6 +4398,9 @@ fn last_span(block: &Block) -> Span {
 pub fn builtin_struct_fields(name: &str) -> &'static [(&'static str, &'static str)] {
     match name {
         "HttpResponse" => &[("status", "Int"), ("body", "String")],
+        "HttpRequest" => {
+            &[("method", "String"), ("path", "String"), ("query", "String"), ("body", "String")]
+        }
         "HttpError" => &[("status", "Int"), ("message", "String")],
         "HttpStream" => &[("handle", "Int"), ("status", "Int")],
         "DecodeError" | "AssertionError" => &[("message", "String")],
@@ -4424,6 +4451,7 @@ pub fn std_module_members(target: &str) -> &'static [(&'static str, &'static str
             ("openStream", "http.openStream(url) -> HttpStream ! HttpError uses Http — GET with a streamed body"),
             ("read", "http.read(stream) -> String? ! HttpError uses Http — next chunk; None at end"),
             ("close", "http.close(stream) uses Http"),
+            ("serve", "http.serve(port, (HttpRequest) -> HttpResponse) -> Unit ! HttpError uses Http — serve until failure; a handler failure answers 500 and re-raises here"),
         ],
         "std/graphics" => &[
             ("run", "graphics.run(width, height, title, frame) — runtime-owned loop; frame runs once per frame"),

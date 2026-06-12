@@ -522,6 +522,36 @@ open. Bodies decode with `json.decode(resp.body, User)` (std/json). The
 client is blocking (rustls underneath) — exactly right for
 thread-per-fiber, and the M:N reactor adopts these calls in phase 2.
 
+**The server** is the same module:
+
+```inga
+handle :: (HttpRequest req) -> HttpResponse uses Counter {
+    Counter counter
+    match req.path {
+        "/visit" -> HttpResponse(200, json.encode(Stats { visits: counter.bump() }))
+        _        -> HttpResponse(404, "try /visit")
+    }
+}
+
+main :: () {
+    provide Http, memCounter
+    http.serve(8080, handle) |> catch { HttpError(s, m) -> println(m) }
+}
+```
+
+`http.serve(Int port, (HttpRequest) -> HttpResponse) -> Unit ! HttpError uses Http`.
+`HttpRequest { String method, String path, String query, String body }`;
+the handler returns the same `HttpResponse` the client receives — one
+vocabulary for both directions. The handler is an ordinary closure: it
+captures evidence (`uses Counter` above), and its rows surface at the
+serve site — a failing handler answers that client `500`, then the error
+re-raises from `serve`, so an unsupervised crash-loop is unrepresentable;
+catch inside the handler to keep serving. Requests are handled one at a
+time on the serving fiber (fork the server itself for background serving;
+the M:N scheduler parallelizes dispatch in phase 2). `serve` binds
+`0.0.0.0`; failures to bind raise `HttpError` with status 0. See
+`examples/server.inga`.
+
 ## 8.6 File system: `std/fs`
 
 ```inga

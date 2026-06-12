@@ -185,6 +185,10 @@ impl<'a> Cg<'a> {
             .insert("HttpError".into(), vec!["status".into(), "message".into()]);
         self.struct_meta
             .insert("HttpStream".into(), vec!["handle".into(), "status".into()]);
+        self.struct_meta.insert(
+            "HttpRequest".into(),
+            vec!["method".into(), "path".into(), "query".into(), "body".into()],
+        );
         self.struct_meta.insert("IoError".into(), vec!["path".into(), "message".into()]);
         for (i, tag) in [
             "DecodeError",
@@ -3764,6 +3768,38 @@ impl<'a> Cg<'a> {
                 f.line(format!("call void @rt_http_close(i64 {handle})"));
                 "0".to_string()
             }
+            ("serve", 2) => {
+                let port = self.gen_expr(f, args[0]);
+                // The handler is a closure value; the runtime calls it once
+                // per request on this thread.
+                let handler = self.gen_expr(f, args[1]);
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @rt_http_serve(i64 {port}, i64 {handler})"));
+                let kind = self.load_slot_from_int(f, &boxed, 0);
+                // kind 0: listener failure -> HttpError { 0, message };
+                // kind 2: the handler's own error re-raises here.
+                let (bind_l, rest_l) = (self.label("srv.bind"), self.label("srv.rest"));
+                let c = self.tmp();
+                f.line(format!("{c} = icmp eq i64 {kind}, 0"));
+                f.line(format!("br i1 {c}, label %{bind_l}, label %{rest_l}"));
+                f.start_block(&bind_l);
+                let msg = self.load_slot_from_int(f, &boxed, 2);
+                let errp = self.gen_alloc(f, 2);
+                self.store_slot(f, &errp, 0, "0");
+                self.store_slot(f, &errp, 1, &msg);
+                let err = self.ptr_to_int(f, &errp);
+                self.emit_fail_value(f, &err, &CType::Struct("HttpError".to_string()), span);
+                f.start_block(&rest_l);
+                let (raise_l, done_l) = (self.label("srv.raise"), self.label("srv.done"));
+                let c2 = self.tmp();
+                f.line(format!("{c2} = icmp eq i64 {kind}, 2"));
+                f.line(format!("br i1 {c2}, label %{raise_l}, label %{done_l}"));
+                f.start_block(&raise_l);
+                let errbox = self.load_slot_from_int(f, &boxed, 1);
+                self.emit_failure(f, &errbox);
+                f.start_block(&done_l);
+                "0".to_string()
+            }
             _ => {
                 self.unsupported(span, "this `http` operation shape");
                 "0".to_string()
@@ -4851,6 +4887,7 @@ declare void @rt_gfx_image(i64, i64, i64, i64, i64)
 declare i64 @rt_http_send(i64, i64, i64, i64)
 declare i64 @rt_http_open(i64)
 declare i64 @rt_http_read(i64)
+declare i64 @rt_http_serve(i64, i64)
 declare i64 @rt_fs_read(i64)
 declare i64 @rt_fs_write(i64, i64)
 declare i64 @rt_fs_append(i64, i64)

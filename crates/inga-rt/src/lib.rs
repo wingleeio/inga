@@ -2112,6 +2112,129 @@ pub extern "C" fn rt_http_close(handle: i64) {
     }
 }
 
+// ---- http server ------------------------------------------------------------------
+
+fn http_reason(status: i64) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        503 => "Service Unavailable",
+        _ => "",
+    }
+}
+
+fn http_write_response(stream: &mut std::net::TcpStream, status: i64, body: &[u8]) {
+    use std::io::Write;
+    let head = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        http_reason(status),
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.flush();
+}
+
+/// Read one request: the request line, headers (only Content-Length is
+/// honored), and the body. Returns (method, path, query, body).
+fn http_read_request(
+    stream: &mut std::net::TcpStream,
+) -> std::io::Result<(String, String, String, Vec<u8>)> {
+    use std::io::{BufRead, BufReader, Read};
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let target = parts.next().unwrap_or("/").to_string();
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (target, String::new()),
+    };
+    let mut content_length = 0usize;
+    loop {
+        let mut header = String::new();
+        reader.read_line(&mut header)?;
+        let header = header.trim_end();
+        if header.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    let mut body = vec![0u8; content_length];
+    reader.read_exact(&mut body)?;
+    Ok((method, path, query, body))
+}
+
+/// Serve HTTP/1.1 on `port`, one request at a time on the calling thread.
+/// Returns `{0, 0, message}` when the listener fails, `{1, 0, 0}` when the
+/// request budget (INGA_HTTP_SERVE_REQUESTS, a test hook) is spent, and
+/// `{2, errbox, 0}` when the handler fails — that client got a 500 and the
+/// error re-raises at the serve site.
+#[no_mangle]
+pub extern "C" fn rt_http_serve(port: i64, closure: i64) -> i64 {
+    let listener = match std::net::TcpListener::bind(("0.0.0.0", port as u16)) {
+        Ok(l) => l,
+        Err(e) => return http_box(0, 0, make_str(e.to_string().as_bytes())),
+    };
+    let mut budget: Option<u64> = std::env::var("INGA_HTTP_SERVE_REQUESTS")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let handler: extern "C" fn(*const i64, i64) -> RtPair =
+        unsafe { std::mem::transmute(*(closure as *const i64)) };
+    loop {
+        if budget == Some(0) {
+            return http_box(1, 0, 0);
+        }
+        let mut stream = match listener.accept() {
+            Ok((s, _)) => s,
+            Err(_) => continue,
+        };
+        let (method, path, query, body) = match http_read_request(&mut stream) {
+            Ok(req) => req,
+            Err(_) => {
+                http_write_response(&mut stream, 400, b"bad request");
+                continue;
+            }
+        };
+        if let Some(n) = budget.as_mut() {
+            *n -= 1;
+        }
+        let req = rt_alloc(32) as *mut i64;
+        unsafe {
+            *req = make_str(method.as_bytes());
+            *req.add(1) = make_str(path.as_bytes());
+            *req.add(2) = make_str(query.as_bytes());
+            *req.add(3) = make_str(&body);
+        }
+        let pair = handler(closure as *const i64, req as i64);
+        if pair.e != 0 {
+            http_write_response(&mut stream, 500, b"internal server error");
+            return http_box(2, pair.e, 0);
+        }
+        let resp = pair.v as *const i64;
+        let (status, resp_body) = unsafe { (*resp, str_bytes(*resp.add(1))) };
+        http_write_response(&mut stream, status, resp_body);
+    }
+}
+
 // ---- file system -----------------------------------------------------------------
 // Every fallible call returns the http-style `{ok, value, message}` box;
 // codegen unpacks it and raises IoError { path, message } on failure.

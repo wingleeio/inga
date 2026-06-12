@@ -167,6 +167,14 @@ all 151 gen-1 pokémon with real sprites — pages fetch on background fibers
 (`fiber.poll` per frame, the render fiber never parks), sprite PNGs become
 textures via `graphics.imageNew`, and prev/next page through the API.
 
+And `std/http` serves too — `http.serve(port, handler)` where the handler
+is an ordinary `(HttpRequest) -> HttpResponse` function: it captures
+services like any closure (`uses Counter` shows up in its row), and a
+handler failure answers that client 500 *and re-raises at the serve
+site* — so a silently crash-looping server is unrepresentable; catch in
+the handler to keep serving. Try it, then curl localhost:8080/visit:
+`inga run examples/server.inga`.
+
 The disk works the same way: `std/fs` is the file system, `uses Fs` in a
 signature is how you know a function touches it, and failures raise
 `IoError { path, message }` — the path rides in the error.
@@ -217,7 +225,7 @@ crates/inga-lsp       language server (lsp-server / lsp-types)
 editors/vscode        VS Code extension + TextMate grammar
 editors/zed           Zed extension (tree-sitter highlighting + LSP)
 tree-sitter-inga      tree-sitter grammar (used by the Zed extension)
-examples/             hello.inga, retry.inga, shapes.inga, arena.inga, fibers.inga, fiber_errors.inga, http_client.inga, pokedex.inga, notes.inga, modules.inga (+ geometry.inga), user_service.inga
+examples/             hello.inga, retry.inga, shapes.inga, arena.inga, fibers.inga, fiber_errors.inga, http_client.inga, pokedex.inga, notes.inga, server.inga, modules.inga (+ geometry.inga), user_service.inga
 games/                balatro.inga (+ game, util, cards, jokers, poker, state, logic_test) — a Balatro-style deckbuilder
 bench/                the same workloads in Inga, JavaScript, and Rust (see bench/README.md)
 docs/SPEC.md          language design: semantics, effect rows, execution strategy

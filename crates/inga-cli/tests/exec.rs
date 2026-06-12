@@ -36,8 +36,17 @@ fn run_file(path: &std::path::Path) -> String {
 }
 
 fn run(src: &str) -> String {
+    run_env(src, &[])
+}
+
+fn run_env(src: &str, env: &[(&str, &str)]) -> String {
     let path = write_temp(src);
-    let out = Command::new(env!("CARGO_BIN_EXE_inga")).arg("run").arg(&path).output().unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_inga"));
+    cmd.arg("run").arg(&path);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
     assert!(
         out.status.success(),
         "inga run failed:\n--- stderr ---\n{}\n--- source ---\n{src}",
@@ -455,6 +464,63 @@ main :: () {
 }
 "#);
     assert_eq!(out, "{\"id\":7,\"name\":\"Ada\"}\nAda\n");
+}
+
+#[test]
+fn http_serve_answers_requests() {
+    let out = run_env(
+        r#"
+use std/fiber
+use std/http
+
+handle :: (HttpRequest req) -> HttpResponse {
+    match req.path {
+        "/echo" -> HttpResponse(200, "${req.method} ${req.path}?${req.query} body=${req.body}")
+        _       -> HttpResponse(404, "no such page")
+    }
+}
+
+main :: () {
+    provide Http, Runtime(2)
+    server = fiber.fork(http.serve(18474, handle))
+    sleep(200.millis)
+    a = http.post("http://127.0.0.1:18474/echo?k=v", "hi") |> catch { HttpError -> HttpResponse(0, "fail") }
+    b = http.get("http://127.0.0.1:18474/nope") |> catch { HttpError -> HttpResponse(0, "fail") }
+    println(a.status, a.body)
+    println(b.status, b.body)
+    fiber.join(server) |> catch { HttpError(s, m) -> println("server failed: ${m}") }
+}
+"#,
+        &[("INGA_HTTP_SERVE_REQUESTS", "2")],
+    );
+    assert_eq!(out, "200 POST /echo?k=v body=hi\n404 no such page\n");
+}
+
+#[test]
+fn http_serve_handler_failure_is_500_and_reraises() {
+    let out = run(r#"
+use std/fiber
+use std/http
+
+struct Boom = { String why }
+
+handle :: (HttpRequest req) -> HttpResponse ! Boom {
+    fail Boom("handler exploded")
+}
+
+main :: () {
+    provide Http, Runtime(2)
+    server = fiber.fork(http.serve(18475, handle))
+    sleep(200.millis)
+    a = http.get("http://127.0.0.1:18475/x") |> catch { HttpError -> HttpResponse(0, "fail") }
+    println(a.status, a.body)
+    fiber.join(server) |> catch {
+        HttpError(s, m) -> println("http error: ${m}")
+        Boom(why) -> println("server stopped: ${why}")
+    }
+}
+"#);
+    assert_eq!(out, "500 internal server error\nserver stopped: handler exploded\n");
 }
 
 #[test]

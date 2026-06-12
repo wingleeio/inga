@@ -43,6 +43,8 @@ pub enum Type {
     Tag(String),
     /// Built-in mutable map (impl instance state).
     MutMap(Box<Type>, Box<Type>),
+    /// Built-in mutable array.
+    MutList(Box<Type>),
     Func(Rc<FuncType>),
     Var(u32),
     /// Error-recovery type: unifies with anything, reports nothing.
@@ -93,6 +95,7 @@ impl TypeCtx {
             Type::MutMap(k, v) => {
                 Type::MutMap(Box::new(self.apply(&k)), Box::new(self.apply(&v)))
             }
+            Type::MutList(t) => Type::MutList(Box::new(self.apply(&t))),
             Type::Func(f) => Type::Func(Rc::new(FuncType {
                 params: f.params.iter().map(|p| self.apply(p)).collect(),
                 ret: self.apply(&f.ret),
@@ -106,9 +109,11 @@ impl TypeCtx {
     fn occurs(&self, var: u32, ty: &Type) -> bool {
         match self.resolve(ty) {
             Type::Var(v) => v == var,
-            Type::Option(t) | Type::List(t) | Type::Fiber(t, _) | Type::Outcome(t, _) => {
-                self.occurs(var, &t)
-            }
+            Type::Option(t)
+            | Type::List(t)
+            | Type::Fiber(t, _)
+            | Type::Outcome(t, _)
+            | Type::MutList(t) => self.occurs(var, &t),
             Type::Tuple(ts) => ts.iter().any(|t| self.occurs(var, t)),
             Type::MutMap(k, v) => self.occurs(var, &k) || self.occurs(var, &v),
             Type::Func(f) => {
@@ -163,6 +168,7 @@ impl TypeCtx {
                 self.unify(k1, k2)?;
                 self.unify(v1, v2)
             }
+            (Type::MutList(x), Type::MutList(y)) => self.unify(x, y),
             (Type::Func(f), Type::Func(g)) => {
                 if f.params.len() != g.params.len() {
                     return Err((a.clone(), b.clone()));
@@ -221,6 +227,7 @@ impl TypeCtx {
             Type::MutMap(k, v) => {
                 format!("MutMap<{}, {}>", self.render(&k, names), self.render(&v, names))
             }
+            Type::MutList(t) => format!("MutList<{}>", self.render(&t, names)),
             Type::Func(f) => {
                 let params: Vec<String> = f.params.iter().map(|p| self.render(p, names)).collect();
                 let mut out = format!("({}) -> {}", params.join(", "), self.render(&f.ret, names));

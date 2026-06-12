@@ -989,6 +989,22 @@ fn value_member_items(
                 });
             }
         }
+        CType::MutList(_) => {
+            for (name, detail) in [
+                ("push", "push(value)"),
+                ("pop", "pop() -> value?"),
+                ("get", "get(index) -> value?"),
+                ("set", "set(index, value)"),
+                ("size", "size() -> Int"),
+            ] {
+                items.push(CompletionItem {
+                    label: name.to_string(),
+                    kind: Some(CompletionItemKind::METHOD),
+                    detail: Some(detail.to_string()),
+                    ..Default::default()
+                });
+            }
+        }
         CType::Tuple(ts) => {
             for i in 0..ts.len() {
                 items.push(field(&i.to_string(), format!("tuple slot {i}")));

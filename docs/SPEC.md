@@ -80,7 +80,7 @@ fetchAndCache :: (id) { ... }                // a function
 - `Name?` is an option type, `[Name]` a list type, `(Int, String)` a
   tuple type, `(Int) -> Bool` a function type (for callbacks), and the two
   builtin generic types are written the way hover renders them:
-  `MutMap<String, Int>`, `Fiber<Int ! Boom>`, `Outcome<a ! E>`. A plain
+  `MutMap<String, Int>`, `MutList<Int>`, `Fiber<Int ! Boom>`, `Outcome<a ! E>`. A plain
   arrow type is a *pure* contract;
   `(Int) -> User ! DbError uses Logger` accepts effectful callbacks, and a
   function with effects the annotation doesn't declare is rejected. An
@@ -221,7 +221,7 @@ provides real implementations.
   buffers, so these are the storage-format vocabulary),
   `getOrElse orFail` (options), `retry ignoreFailure
   tap tapError then sleep` (effects), `assert assertEq` (tests),
-  `MutMap Some env nowMillis nowMicros random`. Concurrency is **not** in the
+  `MutMap MutList Some env nowMillis nowMicros random`. Concurrency is **not** in the
   prelude — it lives in `std/fiber` (§6.5). Editors show each builtin's
   signature on hover.
 

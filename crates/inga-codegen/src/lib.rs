@@ -1391,6 +1391,64 @@ impl<'a> Cg<'a> {
                     }
                 }
             }
+            CType::MutList(elem) => {
+                let l = self.gen_expr(f, recv);
+                let ecty = (*elem).clone();
+                match name {
+                    "push" if args.len() == 1 => {
+                        let v = self.gen_expr(f, args[0]);
+                        // The list takes a reference.
+                        self.dup_value(f, &v, &ecty);
+                        f.line(format!("call void @rt_mutlist_push(i64 {l}, i64 {v})"));
+                        "0".to_string()
+                    }
+                    "pop" if args.is_empty() => {
+                        // Ownership transfers from the list to the Some-box.
+                        let r = self.tmp();
+                        f.line(format!("{r} = call i64 @rt_mutlist_pop(i64 {l})"));
+                        self.pool_value(f, &r, &CType::Option(Box::new(ecty)));
+                        r
+                    }
+                    "get" if args.len() == 1 => {
+                        let idx = self.gen_expr(f, args[0]);
+                        let r = self.tmp();
+                        f.line(format!("{r} = call i64 @rt_mutlist_get(i64 {l}, i64 {idx})"));
+                        // The fresh Some-box is pooled; its drop glue would
+                        // steal the list's reference, so take one for the box.
+                        if self.is_rc(&ecty) {
+                            let (dup_l, done_l) = (self.label("lg.dup"), self.label("lg.done"));
+                            let c = self.tmp();
+                            f.line(format!("{c} = icmp ne i64 {r}, 0"));
+                            f.line(format!("br i1 {c}, label %{dup_l}, label %{done_l}"));
+                            f.start_block(&dup_l);
+                            let inner = self.load_slot_from_int(f, &r, 0);
+                            let t = self.tmp();
+                            f.line(format!("{t} = call i64 @rt_dup(i64 {inner})"));
+                            f.line(format!("br label %{done_l}"));
+                            f.start_block(&done_l);
+                        }
+                        self.pool_value(f, &r, &CType::Option(Box::new(ecty)));
+                        r
+                    }
+                    "set" if args.len() == 2 => {
+                        let idx = self.gen_expr(f, args[0]);
+                        let v = self.gen_expr(f, args[1]);
+                        self.dup_value(f, &v, &ecty);
+                        let r = self.tmp();
+                        f.line(format!("{r} = call i64 @rt_mutlist_set(i64 {l}, i64 {idx}, i64 {v})"));
+                        "0".to_string()
+                    }
+                    "size" if args.is_empty() => {
+                        let r = self.tmp();
+                        f.line(format!("{r} = call i64 @rt_mutlist_size(i64 {l})"));
+                        r
+                    }
+                    _ => {
+                        self.unsupported(name_span, "this MutList method");
+                        "0".to_string()
+                    }
+                }
+            }
             _ => {
                 self.unsupported(name_span, "this method call");
                 "0".to_string()
@@ -2711,6 +2769,11 @@ impl<'a> Cg<'a> {
                 f.line(format!("{out} = call i64 @rt_map_new()"));
                 out
             }
+            "MutList" => {
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_mutlist_new()"));
+                out
+            }
             "map" if args.len() == 2 => return Some(self.gen_map_builtin(f, args, span)),
             "filter" if args.len() == 2 => return Some(self.gen_filter_builtin(f, args, span)),
             "fold" if args.len() == 3 => return Some(self.gen_fold_builtin(f, args, span)),
@@ -3166,10 +3229,14 @@ impl<'a> Cg<'a> {
                 // Instance records are immutable and never freed; `shared`
                 // limits their fields to scalars.
                 | CType::Service(_) => {}
-                CType::Func | CType::MutMap(..) | CType::Fiber(_) | CType::Outcome(_) => {
+                CType::Func
+                | CType::MutMap(..)
+                | CType::MutList(_)
+                | CType::Fiber(_)
+                | CType::Outcome(_) => {
                     self.unsupported(
                         span,
-                        "capturing a function value, map, fiber, or outcome at a fork",
+                        "capturing a function value, map, mutable list, fiber, or outcome at a fork",
                     );
                 }
                 _ => {
@@ -4535,7 +4602,7 @@ impl<'a> Cg<'a> {
             | CType::Service(_)
             | CType::Fiber(_)
             | CType::Outcome(_) => "F".into(),
-            CType::MutMap(..) => "M".into(),
+            CType::MutMap(..) | CType::MutList(_) => "M".into(),
             CType::Option(t) => format!("O{}", self.value_desc(t)),
             CType::List(t) => format!("L{}", self.value_desc(t)),
             CType::Tuple(ts) => {
@@ -4632,6 +4699,7 @@ impl<'a> Cg<'a> {
             CType::Service(n) => format!("V{n}"),
             CType::Tag(n) => format!("T{n}"),
             CType::MutMap(..) => "M".into(),
+            CType::MutList(t) => format!("m{}", Self::ckey(t)),
             CType::Func => "F".into(),
             CType::Fiber(t) => format!("k{}", Self::ckey(t)),
             CType::Outcome(t) => format!("w{}", Self::ckey(t)),
@@ -4674,7 +4742,8 @@ impl<'a> Cg<'a> {
             | CType::Duration
             | CType::Tag(_)
             | CType::Service(_)
-            | CType::MutMap(..) => None,
+            | CType::MutMap(..)
+            | CType::MutList(_) => None,
             CType::Enum(n) if self.enum_simple.get(n).copied().unwrap_or(true) => None,
             CType::Str | CType::Schedule | CType::Func => Some(self.leaf_drop()),
             CType::Fiber(_) => {
@@ -5101,6 +5170,12 @@ declare i64 @rt_env(i64)
 declare void @rt_sleep_millis(i64)
 declare void @rt_panic(i64)
 declare i64 @rt_map_new()
+declare i64 @rt_mutlist_new()
+declare void @rt_mutlist_push(i64, i64)
+declare i64 @rt_mutlist_pop(i64)
+declare i64 @rt_mutlist_get(i64, i64)
+declare i64 @rt_mutlist_set(i64, i64, i64)
+declare i64 @rt_mutlist_size(i64)
 declare void @rt_map_set_int(i64, i64, i64)
 declare i64 @rt_map_get_int(i64, i64)
 declare i64 @rt_map_get_or_int(i64, i64, i64)

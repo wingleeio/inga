@@ -104,6 +104,7 @@ pub enum CType {
     Service(String),
     Tag(String),
     MutMap(Box<CType>, Box<CType>),
+    MutList(Box<CType>),
     Func,
 }
 
@@ -807,6 +808,9 @@ impl<'a> Checker<'a> {
                         Box::new(self.resolve_type_expr(&args[0], tyvars)),
                         Box::new(self.resolve_type_expr(&args[1], tyvars)),
                     ),
+                    ("MutList", 1) => {
+                        Type::MutList(Box::new(self.resolve_type_expr(&args[0], tyvars)))
+                    }
                     ("Fiber", 1) => Type::Fiber(
                         Box::new(self.resolve_type_expr(&args[0], tyvars)),
                         Rc::new(RefCell::new(row_set)),
@@ -822,7 +826,7 @@ impl<'a> Checker<'a> {
                         self.error(
                             *name_span,
                             format!(
-                                "`{name}` does not take type arguments (only `MutMap<K, V>`, `Fiber<T ! E>`, and `Outcome<T ! E>` do)"
+                                "`{name}` does not take type arguments (only `MutMap<K, V>`, `MutList<T>`, `Fiber<T ! E>`, and `Outcome<T ! E>` do)"
                             ),
                         );
                         Type::Unknown
@@ -930,6 +934,7 @@ impl<'a> Checker<'a> {
                 Box::new(self.instantiate(&k, rigid, map)),
                 Box::new(self.instantiate(&v, rigid, map)),
             ),
+            Type::MutList(t) => Type::MutList(Box::new(self.instantiate(&t, rigid, map))),
             Type::Func(f) => Type::Func(Rc::new(FuncType {
                 params: f.params.iter().map(|t| self.instantiate(t, rigid, map)).collect(),
                 ret: self.instantiate(&f.ret, rigid, map),
@@ -1247,6 +1252,7 @@ impl<'a> Checker<'a> {
             Type::MutMap(k, v) => {
                 CType::MutMap(Box::new(self.ctype(&k)), Box::new(self.ctype(&v)))
             }
+            Type::MutList(t) => CType::MutList(Box::new(self.ctype(&t))),
             Type::Func(_) => CType::Func,
             // Unconstrained or error-recovery types default to Int.
             Type::Var(_) | Type::Unknown => CType::Int,
@@ -3344,6 +3350,11 @@ impl<'a> Checker<'a> {
                 let v = self.ctx.fresh();
                 Type::MutMap(Box::new(k), Box::new(v))
             }
+            "MutList" => {
+                check_arity(self, 0);
+                let t = self.ctx.fresh();
+                Type::MutList(Box::new(t))
+            }
             "nowMillis" | "nowMicros" => {
                 check_arity(self, 0);
                 Type::Int
@@ -3492,6 +3503,56 @@ impl<'a> Checker<'a> {
                     self.error(
                         name_span,
                         format!("MutMap has no method `{name}` (get, set, delete, size)"),
+                    );
+                    Type::Unknown
+                }
+            },
+            Type::MutList(t) => match name {
+                "push" => {
+                    if args.len() == 1 {
+                        let val_ty = self.check_expr(args[0]);
+                        self.unify_at(&t, &val_ty, args[0].span, "list element");
+                    } else {
+                        self.error(span, "`push` expects 1 argument (the value)");
+                    }
+                    Type::Unit
+                }
+                "pop" => {
+                    if !args.is_empty() {
+                        self.error(span, "`pop` takes no arguments");
+                    }
+                    Type::Option(t.clone())
+                }
+                "get" => {
+                    if args.len() == 1 {
+                        let idx_ty = self.check_expr(args[0]);
+                        self.unify_at(&Type::Int, &idx_ty, args[0].span, "list index");
+                    } else {
+                        self.error(span, "`get` expects 1 argument (the index)");
+                    }
+                    Type::Option(t.clone())
+                }
+                "set" => {
+                    if args.len() == 2 {
+                        let idx_ty = self.check_expr(args[0]);
+                        self.unify_at(&Type::Int, &idx_ty, args[0].span, "list index");
+                        let val_ty = self.check_expr(args[1]);
+                        self.unify_at(&t, &val_ty, args[1].span, "list element");
+                    } else {
+                        self.error(span, "`set` expects 2 arguments (index, value)");
+                    }
+                    Type::Unit
+                }
+                "size" => {
+                    if !args.is_empty() {
+                        self.error(span, "`size` takes no arguments");
+                    }
+                    Type::Int
+                }
+                _ => {
+                    self.error(
+                        name_span,
+                        format!("MutList has no method `{name}` (push, pop, get, set, size)"),
                     );
                     Type::Unknown
                 }
@@ -4297,7 +4358,7 @@ impl<'a> Checker<'a> {
     /// value containing one would still point into the freed region.
     fn arena_copyable(&self, ty: &Type, seen: &mut std::collections::HashSet<String>) -> bool {
         match self.ctx.resolve(ty) {
-            Type::Func(_) | Type::Service(_) | Type::MutMap(..) => false,
+            Type::Func(_) | Type::Service(_) | Type::MutMap(..) | Type::MutList(_) => false,
             Type::Option(t) | Type::List(t) => self.arena_copyable(&t, seen),
             Type::Tuple(ts) => ts.iter().all(|t| self.arena_copyable(t, seen)),
             Type::Named(n) => {
@@ -4805,7 +4866,7 @@ pub fn builtin_doc(name: &str) -> Option<&'static str> {
     builtin_completions().into_iter().find(|(n, _)| *n == name).map(|(_, doc)| doc)
 }
 
-const BUILTIN_NAMES: [&str; 58] = [
+const BUILTIN_NAMES: [&str; 59] = [
     "println",
     "print",
     "show",
@@ -4859,6 +4920,7 @@ const BUILTIN_NAMES: [&str; 58] = [
     "toFloat",
     "floor",
     "MutMap",
+    "MutList",
     "Some",
     "nowMillis",
     "nowMicros",
@@ -4923,6 +4985,7 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("toFloat", "toFloat(n) -> Float"),
         ("floor", "floor(x) -> Int"),
         ("MutMap", "MutMap() -> MutMap<k, v> — built-in mutable map"),
+        ("MutList", "MutList() -> MutList<a> — built-in mutable array: push/pop/get/set/size"),
         ("nowMillis", "nowMillis() -> Int — monotonic milliseconds since program start"),
         ("nowMicros", "nowMicros() -> Int — monotonic microseconds since program start"),
         ("range", "range(n) -> [Int] — the list [0, 1, ..., n-1]"),

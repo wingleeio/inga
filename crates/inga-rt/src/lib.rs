@@ -738,6 +738,59 @@ pub extern "C" fn rt_map_size(m: i64) -> i64 {
     map_ref(m).len as i64
 }
 
+// ---- MutList ----------------------------------------------------------------------
+// Like MutMap: a boxed Rust Vec behind an opaque handle. Values keep the
+// references they were given by push/set (the same known leak as MutMap).
+
+fn mutlist_ref<'a>(l: i64) -> &'a mut Vec<i64> {
+    unsafe { &mut *(l as *mut Vec<i64>) }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_mutlist_new() -> i64 {
+    Box::into_raw(Box::new(Vec::<i64>::new())) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn rt_mutlist_push(l: i64, v: i64) {
+    mutlist_ref(l).push(v);
+}
+
+/// Some-box of the last element (ownership transfers out); None when empty.
+#[no_mangle]
+pub extern "C" fn rt_mutlist_pop(l: i64) -> i64 {
+    match mutlist_ref(l).pop() {
+        Some(v) => box_value(v),
+        None => 0,
+    }
+}
+
+/// Some-box of the i-th element; None out of bounds.
+#[no_mangle]
+pub extern "C" fn rt_mutlist_get(l: i64, i: i64) -> i64 {
+    let items = mutlist_ref(l);
+    if i < 0 || i as usize >= items.len() {
+        return 0;
+    }
+    box_value(items[i as usize])
+}
+
+/// Overwrite in place; out of bounds is a no-op (returns 0).
+#[no_mangle]
+pub extern "C" fn rt_mutlist_set(l: i64, i: i64, v: i64) -> i64 {
+    let items = mutlist_ref(l);
+    if i < 0 || i as usize >= items.len() {
+        return 0;
+    }
+    items[i as usize] = v;
+    1
+}
+
+#[no_mangle]
+pub extern "C" fn rt_mutlist_size(l: i64) -> i64 {
+    mutlist_ref(l).len() as i64
+}
+
 // ---- range / random -------------------------------------------------------------
 
 #[no_mangle]

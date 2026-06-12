@@ -486,6 +486,30 @@ fn read_line_consumes_stdin_until_eof() {
 }
 
 #[test]
+fn mutlist_push_pop_get_set() {
+    let out = run(r#"
+struct Node = { Int key, String label }
+
+main :: () {
+    xs = MutList()
+    xs.push(10)
+    xs.push(20)
+    xs.push(30)
+    println(xs.size(), xs.get(1) |> getOrElse(-1), xs.get(9) |> getOrElse(-1))
+    xs.set(1, 99)
+    println(xs.get(1) |> getOrElse(-1), xs.pop() |> getOrElse(-1), xs.size())
+    nodes = MutList()
+    nodes.push(Node { key: 7, label: "seven" })
+    match nodes.get(0) {
+        Some(n) -> println(n.label, n.key)
+        None -> println("missing")
+    }
+}
+"#);
+    assert_eq!(out, "3 20 -1\n99 30 2\nseven 7\n");
+}
+
+#[test]
 fn bitwise_and_byte_vocabulary() {
     let out = run(r#"
 main :: () {

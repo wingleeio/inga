@@ -18,6 +18,7 @@ fn compileable_examples_produce_ir() {
         "fibers.inga",
         "fiber_errors.inga",
         "http_client.inga",
+        "pokedex.inga",
     ] {
         let src = example(name);
         let checked = check_source(&src);

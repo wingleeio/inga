@@ -160,7 +160,9 @@ fetchPrice :: (String sym) -> Float ! HttpError, TimeoutError uses Http, Fibers 
 }
 ```
 
-Try it: `inga run examples/http_client.inga`.
+Try it: `inga run examples/http_client.inga` — or
+[`examples/pokedex.inga`](examples/pokedex.inga), which fetches the real
+PokeAPI in parallel and draws the results as a pokédex with `std/graphics`.
 
 ## Graphics, and a game
 
@@ -203,7 +205,7 @@ crates/inga-lsp       language server (lsp-server / lsp-types)
 editors/vscode        VS Code extension + TextMate grammar
 editors/zed           Zed extension (tree-sitter highlighting + LSP)
 tree-sitter-inga      tree-sitter grammar (used by the Zed extension)
-examples/             hello.inga, retry.inga, shapes.inga, arena.inga, fibers.inga, fiber_errors.inga, http_client.inga, modules.inga (+ geometry.inga), user_service.inga
+examples/             hello.inga, retry.inga, shapes.inga, arena.inga, fibers.inga, fiber_errors.inga, http_client.inga, pokedex.inga, modules.inga (+ geometry.inga), user_service.inga
 games/                balatro.inga (+ game, util, cards, jokers, poker, state, logic_test) — a Balatro-style deckbuilder
 bench/                the same workloads in Inga, JavaScript, and Rust (see bench/README.md)
 docs/SPEC.md          language design: semantics, effect rows, execution strategy

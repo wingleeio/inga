@@ -1,0 +1,132 @@
+// INGA-DEX — a pokédex from the real PokeAPI, drawn with std/graphics.
+//
+// The whole std library in one program: six pokémon fetched in parallel
+// (`fiber.parMap` + `settle`, so one bad fetch can't sink the batch), the
+// JSON decoded straight into a struct, and the results rendered as cards
+// with a per-frame `provide Arena` keeping the draw path allocation-free.
+//
+//   inga run examples/pokedex.inga   (needs network access)
+
+use std/graphics
+use std/fiber
+use std/http
+
+struct Pokemon = { Int id, String name, Int height, Int weight, Int base_experience }
+
+fetchPokemon :: (String name) -> Pokemon ! HttpError, DecodeError uses Http {
+    resp = http.get("https://pokeapi.co/api/v2/pokemon/${name}")
+    if resp.status != 200 {
+        fail HttpError(resp.status, name)
+    }
+    decode(resp.body, Pokemon)
+}
+
+// ---- drawing helpers --------------------------------------------------------
+
+rgbRect :: (Int x, Int y, Int w, Int h, Int packed, Int a) {
+    graphics.rect(x, y, w, h, packed / 65536, packed / 256 % 256, packed % 256, a)
+}
+
+roundRect :: (Int x, Int y, Int w, Int h, Int packed, Int a) {
+    rgbRect(x + 2, y, w - 4, h, packed, a)
+    rgbRect(x, y + 2, w, h - 4, packed, a)
+}
+
+textC :: (String s, Int x, Int y, Int size, Int packed) {
+    graphics.text(s, x, y, size, packed / 65536, packed / 256 % 256, packed % 256)
+}
+
+centerText :: (String s, Int cx, Int y, Int size, Int packed) {
+    textC(s, cx - graphics.textWidth(s, size) / 2, y, size, packed)
+}
+
+hit :: (Int x, Int y, Int w, Int h) -> Bool {
+    mx = graphics.mouseX()
+    my = graphics.mouseY()
+    mx >= x && mx <= x + w && my >= y && my <= y + h
+}
+
+cardColor :: (Int i) -> Int {
+    match i % 6 {
+        0 -> 16240684
+        1 -> 15630640
+        2 -> 8046412
+        3 -> 6525168
+        4 -> 16340359
+        _ -> 7559063
+    }
+    // electric yellow
+    // fire orange
+    // grass green
+    // water blue
+    // psychic pink
+    // ghost purple
+}
+
+// One stat row: label, value text, and a bar scaled against `max`.
+statBar :: (Int x, Int y, String label, String value, Int amount, Int max, Int packed) {
+    textC(label, x, y, 14, 9342618)
+    textC(value, x + 150, y, 14, 15921906)
+    w = amount * 170 / max
+    rgbRect(x, y + 8, 170, 8, 2434352, 255)
+    rgbRect(x, y + 8, if w > 170 {
+        170
+    } else {
+        w
+    }, 8, packed, 255)
+}
+
+drawCard :: (Pokemon p, Int i) {
+    col = i % 3
+    row = i / 3
+    lift = if hit(40 + col * 300, 60 + row * 230, 280, 210) {
+        4
+    } else {
+        0
+    }
+    x = 40 + col * 300
+    y = 60 + row * 230 - lift
+    color = cardColor(i)
+    graphics.rect(x + 4, y + 6, 280, 210, 8, 10, 14, 120)
+    roundRect(x, y, 280, 210, 1973790, 250)
+    rgbRect(x, y, 280, 44, color, 255)
+    textC(p.name, x + 14, y + 30, 26, 1973790)
+    centerText("#${p.id}", x + 248, y + 29, 18, 1973790)
+    statBar(x + 14, y + 70, "height", "${p.height / 10}.${p.height % 10} m", p.height, 25, color)
+    statBar(x + 14, y + 104, "weight", "${p.weight / 10}.${p.weight % 10} kg", p.weight, 1200, color)
+    statBar(x + 14, y + 138, "base xp", "${p.base_experience}", p.base_experience, 350, color)
+    centerText("the inga-dex", x + 140, y + 196, 12, 5395026)
+}
+
+frame :: ([Pokemon] pokes, Int failures) {
+    provide Arena(256.kb)
+    graphics.clear(24, 26, 32)
+    centerText("INGA-DEX", 480, 38, 32, 14423100)
+    map(range(len(pokes)), (i) -> match at(pokes, i) {
+        Some(p) -> {
+            drawCard(p, i)
+            0
+        }
+        None    -> 0
+    })
+    if failures > 0 {
+        centerText("${failures} fetch(es) failed", 480, 528, 14, 15355446)
+    }
+}
+
+main :: () {
+    provide Http, Runtime(6)
+    names = ["pikachu", "charizard", "bulbasaur", "squirtle", "mewtwo", "gengar"]
+    println("fetching ${len(names)} pokemon in parallel...")
+    outcomes = fiber.parMap(names, (n) -> fetchPokemon(n) |> fiber.settle)
+    parts = fiber.partition(outcomes)
+    pokes = parts.0
+    map(parts.1, (o) -> match o {
+        Ok(p)                        -> println("unexpected:", p.name)
+        Failed(HttpError(status, m)) -> println("fetch failed (${status}):", m)
+        Failed(DecodeError(m))       -> println("decode failed:", m)
+    })
+    println("got ${len(pokes)}; opening the dex")
+    failures = len(parts.1)
+    graphics.run(960, 540, "INGA-DEX", () -> frame(pokes, failures))
+}

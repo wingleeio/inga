@@ -97,7 +97,7 @@ One binary, everything included:
 | `inga test [files...]` | run `test*` functions; `assert`/`assertEq` failures point at the line |
 | `inga fmt [--check] files...` | canonical formatter (idempotent, keeps comments) |
 | `inga highlight file.inga` | ANSI syntax highlighting in the terminal |
-| `inga lsp` | language server: hover with inferred `!`/`uses` rows, diagnostics, go-to-definition, completion with **auto-import** (sibling modules + `std/*`) and **`.`-member completion** (module members, struct fields, service methods, map ops, tuple slots, duration suffixes), **arm completion** in `catch`/`match` (the row's error types, the scrutinee's variants), quick fixes on unknown names (cmd+.), formatting, semantic tokens |
+| `inga lsp` | language server: hover on **everything a cursor lands on** (inferred `!`/`uses` rows, struct fields like `req.path`, record-literal keys, constructors, container methods, tuple slots, suffixes — binding types reflect the whole function's inference), diagnostics, go-to-definition, completion with **auto-import** (sibling modules + `std/*`), **`.`-member completion** (module members, struct fields, service methods, map/list ops, tuple slots, duration suffixes), **field-name completion inside `User { … }` literals**, **arm completion** in `catch`/`match` (the row's error types, the scrutinee's variants), quick fixes on unknown names (cmd+.), formatting, semantic tokens |
 
 Editor support lives in [`editors/vscode`](editors/vscode) (TextMate grammar
 + LSP client).

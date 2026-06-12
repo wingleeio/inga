@@ -249,6 +249,11 @@ pub fn check(
     checker.validate_shared_impls();
     checker.record_def_details();
     checker.record_facts();
+    let deferred = std::mem::take(&mut checker.typed_hovers);
+    for (span, name, ty) in deferred {
+        let rendered = checker.render(&ty);
+        checker.info.hovers.push((span, format!("{name} : {rendered}")));
+    }
 
     diagnostics.extend(decl_diags);
     diagnostics.append(&mut checker.diags.clone());
@@ -274,6 +279,10 @@ struct Checker<'a> {
 
     diags: Vec<Diagnostic>,
     record_info: bool,
+    /// Value-type hovers (`name : T`) deferred to the end of checking, so
+    /// the rendered type reflects constraints discovered after the use site
+    /// (e.g. `xs = MutList()` refined by a later `xs.push(1)`).
+    typed_hovers: Vec<(Span, String, Type)>,
     current_rigid: std::collections::HashSet<u32>,
     raw_expr_types: HashMap<(u32, u32), Type>,
     info: CheckInfo,
@@ -300,6 +309,7 @@ impl<'a> Checker<'a> {
             impl_field_rows: HashMap::new(),
             diags: Vec::new(),
             record_info: false,
+            typed_hovers: Vec::new(),
             current_rigid: std::collections::HashSet::new(),
             raw_expr_types: HashMap::new(),
             info: CheckInfo::default(),
@@ -1006,8 +1016,7 @@ impl<'a> Checker<'a> {
         for (param, ty) in d.sig.params.iter().zip(params.iter()) {
             scope.insert(param.name.clone(), ty.clone());
             if self.record_info {
-                let rendered = self.render(ty);
-                self.info.hovers.push((param.span, format!("{} : {}", param.name, rendered)));
+                self.typed_hovers.push((param.span, param.name.clone(), ty.clone()));
             }
         }
         self.scopes = vec![scope];
@@ -1191,8 +1200,7 @@ impl<'a> Checker<'a> {
                         None => value_ty,
                     };
                     if self.record_info {
-                        let rendered = self.render(&bound_ty);
-                        self.info.hovers.push((*name_span, format!("{name} : {rendered}")));
+                        self.typed_hovers.push((*name_span, name.clone(), bound_ty.clone()));
                     }
                     self.scopes.last_mut().unwrap().insert(name.clone(), bound_ty);
                     result = Type::Unit;
@@ -1357,7 +1365,12 @@ impl<'a> Checker<'a> {
                 let recv_ty = self.check_expr(recv);
                 match self.ctx.resolve(&recv_ty) {
                     Type::Tuple(ts) => match usize::try_from(*index).ok().and_then(|i| ts.get(i)) {
-                        Some(t) => t.clone(),
+                        Some(t) => {
+                            if self.record_info {
+                                self.typed_hovers.push((*index_span, format!(".{index}"), t.clone()));
+                            }
+                            t.clone()
+                        }
                         None => {
                             self.error(
                                 *index_span,
@@ -1384,8 +1397,12 @@ impl<'a> Checker<'a> {
             ExprKind::RecordUpdate { name, name_span, base, fields } => {
                 let result = if self.structs.contains_key(name) {
                     let info = &self.structs[name];
-                    let (m, p) = (info.module, info.is_pub);
+                    let (m, p, def_span) = (info.module, info.is_pub, info.name_span);
                     self.gate(name, m, p, *name_span);
+                    if self.record_info {
+                        self.info.hovers.push((*name_span, self.render_struct_sig(name)));
+                        self.info.refs.push((*name_span, def_span));
+                    }
                     Type::Named(name.clone())
                 } else {
                     let what = if base.is_some() { "record update" } else { "construction" };
@@ -1408,6 +1425,9 @@ impl<'a> Checker<'a> {
                     match decl_fields.iter().find(|(f, _)| f == fname) {
                         Some((_, fty)) => {
                             self.unify_at(fty, &value_ty, value.span, "record update field");
+                            if self.record_info {
+                                self.typed_hovers.push((*fspan, fname.clone(), fty.clone()));
+                            }
                         }
                         None => {
                             self.error(*fspan, format!("`{name}` has no field `{fname}`"));
@@ -1547,8 +1567,7 @@ impl<'a> Checker<'a> {
             if let Some(ty) = scope.get(name) {
                 let ty = ty.clone();
                 if self.record_info {
-                    let rendered = self.render(&ty);
-                    self.info.hovers.push((span, format!("{name} : {rendered}")));
+                    self.typed_hovers.push((span, name.to_string(), ty.clone()));
                 }
                 return ty;
             }
@@ -1716,6 +1735,7 @@ impl<'a> Checker<'a> {
                     self.gate(name, m, p, callee.span);
                     if self.record_info {
                         self.info.refs.push((callee.span, def_span));
+                        self.info.hovers.push((callee.span, self.render_struct_sig(name)));
                     }
                     return self.check_ctor(name, &fields, args, span, Type::Named(name.clone()));
                 }
@@ -1729,6 +1749,15 @@ impl<'a> Checker<'a> {
                         if let Some(info) = self.enums.get(&owner) {
                             self.info.refs.push((callee.span, info.name_span));
                         }
+                        let mut names = Vec::new();
+                        let rendered: Vec<String> = fields
+                            .iter()
+                            .map(|(f, t)| format!("{} {f}", self.ctx.render(t, &mut names)))
+                            .collect();
+                        self.info.hovers.push((
+                            callee.span,
+                            format!("{name}({}) — variant of {owner}", rendered.join(", ")),
+                        ));
                     }
                     return self.check_ctor(name, &fields, args, span, Type::Enum(owner));
                 }
@@ -3710,7 +3739,8 @@ impl<'a> Checker<'a> {
                 }
                 ret
             }
-            Type::MutMap(k, v) => match name {
+            Type::MutMap(k, v) => {
+                let result = match name {
                 "get" => {
                     if args.len() == 1 {
                         let arg_ty = self.check_expr(args[0]);
@@ -3746,15 +3776,35 @@ impl<'a> Checker<'a> {
                     }
                     Type::Int
                 }
-                _ => {
-                    self.error(
-                        name_span,
-                        format!("MutMap has no method `{name}` (get, set, delete, size)"),
-                    );
-                    Type::Unknown
+                    _ => {
+                        self.error(
+                            name_span,
+                            format!("MutMap has no method `{name}` (get, set, delete, size)"),
+                        );
+                        Type::Unknown
+                    }
+                };
+                // Doc hover after the args are checked, so the key/value
+                // types reflect this very call's constraints.
+                if self.record_info {
+                    let mut names = Vec::new();
+                    let (rk, rv) =
+                        (self.ctx.render(&k, &mut names), self.ctx.render(&v, &mut names));
+                    let doc = match name {
+                        "get" => Some(format!("get({rk} key) -> {rv}?")),
+                        "set" => Some(format!("set({rk} key, {rv} value) -> Unit")),
+                        "delete" => Some(format!("delete({rk} key) -> Unit")),
+                        "size" => Some("size() -> Int".to_string()),
+                        _ => None,
+                    };
+                    if let Some(doc) = doc {
+                        self.info.hovers.push((name_span, doc));
+                    }
                 }
-            },
-            Type::MutList(t) => match name {
+                result
+            }
+            Type::MutList(t) => {
+                let result = match name {
                 "push" => {
                     if args.len() == 1 {
                         let val_ty = self.check_expr(args[0]);
@@ -3796,14 +3846,31 @@ impl<'a> Checker<'a> {
                     }
                     Type::Int
                 }
-                _ => {
-                    self.error(
-                        name_span,
-                        format!("MutList has no method `{name}` (push, pop, get, set, size)"),
-                    );
-                    Type::Unknown
+                    _ => {
+                        self.error(
+                            name_span,
+                            format!("MutList has no method `{name}` (push, pop, get, set, size)"),
+                        );
+                        Type::Unknown
+                    }
+                };
+                if self.record_info {
+                    let mut names = Vec::new();
+                    let rt = self.ctx.render(&t, &mut names);
+                    let doc = match name {
+                        "push" => Some(format!("push({rt} value) -> Unit")),
+                        "pop" => Some(format!("pop() -> {rt}?")),
+                        "get" => Some(format!("get(Int index) -> {rt}?")),
+                        "set" => Some(format!("set(Int index, {rt} value) -> Unit")),
+                        "size" => Some("size() -> Int".to_string()),
+                        _ => None,
+                    };
+                    if let Some(doc) = doc {
+                        self.info.hovers.push((name_span, doc));
+                    }
                 }
-            },
+                result
+            }
             Type::Unknown => {
                 for arg in args {
                     self.check_expr(arg);
@@ -3840,6 +3907,9 @@ impl<'a> Checker<'a> {
             match resolved {
                 Type::Int | Type::Var(_) | Type::Unknown => {
                     self.unify_at(&Type::Int, &recv_ty, recv.span, "duration value");
+                    if self.record_info {
+                        self.info.hovers.push((name_span, format!(".{name} — Int to Duration")));
+                    }
                     return Type::Duration;
                 }
                 _ => {}
@@ -3850,6 +3920,14 @@ impl<'a> Checker<'a> {
             match resolved {
                 Type::Int | Type::Var(_) | Type::Unknown => {
                     self.unify_at(&Type::Int, &recv_ty, recv.span, "size value");
+                    if self.record_info {
+                        if let Some((_, factor)) = SIZE_SUFFIXES.iter().find(|(s, _)| *s == name) {
+                            self.info.hovers.push((
+                                name_span,
+                                format!(".{name} — Int bytes (×{factor})"),
+                            ));
+                        }
+                    }
                     return Type::Int;
                 }
                 _ => {}
@@ -3857,7 +3935,16 @@ impl<'a> Checker<'a> {
         }
 
         match resolved {
-            Type::Named(type_name) => self.struct_field_type(&type_name, name, name_span),
+            Type::Named(type_name) => {
+                let fty = self.struct_field_type(&type_name, name, name_span);
+                if self.record_info && !matches!(fty, Type::Unknown) {
+                    self.typed_hovers.push((name_span, name.to_string(), fty.clone()));
+                    if let Some(info) = self.structs.get(&type_name) {
+                        self.info.refs.push((name_span, info.name_span));
+                    }
+                }
+                fty
+            }
             Type::Var(_) => {
                 // Try unique-field inference: if exactly one struct has this
                 // field, the receiver must be it.
@@ -3870,6 +3957,9 @@ impl<'a> Checker<'a> {
                 if owners.len() == 1 {
                     let (owner, field_ty) = owners.pop().unwrap();
                     self.unify_at(&owner, &recv_ty, recv.span, "field access");
+                    if self.record_info {
+                        self.typed_hovers.push((name_span, name.to_string(), field_ty.clone()));
+                    }
                     field_ty
                 } else if owners.is_empty() {
                     self.error(name_span, format!("no type has a field named `{name}`"));
@@ -4290,8 +4380,7 @@ impl<'a> Checker<'a> {
             PatternKind::Bind(name) => {
                 self.scopes.last_mut().unwrap().insert(name.clone(), scrut_ty.clone());
                 if self.record_info {
-                    let rendered = self.render(scrut_ty);
-                    self.info.hovers.push((pat.span, format!("{name} : {rendered}")));
+                    self.typed_hovers.push((pat.span, name.clone(), scrut_ty.clone()));
                 }
             }
             PatternKind::Int(_) => {
@@ -4394,8 +4483,7 @@ impl<'a> Checker<'a> {
                 Some(bound) => {
                     self.unify_at(&bound, scrut_ty, pat.span, "pattern");
                     if self.record_info {
-                        let rendered = self.render(&bound);
-                        self.info.hovers.push((pat.span, format!("{name} : {rendered}")));
+                        self.typed_hovers.push((pat.span, name.clone(), bound.clone()));
                     }
                     self.scopes.last_mut().unwrap().insert(name.clone(), bound);
                 }
@@ -4803,11 +4891,7 @@ impl<'a> Checker<'a> {
                     name: d.name.clone(),
                     span: d.name_span,
                     kind: DefKind::Struct,
-                    detail: format!(
-                        "struct {} = {{ {} }}",
-                        d.name,
-                        d.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>().join(", ")
-                    ),
+                    detail: self.render_struct_sig(&d.name),
                 },
                 Decl::Enum(d) => DefInfo {
                     name: d.name.clone(),
@@ -5020,6 +5104,18 @@ impl<'a> Checker<'a> {
     fn render(&self, ty: &Type) -> String {
         let mut names = Vec::new();
         self.ctx.render(ty, &mut names)
+    }
+
+    /// `struct Stats = { Int visits, String label }` — typed, for hovers.
+    fn render_struct_sig(&self, name: &str) -> String {
+        let Some(info) = self.structs.get(name) else { return name.to_string() };
+        let mut names = Vec::new();
+        let fields: Vec<String> = info
+            .fields
+            .iter()
+            .map(|(f, t)| format!("{} {f}", self.ctx.render(t, &mut names)))
+            .collect();
+        format!("struct {name} = {{ {} }}", fields.join(", "))
     }
 
     fn render_func_signature(&self, name: &str) -> String {

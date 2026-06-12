@@ -362,6 +362,9 @@ impl Server {
         if let Some(items) = self.member_completion(&uri, src, offset) {
             return Some(CompletionResponse::Array(items));
         }
+        if let Some(items) = self.record_field_completion(&uri, src, offset) {
+            return Some(CompletionResponse::Array(items));
+        }
         if let Some(items) = self.arm_completion(&uri, src, offset) {
             return Some(CompletionResponse::Array(items));
         }
@@ -439,6 +442,133 @@ impl Server {
             }
         }
         Some(CompletionResponse::Array(items))
+    }
+
+    /// Field-name completions inside a record literal/update: at
+    /// `Stats { ‸ }` or `Stats { visits: 1, ‸ }`, offer the struct's
+    /// missing fields as `name: `. Returns None when the cursor is not at
+    /// a field position inside a `Upper { … }` literal.
+    fn record_field_completion(
+        &self,
+        uri: &Url,
+        src: &str,
+        offset: u32,
+    ) -> Option<Vec<CompletionItem>> {
+        let mut diags = Vec::new();
+        let tokens = inga_core::lexer::lex(src, &mut diags);
+        let toks: Vec<&Token> = tokens
+            .iter()
+            .filter(|t| !matches!(t.kind, TokenKind::Comment(_) | TokenKind::Eof))
+            .collect();
+        // Walk to the cursor tracking open braces; remember which opened a
+        // record literal (an Upper ident right before `{`, not a match
+        // scrutinee / service body / impl body).
+        let mut stack: Vec<Option<(String, usize)>> = Vec::new();
+        let mut i = 0;
+        while i < toks.len() && toks[i].span.start < offset {
+            match &toks[i].kind {
+                TokenKind::LBrace => {
+                    let mut opener = None;
+                    // The significant token before the `{`.
+                    let prev = (0..i).rev().find(|&j| !matches!(toks[j].kind, TokenKind::Newline));
+                    if let Some(j) = prev {
+                        if let TokenKind::Ident(name) = &toks[j].kind {
+                            let is_upper =
+                                name.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+                            let before = (0..j)
+                                .rev()
+                                .find(|&k| !matches!(toks[k].kind, TokenKind::Newline));
+                            let blocked = before.is_some_and(|k| {
+                                matches!(
+                                    toks[k].kind,
+                                    TokenKind::KwMatch
+                                        | TokenKind::KwService
+                                        | TokenKind::KwShared
+                                        | TokenKind::ColonColon
+                                )
+                            });
+                            if is_upper && !blocked {
+                                opener = Some((name.clone(), i));
+                            }
+                        }
+                    }
+                    stack.push(opener);
+                }
+                TokenKind::RBrace => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let (struct_name, open_idx) = stack.iter().rev().flatten().next()?.clone();
+        // Only at a field position: directly after `{`, `,`, or a newline
+        // (or in a partial identifier following one of those).
+        let before_cursor =
+            (0..i).rev().find(|&j| toks[j].span.end <= offset).map(|j| &toks[j].kind);
+        let at_field_pos = match before_cursor {
+            Some(TokenKind::LBrace | TokenKind::Comma | TokenKind::Newline) => true,
+            Some(TokenKind::Ident(_)) => {
+                // A partial field name: the cursor touches the ident and the
+                // token before it opens a field position.
+                let j = (0..i).rev().find(|&j| toks[j].span.end <= offset).unwrap();
+                toks[j].span.end >= offset
+                    && j > 0
+                    && matches!(
+                        toks[j - 1].kind,
+                        TokenKind::LBrace | TokenKind::Comma | TokenKind::Newline
+                    )
+            }
+            _ => false,
+        };
+        if !at_field_pos {
+            return None;
+        }
+        // Fields already given inside this literal (at its own brace depth).
+        let mut present: Vec<String> = Vec::new();
+        let mut depth = 0usize;
+        let mut j = open_idx + 1;
+        while j < toks.len() {
+            match &toks[j].kind {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Ident(f)
+                    if depth == 0
+                        && j + 1 < toks.len()
+                        && toks[j + 1].kind == TokenKind::Colon =>
+                {
+                    present.push(f.clone());
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        // The struct's fields: this file, then siblings, then builtins.
+        let fields = struct_fields_for(uri, src, &self.documents, &struct_name)?;
+        let items: Vec<CompletionItem> = fields
+            .into_iter()
+            .filter(|(f, _)| !present.contains(f))
+            .map(|(f, ty)| CompletionItem {
+                label: f.clone(),
+                kind: Some(CompletionItemKind::FIELD),
+                detail: Some(if ty.is_empty() {
+                    format!("field of {struct_name}")
+                } else {
+                    format!("{ty} — field of {struct_name}")
+                }),
+                insert_text: Some(format!("{f}: ")),
+                ..Default::default()
+            })
+            .collect();
+        if items.is_empty() {
+            return None;
+        }
+        Some(items)
     }
 
     /// Completions after a `.`: module members for `schedule.`/`fiber.`/
@@ -774,6 +904,70 @@ fn parse_loose(src: &str) -> inga_core::ast::Program {
     let mut diags = Vec::new();
     let tokens = inga_core::lexer::lex(src, &mut diags);
     inga_core::parser::parse(tokens, &mut diags)
+}
+
+/// A struct's (field, type) pairs by name: the open file's declarations,
+/// then sibling modules', then the builtin structs.
+fn struct_fields_for(
+    uri: &Url,
+    src: &str,
+    docs: &HashMap<Url, String>,
+    name: &str,
+) -> Option<Vec<(String, String)>> {
+    use inga_core::ast::{Decl, TypeExpr};
+    fn ty_label(t: &Option<TypeExpr>) -> String {
+        match t {
+            Some(TypeExpr::Name(n, _)) => n.clone(),
+            Some(TypeExpr::Option(inner, _)) => {
+                format!("{}?", ty_label(&Some((**inner).clone())))
+            }
+            Some(TypeExpr::List(inner, _)) => {
+                format!("[{}]", ty_label(&Some((**inner).clone())))
+            }
+            _ => String::new(),
+        }
+    }
+    let from_decls = |text: &str| -> Option<Vec<(String, String)>> {
+        for decl in &parse_loose(text).decls {
+            if let Decl::Struct(d) = decl {
+                if d.name == name {
+                    return Some(
+                        d.fields.iter().map(|f| (f.name.clone(), ty_label(&f.ty))).collect(),
+                    );
+                }
+            }
+        }
+        None
+    };
+    if let Some(fields) = from_decls(src) {
+        return Some(fields);
+    }
+    if let Ok(path) = uri.to_file_path() {
+        if let Some(dir) = path.parent() {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) != Some("inga") || p == path {
+                        continue;
+                    }
+                    let text = Url::from_file_path(&p)
+                        .ok()
+                        .and_then(|u| docs.get(&u).cloned())
+                        .or_else(|| std::fs::read_to_string(&p).ok());
+                    if let Some(fields) = text.as_deref().and_then(from_decls) {
+                        return Some(fields);
+                    }
+                }
+            }
+        }
+    }
+    let builtin = inga_core::check::builtin_struct_fields(name);
+    if !builtin.is_empty() {
+        return Some(
+            builtin.iter().map(|(f, t)| (f.to_string(), t.to_string())).collect(),
+        );
+    }
+    None
 }
 
 /// Every `pub` name exported by the open file's sibling modules. Open
@@ -1398,6 +1592,50 @@ mod member_tests {
         assert!(labels(&items).contains(&"millis".to_string()));
         assert!(labels(&items).contains(&"kb".to_string()));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_literal_field_completion() {
+        let dir = std::env::temp_dir().join(format!("inga-recfield-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "struct Pokemon = { Int id, String name, Bool shiny }\n\nmain :: () {\n    p = Pokemon { id: 1, ZZ }\n    q = Pokemon { sh }\n    match p {\n        other -> println(other.name)\n    }\n}\n";
+        let (server, uri) = server_with(&dir.join("recfield.inga"), src);
+
+        // After `id: 1, ` — the remaining fields, not `id`.
+        let items =
+            server.record_field_completion(&uri, src, offset_of(src, "id: 1, ")).unwrap();
+        assert_eq!(labels(&items), vec!["name", "shiny"]);
+        assert_eq!(items[0].insert_text.as_deref(), Some("name: "));
+
+        // A partial field name right after `{ `.
+        let items = server.record_field_completion(&uri, src, offset_of(src, "q = Pokemon { sh")).unwrap();
+        assert_eq!(labels(&items), vec!["id", "name", "shiny"]);
+
+        // Inside a match body — not a record literal.
+        assert!(server
+            .record_field_completion(&uri, src, offset_of(src, "other -> "))
+            .is_none());
+
+        // Builtin structs complete too.
+        let src2 = "use std/http\n\nmain :: () {\n    provide Http\n    r = HttpResponse { status: 200, ZZ }\n    println(r.body)\n}\n";
+        let (server2, uri2) = server_with(&dir.join("recfield2.inga"), src2);
+        let items = server2
+            .record_field_completion(&uri2, src2, offset_of(src2, "status: 200, "))
+            .unwrap();
+        assert_eq!(labels(&items), vec!["body"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_struct_fields_complete_after_dot() {
+        let dir = std::env::temp_dir().join(format!("inga-bsf-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "use std/http\n\nhandle :: (HttpRequest req) -> HttpResponse {\n    HttpResponse(200, req.body)\n}\n\nmain :: () {\n    provide Http\n    println(handle(HttpRequest(\"GET\", \"/\", \"\", \"\")).status)\n}\n";
+        let (server, uri) = server_with(&dir.join("bsf.inga"), src);
+        let items = server.member_completion(&uri, src, offset_of(src, "200, req.")).unwrap();
+        assert_eq!(labels(&items), vec!["method", "path", "query", "body"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

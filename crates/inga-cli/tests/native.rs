@@ -51,6 +51,10 @@ fn examples_build_and_run_with_expected_output() {
         ("shapes.inga", "area 12.56636\nrejected: a dot has no area\ntoo big at 600.0\n1\n"),
         ("arena.inga", "simulated 10000 particles in the region\n9000\n"),
         (
+            "fiber_errors.inga",
+            "1: default.png\n2: cached prices.json\n3: fallback 0\n4: 2 ok, 1 failed\n   body of a\n   retrying b later\n   body of c\n5: timed out\n6: cancelled\n",
+        ),
+        (
             "fibers.inga",
             "huge refused the job\nsmall: 500500\nmedium: 5000050000\nhuge: -1\ngrand total: 5000550499\ndone: 500500\nskipped: n=99999999\n",
         ),

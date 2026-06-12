@@ -1,0 +1,87 @@
+// Where errors go with fibers — one placement per section.
+//
+// The whole model in one sentence: errors live in the fiber's type until
+// the join; the join puts them back in the channel; then it's ordinary
+// `catch`. Decide per branch at the fork, sweep up the remainder at the
+// join, or turn failures into data with `settle` when you'll act on them.
+//
+//   inga run examples/fiber_errors.inga
+
+use std/fiber
+
+struct Flaky    = { String url }
+struct Critical = { String why }
+
+fetch :: (String url, Bool up) -> String ! Flaky {
+    if up {
+        "body of ${url}"
+    } else {
+        fail Flaky(url)
+    }
+}
+
+mustHave :: (Int n) -> Int ! Critical {
+    if n < 0 {
+        fail Critical("negative input")
+    }
+    n * 2
+}
+
+slowEcho :: (String s) -> String {
+    sleep(10.seconds)
+    s
+}
+
+main :: () {
+    provide Runtime(4)
+
+    // 1. Recover INSIDE the forked expression: the branch's policy is its
+    //    own business. The row never enters the fiber's type (hover shows
+    //    Fiber<String>), so this failure can't cancel siblings and never
+    //    reaches a join.
+    optional = fetch("avatar.png", false) |> catch { Flaky -> "default.png" } |> fiber.fork
+    println("1:", fiber.join(optional))
+
+    // 2. Let it ride: the row travels in Fiber<String ! Flaky> and
+    //    re-raises at the join — catch where the result lands.
+    risky = fetch("prices.json", false) |> fiber.fork
+    println("2:", fiber.join(risky) |> catch { Flaky(url) -> "cached ${url}" })
+
+    // 3. Structural join: the first failure in shape order interrupts the
+    //    rest and re-raises, so one catch sweeps the whole shape. A
+    //    recovering arm must produce the joined tuple; arms that end in
+    //    `fail` are exempt — translate-and-rethrow stays cheap.
+    header = fetch("header", true) |> fiber.fork
+    body = fetch("body", false) |> fiber.fork
+    count = mustHave(7) |> fiber.fork
+    page = fiber.join((header, body, count))
+        |> catch {
+            Flaky         -> ("fallback", "fallback", 0)
+            Critical(why) -> fail Critical(why)
+        }
+        |> catch { Critical -> ("", "", -1) }
+    println("3:", page.0, page.2)
+
+    // 4. The failure IS the data: settle each element and the batch always
+    //    completes — no failure escapes or cancels. Provenance is never
+    //    lost (each Outcome is one branch's fate), and `Failed` arms speak
+    //    catch's pattern language.
+    jobs = [("a", true), ("b", false), ("c", true)]
+    outcomes = fiber.parMap(jobs, (j) -> fetch(j.0, j.1) |> fiber.settle)
+    parts = fiber.partition(outcomes)
+    println("4:", len(parts.0), "ok,", len(parts.1), "failed")
+    map(outcomes, (o) -> match o {
+        Ok(got)            -> println("   ${got}")
+        Failed(Flaky(url)) -> println("   retrying ${url} later")
+    })
+
+    // 5. Deadlines and cancellation are just more typed errors: `within`
+    //    fails with Timeout, joining an interrupted fiber fails with
+    //    Interrupted — both ordinary, both catchable.
+    late = fiber.within(slowEcho("zzz"), 50.millis) |> catch { Timeout -> "timed out" }
+    println("5:", late)
+
+    cancelled = slowEcho("never") |> fiber.fork
+    fiber.interrupt(cancelled)
+    println("6:", fiber.join(cancelled) |> catch { Interrupted -> "cancelled" })
+}

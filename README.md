@@ -126,7 +126,9 @@ declared `shared service` (scalar-only state, checked at every impl);
 captured values are frozen so refcounts never race; an unjoined fiber is
 interrupted when its handle drops — no leaks, no daemons. Parallelism shows
 up in the row (`uses Fibers`), so a library that forks says so in its
-types. Try it: `inga run examples/fibers.inga`.
+types. Try it: `inga run examples/fibers.inga` — and
+[`examples/fiber_errors.inga`](examples/fiber_errors.inga) walks every
+error placement, one section each.
 
 ## Tests are built in
 
@@ -180,7 +182,7 @@ crates/inga-lsp       language server (lsp-server / lsp-types)
 editors/vscode        VS Code extension + TextMate grammar
 editors/zed           Zed extension (tree-sitter highlighting + LSP)
 tree-sitter-inga      tree-sitter grammar (used by the Zed extension)
-examples/             hello.inga, retry.inga, shapes.inga, arena.inga, fibers.inga, modules.inga (+ geometry.inga), user_service.inga
+examples/             hello.inga, retry.inga, shapes.inga, arena.inga, fibers.inga, fiber_errors.inga, modules.inga (+ geometry.inga), user_service.inga
 games/                balatro.inga (+ game, util, cards, jokers, poker, state, logic_test) — a Balatro-style deckbuilder
 bench/                the same workloads in Inga, JavaScript, and Rust (see bench/README.md)
 docs/SPEC.md          language design: semantics, effect rows, execution strategy

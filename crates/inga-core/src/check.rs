@@ -3025,6 +3025,12 @@ impl<'a> Checker<'a> {
     }
 
     fn warn_unreachable_arm(&mut self, span: Span, tag: &str) {
+        // Cancellation can surface at any `fiber.join`/`fiber.poll`; it is
+        // deliberately not part of inferred rows (every join would carry it),
+        // so an `Interrupted` arm is always considered reachable.
+        if tag == INTERRUPTED {
+            return;
+        }
         self.warn(
             span,
             format!("this `catch` arm is unreachable: the expression cannot fail with `{tag}`"),

@@ -568,16 +568,30 @@ impl Printer {
         out
     }
 
-    /// `"""` form: real newlines, bare quotes; content re-indented one
-    /// level past the opener, closing delimiter at that same indent (the
-    /// lexer strips it back out, so this round-trips).
+    /// `"""` form: real newlines, bare quotes; content and the closing
+    /// delimiter sit at the opener's line indentation, so both delimiter
+    /// lines align (the lexer strips that indent back out — round-trips).
     fn render_triple_str(&mut self, pieces: &[StrPiece], indent: usize) -> String {
-        let pad = "    ".repeat(indent + 1);
+        let pad = "    ".repeat(indent);
         let mut body = String::new();
+        // Three raw quotes in content would close the literal early when
+        // re-lexed; escape every third consecutive quote.
+        let mut quotes = 0u32;
         for piece in pieces {
             match piece {
                 StrPiece::Text(text) => {
                     for c in text.chars() {
+                        if c == '"' {
+                            quotes += 1;
+                            if quotes == 3 {
+                                body.push_str("\\\"");
+                                quotes = 0;
+                            } else {
+                                body.push('"');
+                            }
+                            continue;
+                        }
+                        quotes = 0;
                         match c {
                             '\\' => body.push_str("\\\\"),
                             '\r' => body.push_str("\\r"),
@@ -588,8 +602,9 @@ impl Printer {
                     }
                 }
                 StrPiece::Expr(e) => {
+                    quotes = 0;
                     body.push_str("${");
-                    body.push_str(&self.render_expr(e, indent + 1));
+                    body.push_str(&self.render_expr(e, indent));
                     body.push('}');
                 }
             }

@@ -856,3 +856,20 @@ fn catch_after_fork_is_guided() {
         "got: {errs:?}"
     );
 }
+
+#[test]
+fn tap_and_tap_error_observe_without_transforming() {
+    let out = run(
+        "struct Boom = { Int code }\n\nrisky :: (Int n) -> Int ! Boom {\n    if n > 10 {\n        fail Boom(n)\n    }\n    n * 2\n}\n\nmain :: () {\n    total = [1, 2, 3]\n        |> tap((xs) -> println(\"saw\", len(xs)))\n        |> fold(0, (a, b) -> a + b)\n    println(total)\n    ok = risky(3) |> tapError((e) -> println(\"failed\", e.code)) |> catch { Boom -> -1 }\n    bad = risky(99) |> tapError((e) -> println(\"failed\", e.code)) |> catch { Boom(c) -> c }\n    println(ok, bad)\n}\n",
+    );
+    assert_eq!(out, "saw 3\n6\nfailed 99\n6 99\n");
+
+    // The row is preserved: tapError alone does not satisfy main.
+    let errs = check_errors(
+        "struct Boom = { Int code }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(1)\n}\n\nmain :: () {\n    println(risky() |> tapError((e) -> println(e.code)))\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("`main` does not handle the error `Boom`")),
+        "got: {errs:?}"
+    );
+}

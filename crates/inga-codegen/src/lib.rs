@@ -2544,6 +2544,37 @@ impl<'a> Cg<'a> {
                 f.start_block(&cont);
                 "0".to_string()
             }
+            "tap" if args.len() == 2 => {
+                let v = self.gen_expr(f, args[0]);
+                let closure = self.gen_expr(f, args[1]);
+                // The effect returns Unit; nothing to pool.
+                let _ = self.gen_closure_call(f, &closure, &[v.clone()], &CType::Unit);
+                v
+            }
+            "tapError" if args.len() == 2 => {
+                // The closure is materialized first so the handler can call
+                // it (closure construction is pure, so the reordering is
+                // unobservable).
+                let closure = self.gen_expr(f, args[1]);
+                let (handler, cont) = (self.label("tap.fail"), self.label("tapped"));
+                let slot = f.fresh_slot(self);
+                f.handlers.push(handler.clone());
+                let v = self.gen_expr(f, args[0]);
+                f.handlers.pop();
+                f.line(format!("store i64 {v}, ptr {slot}"));
+                f.line(format!("br label %{cont}"));
+                f.start_block(&handler);
+                let e = self.tmp();
+                f.line(format!("{e} = load i64, ptr %err.slot"));
+                let payload = self.load_slot_from_int(f, &e, 1);
+                let _ = self.gen_closure_call(f, &closure, &[payload], &CType::Unit);
+                // Re-raise the same error to the next handler out.
+                self.emit_failure(f, &e);
+                f.start_block(&cont);
+                let out = self.tmp();
+                f.line(format!("{out} = load i64, ptr {slot}"));
+                out
+            }
             "retry" if args.len() == 2 => return Some(self.gen_retry(f, args[0], args[1])),
             "sleep" if args.len() == 1 => {
                 let v = self.gen_expr(f, args[0]);

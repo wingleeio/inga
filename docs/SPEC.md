@@ -130,7 +130,10 @@ the expression cannot fail with is an *unreachable-arm warning*. Helpers:
 (`schedule.exponential(100.millis) |> schedule.upTo(3)`, `schedule.fixed(...)` — from
 `use std/schedule`).
 `retry` deliberately does **not** clear the row — a retried action can still
-fail. `assert(cond)` and `assertEq(actual, expected)` fail with the builtin
+fail. `tap(value, f)` runs a side effect on the value mid-pipe and passes it
+along untouched; `tapError(action, f)` runs a side effect on a *failure* and
+re-raises it — both are observation points (logging, metrics), neither
+transforms nor clears anything. `assert(cond)` and `assertEq(actual, expected)` fail with the builtin
 struct `AssertFailed { message }` — ordinary typed errors, catchable
 anywhere, and the backbone of `inga test` (§9).
 
@@ -197,7 +200,7 @@ provides real implementations.
   `println print show encode decode len map filter fold at concat reverse
   range` (lists), `split slice indexOf trim parseInt toFloat floor`
   (strings/numbers), `getOrElse orFail` (options), `retry ignoreFailure
-  sleep` (effects), `assert assertEq` (tests),
+  tap tapError sleep` (effects), `assert assertEq` (tests),
   `MutMap Some nowMillis nowMicros random`. Concurrency is **not** in the
   prelude — it lives in `std/fiber` (§6.5). Editors show each builtin's
   signature on hover.

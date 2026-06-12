@@ -2430,6 +2430,58 @@ impl<'a> Checker<'a> {
                 self.add_fail_row(&err_ty, args[1].span, "orFail");
                 a
             }
+            "tap" => {
+                if !check_arity(self, 2) {
+                    return Some(Type::Unknown);
+                }
+                // Run a side effect on the value flowing through a pipe,
+                // pass the value along untouched. The effect returns Unit —
+                // tap is for effects; a result would be discarded anyway.
+                let v_ty = self.check_expr(args[0]);
+                let expected_f = Type::Func(Rc::new(FuncType {
+                    params: vec![v_ty.clone()],
+                    ret: Type::Unit,
+                    errors: BTreeSet::new(),
+                    caps: BTreeSet::new(),
+                }));
+                let func_ty = self.check_arg_expecting(args[1], &expected_f);
+                self.add_func_arg_rows(&func_ty);
+                self.unify_at(&expected_f, &func_ty, args[1].span, "tap function");
+                v_ty
+            }
+            "tapError" => {
+                if !check_arity(self, 2) {
+                    return Some(Type::Unknown);
+                }
+                // Observe the error channel without consuming it: on failure
+                // the effect runs on the failed value and the SAME error
+                // re-raises — the row is preserved, so a later `catch` (or
+                // the caller) still has to handle it.
+                let (ty, rows) = self.with_rows(|s| s.check_expr(args[0]));
+                let err_ty = if rows.errors.len() == 1 {
+                    let only = rows.errors.iter().next().unwrap().clone();
+                    self.tag_type(&only).unwrap_or(Type::Unknown)
+                } else {
+                    Type::Unknown
+                };
+                if rows.errors.is_empty() {
+                    self.warn(
+                        args[0].span,
+                        "this expression cannot fail, so `tapError` never runs its effect",
+                    );
+                }
+                self.merge_rows(&rows);
+                let expected_f = Type::Func(Rc::new(FuncType {
+                    params: vec![err_ty],
+                    ret: Type::Unit,
+                    errors: BTreeSet::new(),
+                    caps: BTreeSet::new(),
+                }));
+                let func_ty = self.check_arg_expecting(args[1], &expected_f);
+                self.add_func_arg_rows(&func_ty);
+                self.unify_at(&expected_f, &func_ty, args[1].span, "tapError function");
+                ty
+            }
             "retry" => {
                 if !check_arity(self, 2) {
                     return Some(Type::Unknown);
@@ -3930,7 +3982,7 @@ pub fn builtin_doc(name: &str) -> Option<&'static str> {
     builtin_completions().into_iter().find(|(n, _)| *n == name).map(|(_, doc)| doc)
 }
 
-const BUILTIN_NAMES: [&str; 32] = [
+const BUILTIN_NAMES: [&str; 34] = [
     "println",
     "print",
     "show",
@@ -3941,6 +3993,8 @@ const BUILTIN_NAMES: [&str; 32] = [
     "orFail",
     "retry",
     "ignoreFailure",
+    "tap",
+    "tapError",
     "sleep",
     "assert",
     "assertEq",
@@ -3979,6 +4033,8 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("retry", "retry(lazy action, schedule) -> a — re-run per the Schedule; the error row is kept (a retried action can still fail)"),
         ("schedule.upTo", "schedule.upTo(schedule, times) -> Schedule — cap the retry count"),
         ("ignoreFailure", "ignoreFailure(lazy action) -> Unit — swallow the error channel"),
+        ("tap", "tap(value, f) -> value — run a side effect on the value mid-pipe, pass it along untouched"),
+        ("tapError", "tapError(lazy action, f) -> a — run a side effect on a failure, then re-raise it (the row is preserved)"),
         ("sleep", "sleep(duration) -> Unit"),
         ("assert", "assert(condition) -> Unit ! AssertFailed — for `inga test`"),
         ("assertEq", "assertEq(actual, expected) -> Unit ! AssertFailed — for `inga test`"),

@@ -832,20 +832,11 @@ pub extern "C" fn rt_gfx_run(width: i64, height: i64, title: i64, closure: i64) 
         .unwrap_or(30);
     LOGICAL.with(|l| l.set((width as f32, height as f32)));
     macroquad::Window::from_config(conf, async move {
-        use macroquad::prelude::*;
-        let target = macroquad::texture::render_target(width as u32, height as u32);
-        target.texture.set_filter(macroquad::texture::FilterMode::Linear);
         let mut frame_no = 0u32;
         loop {
-            // Draw the frame into the logical-size target.
-            let mut camera = Camera2D::from_display_rect(Rect::new(
-                0.0,
-                0.0,
-                width as f32,
-                height as f32,
-            ));
-            camera.render_target = Some(target.clone());
-            set_camera(&camera);
+            // The frame draws in logical coordinates; every shim scales to
+            // the live window (so text rasterizes at its real pixel size —
+            // no offscreen target, no upscaling blur).
             let env = closure as *mut u8;
             let fp: FrameFn = unsafe { std::mem::transmute(*(env as *const i64)) };
             let r = unsafe { fp(env) };
@@ -853,21 +844,22 @@ pub extern "C" fn rt_gfx_run(width: i64, height: i64, title: i64, closure: i64) 
                 eprintln!("runtime error: unhandled error escaped the frame closure");
                 std::process::exit(101);
             }
-            // Present: letterboxed scale to the actual window.
-            set_default_camera();
-            clear_background(macroquad::color::BLACK);
+            // Mask the letterbox margins.
+            let (lw, lh) = LOGICAL.with(|l| l.get());
             let (scale, ox, oy) = gfx_viewport();
-            macroquad::texture::draw_texture_ex(
-                &target.texture,
-                ox,
-                oy,
-                macroquad::color::WHITE,
-                macroquad::texture::DrawTextureParams {
-                    dest_size: Some(Vec2::new(width as f32 * scale, height as f32 * scale)),
-                    flip_y: true,
-                    ..Default::default()
-                },
+            let (sw, sh) = (
+                macroquad::window::screen_width(),
+                macroquad::window::screen_height(),
             );
+            let black = macroquad::color::BLACK;
+            if ox > 0.0 {
+                macroquad::shapes::draw_rectangle(0.0, 0.0, ox, sh, black);
+                macroquad::shapes::draw_rectangle(ox + lw * scale, 0.0, sw, sh, black);
+            }
+            if oy > 0.0 {
+                macroquad::shapes::draw_rectangle(0.0, 0.0, sw, oy, black);
+                macroquad::shapes::draw_rectangle(0.0, oy + lh * scale, sw, sh, black);
+            }
             frame_no += 1;
             if let Some(path) = &shot {
                 if frame_no == shot_frame {
@@ -878,6 +870,21 @@ pub extern "C" fn rt_gfx_run(width: i64, height: i64, title: i64, closure: i64) 
             macroquad::window::next_frame().await;
         }
     });
+}
+
+/// Logical x/y/length to live screen pixels.
+fn sx(x: i64) -> f32 {
+    let (scale, ox, _) = gfx_viewport();
+    ox + x as f32 * scale
+}
+
+fn sy(y: i64) -> f32 {
+    let (scale, _, oy) = gfx_viewport();
+    oy + y as f32 * scale
+}
+
+fn sl(v: i64) -> f32 {
+    v as f32 * gfx_viewport().0
 }
 
 fn color(r: i64, g: i64, b: i64, a: i64) -> macroquad::color::Color {
@@ -891,13 +898,7 @@ pub extern "C" fn rt_gfx_clear(r: i64, g: i64, b: i64) {
 
 #[no_mangle]
 pub extern "C" fn rt_gfx_rect(x: i64, y: i64, w: i64, h: i64, r: i64, g: i64, b: i64, a: i64) {
-    macroquad::shapes::draw_rectangle(
-        x as f32,
-        y as f32,
-        w as f32,
-        h as f32,
-        color(r, g, b, a),
-    );
+    macroquad::shapes::draw_rectangle(sx(x), sy(y), sl(w), sl(h), color(r, g, b, a));
 }
 
 #[no_mangle]
@@ -914,37 +915,36 @@ pub extern "C" fn rt_gfx_rect_lines(
     a: i64,
 ) {
     macroquad::shapes::draw_rectangle_lines(
-        x as f32,
-        y as f32,
-        w as f32,
-        h as f32,
-        thickness as f32,
+        sx(x),
+        sy(y),
+        sl(w),
+        sl(h),
+        sl(thickness).max(1.0),
         color(r, g, b, a),
     );
 }
 
 #[no_mangle]
 pub extern "C" fn rt_gfx_circle(x: i64, y: i64, radius: i64, r: i64, g: i64, b: i64, a: i64) {
-    macroquad::shapes::draw_circle(x as f32, y as f32, radius as f32, color(r, g, b, a));
+    macroquad::shapes::draw_circle(sx(x), sy(y), sl(radius), color(r, g, b, a));
 }
 
 #[no_mangle]
 pub extern "C" fn rt_gfx_text(text: i64, x: i64, y: i64, size: i64, r: i64, g: i64, b: i64) {
     let text = unsafe { std::str::from_utf8_unchecked(str_bytes(text)) };
-    macroquad::text::draw_text(
-        text,
-        x as f32,
-        y as f32,
-        size as f32,
-        color(r, g, b, 255),
-    );
+    // Glyphs are rasterized at the SCALED size, so text stays crisp at any
+    // window size instead of being baked at logical size and stretched.
+    macroquad::text::draw_text(text, sx(x), sy(y), sl(size), color(r, g, b, 255));
 }
 
 #[no_mangle]
 pub extern "C" fn rt_gfx_text_width(text: i64, size: i64) -> i64 {
     let text = unsafe { std::str::from_utf8_unchecked(str_bytes(text)) };
-    let dims = macroquad::text::measure_text(text, None, (size as f32) as u16, 1.0);
-    dims.width as i64
+    // Measure at the scaled size, report in logical units (what the caller
+    // does layout in).
+    let scale = gfx_viewport().0;
+    let dims = macroquad::text::measure_text(text, None, sl(size) as u16, 1.0);
+    (dims.width / scale) as i64
 }
 
 #[no_mangle]
@@ -1025,11 +1025,11 @@ pub extern "C" fn rt_gfx_image(handle: i64, x: i64, y: i64, w: i64, h: i64) {
         if let Some(tex) = ts.borrow().get(handle as usize) {
             macroquad::texture::draw_texture_ex(
                 tex,
-                x as f32,
-                y as f32,
+                sx(x),
+                sy(y),
                 macroquad::color::WHITE,
                 macroquad::texture::DrawTextureParams {
-                    dest_size: Some(macroquad::math::Vec2::new(w as f32, h as f32)),
+                    dest_size: Some(macroquad::math::Vec2::new(sl(w), sl(h))),
                     ..Default::default()
                 },
             );

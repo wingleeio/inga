@@ -265,7 +265,12 @@ impl<'a> Cg<'a> {
                         d.name.clone(),
                         ImplMeta {
                             decl: d,
-                            fields: d.fields.iter().map(|(n, _, _)| n.clone()).collect(),
+                            fields: d
+                                .params
+                                .iter()
+                                .map(|p| p.name.clone())
+                                .chain(d.fields.iter().map(|(n, _, _)| n.clone()))
+                                .collect(),
                         },
                     );
                 }
@@ -2403,9 +2408,25 @@ impl<'a> Cg<'a> {
                 let fnref = format!("ptrtoint (ptr @ing.m.{name}.{m} to i64)");
                 self.store_slot(f, &ptr, i as i64, &fnref);
             }
+            // Provide arguments fill the parameter fields, in order; field
+            // initializers (and methods) see them like any other field.
+            f.scopes.push(HashMap::new());
+            let args = item.args.as_deref().unwrap_or(&[]);
+            for (param, arg) in decl.params.iter().zip(args.iter()) {
+                let i = canonical.iter().position(|x| x == &param.name).unwrap_or(0);
+                let v = self.gen_expr(f, arg);
+                let pcty = self.ctype_of(arg);
+                self.dup_value(f, &v, &pcty);
+                self.store_slot(f, &ptr, (methods.len() + i) as i64, &v);
+                let slot = f.alloca(self, &param.name);
+                f.line(format!("store i64 {v}, ptr {slot}"));
+                f.scopes
+                    .last_mut()
+                    .unwrap()
+                    .insert(param.name.clone(), LocalVar { slot, lazy: false, cty: pcty });
+            }
             // Field initializers run in declaration order (so later ones see
             // earlier fields) but store at their canonical slot.
-            f.scopes.push(HashMap::new());
             for (fname, _, init) in decl.fields.iter() {
                 let i = canonical.iter().position(|x| x == fname).unwrap_or(0);
                 let v = self.gen_expr(f, init);

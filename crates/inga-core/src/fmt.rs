@@ -332,6 +332,19 @@ impl Printer {
         self.blank_line_if_gap(self.lines.line(d.span.start));
         self.out.push_str(&format!("{}{} :: {} {{\n", pub_prefix(d.is_pub), d.name, d.service));
         self.prev_end_line = Some(self.lines.line(d.span.start));
+        for p in &d.params {
+            self.flush_comments_before(p.span.start, 1);
+            self.blank_line_if_gap(self.lines.line(p.span.start));
+            self.push_indent(1);
+            if let Some(ty) = &p.ty {
+                self.out.push_str(&format!("{} {}", render_type(ty), p.name));
+            } else {
+                self.out.push_str(&p.name);
+            }
+            self.attach_trailing_comment(p.span.end);
+            self.out.push('\n');
+            self.prev_end_line = Some(self.lines.line(p.span.end));
+        }
         for (name, span, value) in &d.fields {
             self.flush_comments_before(span.start, 1);
             self.blank_line_if_gap(self.lines.line(span.start));

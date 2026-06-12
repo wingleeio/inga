@@ -115,6 +115,10 @@ pub struct ImplDecl {
     pub name_span: Span,
     pub service: String,
     pub service_span: Span,
+    /// `User u` — parameter fields, supplied positionally by
+    /// `provide name(args…)`. A parameter may satisfy a service value
+    /// member of the same name.
+    pub params: Vec<Field>,
     /// `store = MutMap()` — instance state, evaluated when the impl is provided.
     pub fields: Vec<(String, Span, Expr)>,
     pub methods: Vec<FuncDecl>,

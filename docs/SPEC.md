@@ -221,6 +221,29 @@ also be a configured builtin resource — `provide Arena(256.kb)` switches
 the scope's allocator (see §6). Capabilities compose transitively: callers
 of `cached` inherit `uses Cache, Logger` without writing anything.
 
+**Parameterized implementations** take runtime values: a `Type name`
+entry in the impl body with no initializer is a parameter field, supplied
+positionally at the provide site —
+
+```inga
+loggedIn :: Session {
+    User user                       // parameter (also satisfies a value member)
+    banner = "hi, ${user.name}"     // initializers see the parameters
+
+    greeting :: () { banner }
+}
+
+serveOne :: (String token) -> String ! AuthError {
+    provide loggedIn(authenticate(token))   // setup can fail — the row rides here
+    dashboard()                             // uses Session, satisfied for this extent
+}
+```
+
+The argument expressions are ordinary expressions at the provide site:
+a fallible or capability-using setup adds to *that* function's rows —
+an Effect-style layer whose construction errors are typed and must be
+handled (or carried) like any other.
+
 This is Effect.ts `Layer`/`Context` reduced to two keywords. There are no
 globals and no implicit singletons; tests provide fakes the same way `main`
 provides real implementations.

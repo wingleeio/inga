@@ -482,6 +482,7 @@ impl<'a> Parser<'a> {
 
     fn parse_impl_decl(&mut self, name: String, name_span: Span) -> ImplDecl {
         let (service, service_span) = self.expect_ident("a service name");
+        let mut params = Vec::new();
         let mut fields = Vec::new();
         let mut methods = Vec::new();
         if self.expect(&TokenKind::LBrace, "`{`") {
@@ -489,6 +490,22 @@ impl<'a> Parser<'a> {
                 self.skip_newlines();
                 if self.at(&TokenKind::RBrace) || self.at(&TokenKind::Eof) {
                     break;
+                }
+                // `Type name` with no `=` is a parameter field, supplied by
+                // `provide name(args…)`.
+                let is_param = matches!(&self.peek().kind, TokenKind::Ident(n) if is_upper(n))
+                    || matches!(self.peek().kind, TokenKind::LBracket);
+                if is_param {
+                    let Some(ty) = self.try_parse_type() else {
+                        self.error_here("expected a type for the parameter field");
+                        break;
+                    };
+                    let (p_name, p_span) = self.expect_ident("a parameter name");
+                    if p_name == "<error>" {
+                        break;
+                    }
+                    params.push(Field { ty: Some(ty), name: p_name, span: p_span });
+                    continue;
                 }
                 let (item_name, item_span) = self.expect_ident("a field or method");
                 if item_name == "<error>" {
@@ -502,7 +519,7 @@ impl<'a> Parser<'a> {
                     self.bump();
                     methods.push(self.parse_func_decl(item_name, item_span));
                 } else {
-                    self.error_here("expected `=` (field) or `::` (method)");
+                    self.error_here("expected `=` (field), `::` (method), or `Type name` (parameter)");
                     break;
                 }
             }
@@ -514,6 +531,7 @@ impl<'a> Parser<'a> {
             name_span,
             service,
             service_span,
+            params,
             fields,
             methods,
             span: name_span.to(self.prev_span()),

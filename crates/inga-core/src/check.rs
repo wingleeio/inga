@@ -204,6 +204,8 @@ struct ServiceInfo {
 
 struct ImplInfo {
     service: String,
+    /// Parameter fields (supplied by `provide name(args…)`), in order.
+    params: Vec<(String, Type)>,
     fields: Vec<(String, Type)>,
     name_span: Span,
     module: usize,
@@ -677,11 +679,26 @@ impl<'a> Checker<'a> {
                     }
                     let fields: Vec<(String, Type)> =
                         d.fields.iter().map(|(name, _, _)| (name.clone(), self.ctx.fresh())).collect();
+                    let params: Vec<(String, Type)> = d
+                        .params
+                        .iter()
+                        .map(|p| {
+                            let ty = match &p.ty {
+                                Some(t) => {
+                                    let mut tyvars = HashMap::new();
+                                    self.resolve_type_expr(t, &mut tyvars)
+                                }
+                                None => self.ctx.fresh(),
+                            };
+                            (p.name.clone(), ty)
+                        })
+                        .collect();
                     let module = self.module_of(d.name_span);
                     self.impls.insert(
                         d.name.clone(),
                         ImplInfo {
                             service: d.service.clone(),
+                            params,
                             fields,
                             name_span: d.name_span,
                             module,
@@ -1125,11 +1142,20 @@ impl<'a> Checker<'a> {
     fn check_impl(&mut self, d: &ImplDecl) {
         let Some(info) = self.impls.get(&d.name) else { return };
         let field_types: Vec<(String, Type)> = info.fields.clone();
+        let param_types: Vec<(String, Type)> = info.params.clone();
         let service = info.service.clone();
 
-        // Field initializers.
+        // Field initializers (parameter fields are in scope).
         let mut field_rows = Rows::default();
         let mut scope = HashMap::new();
+        for (i, (pname, pty)) in param_types.iter().enumerate() {
+            scope.insert(pname.clone(), pty.clone());
+            if self.record_info {
+                if let Some(p) = d.params.get(i) {
+                    self.typed_hovers.push((p.span, pname.clone(), pty.clone()));
+                }
+            }
+        }
         for ((name, _span, value), (_, ty)) in d.fields.iter().zip(field_types.iter()) {
             self.scopes = vec![scope.clone()];
             self.row_stack = vec![Rows::default()];
@@ -1146,6 +1172,16 @@ impl<'a> Checker<'a> {
             .map(|i| i.values.clone())
             .unwrap_or_default();
         for (vname, vty) in &declared_values {
+            if let Some((_, pty)) = param_types.iter().find(|(p, _)| p == vname) {
+                let pspan = d
+                    .params
+                    .iter()
+                    .find(|p| &p.name == vname)
+                    .map(|p| p.span)
+                    .unwrap_or(d.name_span);
+                self.unify_at(vty, pty, pspan, "service value member");
+                continue;
+            }
             match d.fields.iter().position(|(f, _, _)| f == vname) {
                 Some(i) => {
                     let (_, fty) = &field_types[i];
@@ -1438,7 +1474,14 @@ impl<'a> Checker<'a> {
             self.info.facts.enum_variants.insert(name.clone(), variants);
         }
         for (name, info) in &self.impls {
-            let fields: Vec<CType> = info.fields.iter().map(|(_, t)| self.ctype(t)).collect();
+            // Parameter fields first, then state fields (matching the
+            // backend's ImplMeta field order).
+            let fields: Vec<CType> = info
+                .params
+                .iter()
+                .chain(info.fields.iter())
+                .map(|(_, t)| self.ctype(t))
+                .collect();
             self.info.facts.impl_fields.insert(name.clone(), fields);
         }
         let pairs: Vec<(String, String)> = self
@@ -4851,29 +4894,67 @@ impl<'a> Checker<'a> {
                 }
                 continue;
             }
-            if let Some(args) = &item.args {
-                self.error(
-                    item.name_span,
-                    format!(
-                        "`{}` does not take arguments in `provide` (only `Arena(size)` does)",
-                        item.name
-                    ),
-                );
-                for arg in args {
-                    self.check_expr(arg);
-                }
-            }
             match self.impls.get(&item.name) {
                 Some(info) => {
                     let def_span = info.name_span;
                     let service = info.service.clone();
+                    let params = info.params.clone();
                     let (m, p) = (info.module, info.is_pub);
                     self.gate(&item.name.clone(), m, p, item.name_span);
+                    // Positional arguments fill the impl's parameter fields.
+                    // Their rows ride at this provide site, so a fallible
+                    // setup (`provide db(connect())`) is caught (or carried)
+                    // right here, Effect-layer style.
+                    let args = item.args.as_deref().unwrap_or(&[]);
+                    if args.len() != params.len() {
+                        if params.is_empty() {
+                            self.error(
+                                item.name_span,
+                                format!("`{}` takes no arguments in `provide`", item.name),
+                            );
+                        } else {
+                            let rendered: Vec<String> = {
+                                let mut names = Vec::new();
+                                params
+                                    .iter()
+                                    .map(|(n, t)| {
+                                        format!("{} {n}", self.ctx.render(t, &mut names))
+                                    })
+                                    .collect()
+                            };
+                            self.error(
+                                item.name_span,
+                                format!(
+                                    "`{}` takes ({}) in `provide`, found {} argument(s)",
+                                    item.name,
+                                    rendered.join(", "),
+                                    args.len()
+                                ),
+                            );
+                        }
+                        for arg in args {
+                            self.check_expr(arg);
+                        }
+                    } else {
+                        for (arg, (pname, pty)) in args.iter().zip(params.iter()) {
+                            let arg_ty = self.check_expr(arg);
+                            self.unify_at(pty, &arg_ty, arg.span, "provide argument");
+                            let _ = pname;
+                        }
+                    }
                     if self.record_info {
                         self.info.refs.push((item.name_span, def_span));
-                        self.info
-                            .hovers
-                            .push((item.name_span, format!("{} :: {service}", item.name)));
+                        let sig = if params.is_empty() {
+                            format!("{} :: {service}", item.name)
+                        } else {
+                            let mut names = Vec::new();
+                            let rendered: Vec<String> = params
+                                .iter()
+                                .map(|(n, t)| format!("{} {n}", self.ctx.render(t, &mut names)))
+                                .collect();
+                            format!("{} :: ({}) {service}", item.name, rendered.join(", "))
+                        };
+                        self.info.hovers.push((item.name_span, sig));
                     }
                     // Constructing the impl runs its field initializers; they
                     // see only the services provided earlier in this list.
@@ -4927,7 +5008,11 @@ impl<'a> Checker<'a> {
                 continue;
             }
             let fields = match self.impls.get(&impl_name) {
-                Some(i) => i.fields.clone(),
+                Some(i) => {
+                    let mut all = i.params.clone();
+                    all.extend(i.fields.clone());
+                    all
+                }
                 None => continue,
             };
             for (fname, ty) in &fields {

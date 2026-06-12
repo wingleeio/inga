@@ -1010,6 +1010,62 @@ fn named_field_construction_is_checked() {
 }
 
 #[test]
+fn parameterized_impls_provide_args() {
+    let out = run(r#"
+struct User = { Int id, String name }
+struct AuthError = { String why }
+
+service Session {
+    User user
+    greeting :: () -> String
+}
+
+loggedIn :: Session {
+    User user
+    banner = "hi, ${user.name}"
+
+    greeting :: () {
+        banner
+    }
+}
+
+authenticate :: (String token) -> User ! AuthError {
+    match token {
+        "secret-${Int id}" -> User { id: id, name: "user-${id}" }
+        _ -> fail AuthError("bad token")
+    }
+}
+
+dashboard :: () -> String uses Session {
+    Session session
+    "${session.greeting()} (#${session.user.id})"
+}
+
+serveOne :: (String token) -> String ! AuthError {
+    provide loggedIn(authenticate(token))
+    dashboard()
+}
+
+main :: () {
+    println(serveOne("secret-42") |> catch { AuthError(w) -> "401: ${w}" })
+    println(serveOne("nope") |> catch { AuthError(w) -> "401: ${w}" })
+}
+"#);
+    assert_eq!(out, "hi, user-42 (#42)\n401: bad token\n");
+}
+
+#[test]
+fn provide_args_are_checked() {
+    let errs = check_errors(
+        "service Tagger {\n    label :: () -> String\n}\n\ntagged :: Tagger {\n    String tag\n\n    label :: () {\n        tag\n    }\n}\n\nmain :: () {\n    provide tagged\n    Tagger t\n    println(t.label())\n}\n",
+    );
+    assert!(
+        errs.iter().any(|e| e.contains("takes (String tag) in `provide`")),
+        "{errs:?}"
+    );
+}
+
+#[test]
 fn service_value_members() {
     let out = run(r#"
 struct User = { Int id, String name }

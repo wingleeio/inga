@@ -20,11 +20,11 @@ use util {
     textC,
 }
 use cards { chipsOf, rankName, suitCol, suitName }
-use jokers { jokerDesc, jokerName, jokerPrice }
+use jokers { jokerDesc, jokerName, jokerPrice, sellPrice }
 use poker { handTypeName, scoreSelected }
 use state {
     blindName, discardSelected, finishPlay, nextBlind, playHand, restart, rollShop, selCount,
-    sortHand,
+    sellJoker, sortHand,
 }
 
 // Animation slots in `av`: 0..7 card lift, 10..17 deal slide (both x1000),
@@ -113,6 +113,12 @@ drawSidebar :: () uses Game {
     textC("Hands: ${hands}", 20 + shx, 248 + shy, 22, rgb(120, 190, 255))
     textC("Discards: ${discards}", 20 + shx, 276 + shy, 22, rgb(255, 130, 130))
     textC("Money: \$${money}", 20 + shx, 318 + shy, 26, rgb(255, 210, 80))
+    mPop = gv("mPopT")
+    if mPop > 0 {
+        sv("mPopT", mPop - 1)
+        rise = (80 - mPop) / 4
+        textC("+\$${gv("mPopVal")}", 150 + shx, 318 + shy - rise, 20, dim(rgb(140, 230, 150), cap255(mPop * 4 + 60)))
+    }
     textC("Ante: ${ante}/8", 20 + shx, 356 + shy, 22, rgb(200, 200, 200))
     deckLeft = 52 - gv("deckPos")
     textC("Deck: ${deckLeft}/52", 20 + shx, 388 + shy, 18, rgb(150, 155, 160))
@@ -148,6 +154,8 @@ drawJokers :: () uses Game {
     shx = gv("shx")
     shy = gv("shy")
     owned = gv("jokers")
+    idle = gv("anim") == 0
+    av.set(99, -1) // sell request, applied after the loop
     textC("Jokers (${owned}/5)", 250 + shx, 40 + shy, 18, rgb(170, 175, 180))
     map(range(owned), (s) -> {
         flash = gn(av, 50 + s)
@@ -184,6 +192,14 @@ drawJokers :: () uses Game {
         graphics.rectLines(x, jy, 130, 76, 2, border / 65536, border / 256 % 256, border % 256, 255)
         textC(jokerName(j), x + 8, jy + 18, 16, rgb(240, 230, 250))
         textC(jokerDesc(j), x + 8, jy + 48, 13, rgb(185, 175, 205))
+        // Hover a joker while idle to sell it for half price.
+        if hovered && idle {
+            graphics.rect(x + 2, jy + 58, 126, 16, 20, 26, 20, 230)
+            textC("click to sell  \$${sellPrice(j)}", x + 8, jy + 70, 12, rgb(140, 220, 150))
+            if graphics.mousePressed() {
+                av.set(99, s)
+            }
+        }
         // Trigger popup: rises and fades as the flash decays.
         if flash > 80 {
             pv = gn(av, 60 + s)
@@ -203,6 +219,10 @@ drawJokers :: () uses Game {
         }
         0
     })
+    if gn(av, 99) >= 0 {
+        sellJoker(gn(av, 99))
+        av.set(99, -1)
+    }
 }
 
 // The chips x mult readout, Balatro-style.
@@ -340,6 +360,30 @@ framePlay :: () uses Game {
     drawSidebar()
     drawJokers()
     drawDeck()
+
+    // Blind intro: a banner sweeps in when the blind starts, then fades.
+    intro = gv("introT")
+    if intro > 0 {
+        sv("introT", intro - 1)
+        a = if intro > 90 {
+            (110 - intro) * 11
+        } else if intro < 30 {
+            intro * 7
+        } else {
+            220
+        }
+        slide = if intro > 90 {
+            (intro - 90) * (intro - 90)
+        } else {
+            0
+        }
+        graphics.rect(230, 130 - slide, 730, 96, 8, 10, 16, a)
+        graphics.rect(230, 130 - slide, 730, 3, 255, 90, 90, a)
+        graphics.rect(230, 223 - slide, 730, 3, 255, 90, 90, a)
+        keep = cap255(a + 35)
+        centerText(blindName(gv("blind")), 595, 172 - slide, 34, dim(rgb(255, 230, 230), keep))
+        centerText("Target  ${gv("target")}", 595, 206 - slide, 20, dim(rgb(255, 210, 80), keep))
+    }
 
     n = selCount()
     if anim == 0 {
@@ -486,7 +530,29 @@ frameShop :: () uses Game {
     0
 }
 
+confettiColor :: (Int i) -> Int {
+    match i % 5 {
+        0 -> rgb(255, 99, 132)
+        1 -> rgb(255, 205, 86)
+        2 -> rgb(75, 222, 128)
+        3 -> rgb(96, 165, 250)
+        _ -> rgb(192, 132, 252)
+    }
+}
+
 frameEnd :: (Bool won) uses Game {
+    t = gv("t")
+    if won {
+        // Confetti: deterministic pseudo-random rain from the frame clock.
+        map(range(60), (i) -> {
+            x = (i * 193 + t * (2 + i % 5) / 2) % 980 - 10
+            y = (i * 71 + t * (2 + i % 4)) % 600 - 30
+            c = confettiColor(i)
+            graphics.rect(x, y, 5 + i % 6, 7 + i % 5, c / 65536, c / 256 % 256, c % 256, 235)
+            0
+        })
+        0
+    }
     title = if won {
         "YOU WIN"
     } else {
@@ -497,7 +563,14 @@ frameEnd :: (Bool won) uses Game {
     } else {
         rgb(235, 80, 80)
     }
-    centerText(title, 480, 240, 64, col)
+    // The title breathes: a triangle wave on the frame clock.
+    wave = t % 50
+    pulse = if wave > 25 {
+        50 - wave
+    } else {
+        wave
+    }
+    centerText(title, 480, 240, 58 + pulse / 2, col)
     ante = gv("ante")
     blind = blindName(gv("blind"))
     centerText("Ante ${ante} - ${blind}", 480, 290, 24, rgb(220, 220, 220))
@@ -513,6 +586,7 @@ frame :: () uses Game {
     // path does no refcount work at all. Game state lives in the Game
     // service's MutMaps (runtime-owned storage, untouched by the region).
     provide Arena(256.kb)
+    sv("t", gv("t") + 1)
     drawBackground()
     phase = gv("phase")
     if phase == 0 {

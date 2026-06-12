@@ -181,7 +181,9 @@ across six modules (`use game`, `util`, `cards`, `jokers`, `poker`, `state`) —
 poker-hand scoring, escalating blinds and antes, fifteen jokers and a
 rerollable shop, animated card deals/hovers/score popups, and the signature
 swirling paint background written as a GLSL shader *inside the Inga source*
-and compiled at runtime via `graphics.shaderNew`. All game state lives in
+and compiled at runtime via `graphics.shaderNew` — plus blind-intro
+banners, sellable jokers (hover one), win-screen confetti, and a freely
+resizable window (every Inga game letterboxes for free). All game state lives in
 one `Game` service ([`games/game.inga`](games/game.inga)) provided once in
 `main` — every function just says `uses Game` (inferred), so nothing
 threads state through arguments, and the

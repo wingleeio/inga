@@ -59,6 +59,16 @@ pub jokerPrice :: (Int j) -> Int {
     }
 }
 
+// Jokers sell back for half price (always at least $1).
+pub sellPrice :: (Int j) -> Int {
+    p = jokerPrice(j) / 2
+    if p < 1 {
+        1
+    } else {
+        p
+    }
+}
+
 // Which slot holds joker `j` (-1 when not owned).
 pub jokerSlot :: (Int j) -> Int uses Game {
     Game game

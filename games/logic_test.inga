@@ -10,7 +10,8 @@ use game { Game, freshGame }
 use util { gn, gv }
 use cards { chipsOf, rankName, suitName }
 use poker { baseChips, baseMult, evalSelected, handTypeName }
-use state { blindName, selCount, sortKey, targetFor }
+use jokers { jokerPrice, sellPrice }
+use state { blindName, selCount, sellJoker, sortKey, targetFor }
 
 // Card id = rank * 4 + suit (rank 0 = "2" … 12 = Ace; suit 1 = hearts).
 card :: (Int rank, Int suit) -> Int {
@@ -127,4 +128,28 @@ testFreshGamesAreIndependent :: () {
     }
     provide freshGame
     assertEq(gv("money"), 0)
+}
+
+testSellJoker :: () {
+    provide freshGame
+    Game game
+    jok = game.jok()
+    // Own three jokers: ids 0, 11 (price 8), 5.
+    jok.set(0, 0)
+    jok.set(1, 11)
+    jok.set(2, 5)
+    game.vals().set("jokers", 3)
+    game.vals().set("money", 0)
+
+    sellJoker(1) // sell the middle one for half its price
+    assertEq(gv("money"), sellPrice(11))
+    assertEq(gv("jokers"), 2)
+    assertEq(gn(jok, 0), 0)
+    assertEq(gn(jok, 1), 5) // the tail shifted down
+
+    sellJoker(7) // out of range: a no-op
+    assertEq(gv("jokers"), 2)
+
+    assert(sellPrice(0) >= 1) // cheapest joker still sells for something
+    assert(sellPrice(14) == jokerPrice(14) / 2)
 }

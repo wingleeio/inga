@@ -796,6 +796,22 @@ pub struct RetPair {
 
 type FrameFn = unsafe extern "C" fn(*mut u8) -> RetPair;
 
+// The game draws in LOGICAL coordinates (the size passed to graphics.run);
+// each frame renders into an offscreen target which is scaled to the real
+// window with letterboxing — so every Inga game is resizable for free, and
+// mouse positions are mapped back into logical space.
+thread_local! {
+    static LOGICAL: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((960.0, 540.0)) };
+}
+
+/// (scale, x offset, y offset) of the logical canvas inside the window.
+fn gfx_viewport() -> (f32, f32, f32) {
+    let (lw, lh) = LOGICAL.with(|l| l.get());
+    let (sw, sh) = (macroquad::window::screen_width(), macroquad::window::screen_height());
+    let scale = (sw / lw).min(sh / lh);
+    (scale, (sw - lw * scale) / 2.0, (sh - lh * scale) / 2.0)
+}
+
 #[no_mangle]
 pub extern "C" fn rt_gfx_run(width: i64, height: i64, title: i64, closure: i64) {
     let title = unsafe { String::from_utf8_lossy(str_bytes(title)).into_owned() };
@@ -803,6 +819,7 @@ pub extern "C" fn rt_gfx_run(width: i64, height: i64, title: i64, closure: i64) 
         window_title: title,
         window_width: width as i32,
         window_height: height as i32,
+        window_resizable: true,
         high_dpi: true,
         ..Default::default()
     };
@@ -813,9 +830,22 @@ pub extern "C" fn rt_gfx_run(width: i64, height: i64, title: i64, closure: i64) 
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
+    LOGICAL.with(|l| l.set((width as f32, height as f32)));
     macroquad::Window::from_config(conf, async move {
+        use macroquad::prelude::*;
+        let target = macroquad::texture::render_target(width as u32, height as u32);
+        target.texture.set_filter(macroquad::texture::FilterMode::Linear);
         let mut frame_no = 0u32;
         loop {
+            // Draw the frame into the logical-size target.
+            let mut camera = Camera2D::from_display_rect(Rect::new(
+                0.0,
+                0.0,
+                width as f32,
+                height as f32,
+            ));
+            camera.render_target = Some(target.clone());
+            set_camera(&camera);
             let env = closure as *mut u8;
             let fp: FrameFn = unsafe { std::mem::transmute(*(env as *const i64)) };
             let r = unsafe { fp(env) };
@@ -823,6 +853,21 @@ pub extern "C" fn rt_gfx_run(width: i64, height: i64, title: i64, closure: i64) 
                 eprintln!("runtime error: unhandled error escaped the frame closure");
                 std::process::exit(101);
             }
+            // Present: letterboxed scale to the actual window.
+            set_default_camera();
+            clear_background(macroquad::color::BLACK);
+            let (scale, ox, oy) = gfx_viewport();
+            macroquad::texture::draw_texture_ex(
+                &target.texture,
+                ox,
+                oy,
+                macroquad::color::WHITE,
+                macroquad::texture::DrawTextureParams {
+                    dest_size: Some(Vec2::new(width as f32 * scale, height as f32 * scale)),
+                    flip_y: true,
+                    ..Default::default()
+                },
+            );
             frame_no += 1;
             if let Some(path) = &shot {
                 if frame_no == shot_frame {
@@ -904,12 +949,14 @@ pub extern "C" fn rt_gfx_text_width(text: i64, size: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn rt_gfx_mouse_x() -> i64 {
-    macroquad::input::mouse_position().0 as i64
+    let (scale, ox, _) = gfx_viewport();
+    ((macroquad::input::mouse_position().0 - ox) / scale) as i64
 }
 
 #[no_mangle]
 pub extern "C" fn rt_gfx_mouse_y() -> i64 {
-    macroquad::input::mouse_position().1 as i64
+    let (scale, _, oy) = gfx_viewport();
+    ((macroquad::input::mouse_position().1 - oy) / scale) as i64
 }
 
 #[no_mangle]

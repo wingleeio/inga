@@ -457,7 +457,11 @@ graphics.image(handle, x, y, w, h)          // draw scaled; nearest-filtered (cr
 
 Inverting the loop (`graphics.run` calls the closure, rather than the program
 recursing) keeps stacks bounded, and the frame closure captures capability
-evidence like any closure — services work normally inside frames. Helpers:
+evidence like any closure — services work normally inside frames. Windows
+are **resizable for free**: the frame draws in logical coordinates (the
+size passed to `run`), rendered to an offscreen target and scaled to the
+real window with letterboxing; `mouseX`/`mouseY` map back into logical
+space, so hit-testing never changes. Helpers:
 `range(n) -> [Int]` and `random(n) -> Int`. Setting `INGA_GFX_SHOT=<path>`
 renders 30 frames, writes a PNG of the framebuffer, and exits (CI smoke
 tests). See `games/balatro.inga` for a complete game.

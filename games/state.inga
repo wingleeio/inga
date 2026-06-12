@@ -4,6 +4,7 @@
 
 use game { Game }
 use util { gn, gv, sv }
+use jokers { sellPrice }
 use poker { buildSteps }
 
 // ---- game state ------------------------------------------------------------------
@@ -95,6 +96,7 @@ pub setupBlind :: () uses Game {
     sv("target", targetFor(gv("ante"), gv("blind")))
     sv("deckPos", 0)
     sv("lastType", -1)
+    sv("introT", 110) // blind intro banner frames
     shuffle()
     hand = game.hand()
     sel = game.sel()
@@ -190,7 +192,10 @@ pub finishPlay :: () uses Game {
     removeSelected()
     deal()
     if gv("score") >= gv("target") {
-        sv("money", gv("money") + 3 + gv("blind") + gv("hands"))
+        earned = 3 + gv("blind") + gv("hands")
+        sv("money", gv("money") + earned)
+        sv("mPopT", 80)
+        sv("mPopVal", earned)
         if gv("blind") == 2 && gv("ante") == 8 {
             sv("phase", 3) // won the run
         } else {
@@ -206,6 +211,21 @@ pub discardSelected :: () uses Game {
         sv("discards", gv("discards") - 1)
         removeSelected()
         deal()
+    }
+}
+
+// Sell the joker in `slot` for half price; the rest shift down.
+pub sellJoker :: (Int slot) uses Game {
+    Game game
+    jok = game.jok()
+    n = gv("jokers")
+    if slot >= 0 && slot < n {
+        sv("money", gv("money") + sellPrice(gn(jok, slot)))
+        map(range(n - slot - 1), (k) -> {
+            jok.set(slot + k, gn(jok, slot + k + 1))
+            0
+        })
+        sv("jokers", n - 1)
     }
 }
 

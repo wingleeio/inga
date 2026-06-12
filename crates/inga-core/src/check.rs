@@ -2573,6 +2573,26 @@ impl<'a> Checker<'a> {
                 self.add_fail_row(&err_ty, args[1].span, "orFail");
                 a
             }
+            "then" => {
+                if !check_arity(self, 2) {
+                    return Some(Type::Unknown);
+                }
+                // Transform the value mid-pipe: `x |> then((u) -> u.name)`.
+                // `map` transforms each element of a list; `then` transforms
+                // the value itself. The function's rows merge like any call.
+                let v_ty = self.check_expr(args[0]);
+                let out = self.ctx.fresh();
+                let expected_f = Type::Func(Rc::new(FuncType {
+                    params: vec![v_ty],
+                    ret: out.clone(),
+                    errors: BTreeSet::new(),
+                    caps: BTreeSet::new(),
+                }));
+                let func_ty = self.check_arg_expecting(args[1], &expected_f);
+                self.add_func_arg_rows(&func_ty);
+                self.unify_at(&expected_f, &func_ty, args[1].span, "then function");
+                out
+            }
             "tap" => {
                 if !check_arity(self, 2) {
                     return Some(Type::Unknown);
@@ -4149,7 +4169,7 @@ pub fn builtin_doc(name: &str) -> Option<&'static str> {
     builtin_completions().into_iter().find(|(n, _)| *n == name).map(|(_, doc)| doc)
 }
 
-const BUILTIN_NAMES: [&str; 34] = [
+const BUILTIN_NAMES: [&str; 35] = [
     "println",
     "print",
     "show",
@@ -4162,6 +4182,7 @@ const BUILTIN_NAMES: [&str; 34] = [
     "ignoreFailure",
     "tap",
     "tapError",
+    "then",
     "sleep",
     "assert",
     "assertEq",
@@ -4200,6 +4221,7 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("retry", "retry(lazy action, schedule) -> a — re-run per the Schedule; the error row is kept (a retried action can still fail)"),
         ("schedule.upTo", "schedule.upTo(schedule, times) -> Schedule — cap the retry count"),
         ("ignoreFailure", "ignoreFailure(lazy action) -> Unit — swallow the error channel"),
+        ("then", "then(value, f) -> b — transform the value mid-pipe: x |> then((u) -> u.name); rows of f merge like any call"),
         ("tap", "tap(value, f) -> value — run a side effect on the value mid-pipe, pass it along untouched"),
         ("tapError", "tapError(lazy action, f) -> a — run a side effect on a failure, then re-raise it (the row is preserved)"),
         ("sleep", "sleep(duration) -> Unit"),

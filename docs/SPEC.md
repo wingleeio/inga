@@ -137,7 +137,10 @@ the expression cannot fail with is an *unreachable-arm warning*. Helpers:
 fail. `tap(value, f)` runs a side effect on the value mid-pipe and passes it
 along untouched; `tapError(action, f)` runs a side effect on a *failure* and
 re-raises it — both are observation points (logging, metrics), neither
-transforms nor clears anything. `assert(cond)` and `assertEq(actual, expected)` fail with the builtin
+transforms nor clears anything. `then(value, f)` is the transforming
+sibling — `x |> then((u) -> u.name)` maps the value itself mid-pipe
+(`map` is for the *elements* of a list), with `f`'s rows merging like any
+call. `assert(cond)` and `assertEq(actual, expected)` fail with the builtin
 struct `AssertionError { message }` — ordinary typed errors, catchable
 anywhere, and the backbone of `inga test` (§9).
 
@@ -204,7 +207,7 @@ provides real implementations.
   `println print show encode decode len map filter fold at concat reverse
   range` (lists), `split slice indexOf trim parseInt toFloat floor`
   (strings/numbers), `getOrElse orFail` (options), `retry ignoreFailure
-  tap tapError sleep` (effects), `assert assertEq` (tests),
+  tap tapError then sleep` (effects), `assert assertEq` (tests),
   `MutMap Some nowMillis nowMicros random`. Concurrency is **not** in the
   prelude — it lives in `std/fiber` (§6.5). Editors show each builtin's
   signature on hover.

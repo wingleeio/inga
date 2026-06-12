@@ -2561,6 +2561,12 @@ impl<'a> Cg<'a> {
                 f.start_block(&cont);
                 "0".to_string()
             }
+            "then" if args.len() == 2 => {
+                let v = self.gen_expr(f, args[0]);
+                let closure = self.gen_expr(f, args[1]);
+                let rcty = self.ctype_of_span(span);
+                return Some(self.gen_closure_call(f, &closure, &[v], &rcty));
+            }
             "tap" if args.len() == 2 => {
                 let v = self.gen_expr(f, args[0]);
                 let closure = self.gen_expr(f, args[1]);

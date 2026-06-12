@@ -951,3 +951,20 @@ fn http_get_post_status_and_streaming() {
         "got: {errs:?}"
     );
 }
+
+#[test]
+fn then_transforms_the_value_mid_pipe() {
+    let out = run(
+        "struct User = { Int id, String name }\nstruct LookupError = { Int id }\n\nfindUser :: (Int id) -> User ! LookupError {\n    if id > 100 {\n        fail LookupError(id)\n    }\n    User(id, \"user-${id}\")\n}\n\nmain :: () {\n    greeting = findUser(7)\n        |> then((u) -> u.name)\n        |> tap((n) -> println(\"saw:\", n))\n        |> then((n) -> \"hello, ${n}!\")\n        |> catch { LookupError(id) -> \"no user ${id}\" }\n    println(greeting)\n    missing = findUser(999)\n        |> then((u) -> u.name)\n        |> catch { LookupError(id) -> \"no user ${id}\" }\n    println(missing)\n    println(21 |> then((n) -> n * 2))\n}\n",
+    );
+    assert_eq!(out, "saw: user-7\nhello, user-7!\nno user 999\n42\n");
+
+    // The function's own rows merge like any call.
+    let errs = check_errors(
+        "struct ParseError = { String s }\n\nmain :: () {\n    println(\"x\" |> then((s) -> {\n        fail ParseError(s)\n        1\n    }))\n}\n",
+    );
+    assert!(
+        errs.iter().any(|m| m.contains("`main` does not handle the error `ParseError`")),
+        "got: {errs:?}"
+    );
+}

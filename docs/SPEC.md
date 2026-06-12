@@ -515,7 +515,7 @@ thread-per-fiber, and the M:N reactor adopts these calls in phase 2.
 | `inga test` | `crates/inga-cli` | runs every zero-parameter `test*` function; `assert`/`assertEq` failures point at the failing line; exit code for CI |
 | `inga fmt` | `crates/inga-core/src/fmt.rs` | canonical style, idempotent, comment-preserving, `--check` mode |
 | `inga highlight` | `crates/inga-cli` | ANSI terminal highlighting from the real lexer (lossless) |
-| `inga lsp` | `crates/inga-lsp` | diagnostics, hover (inferred signatures with rows), go-to-definition, completion with auto-import (sibling `pub` names and std modules insert/extend the `use` line) and `.`-member completion (module members, struct fields, service methods, map ops, tuple slots, Int suffixes — typed via the checker), quick fixes on unknown names, formatting, semantic tokens |
+| `inga lsp` | `crates/inga-lsp` | diagnostics, hover (inferred signatures with rows), go-to-definition, completion with auto-import (sibling `pub` names and std modules insert/extend the `use` line) and `.`-member completion (module members, struct fields, service methods, map ops, tuple slots, Int suffixes — typed via the checker), arm completion in `catch`/`match` (the caught row's error types and variants; the scrutinee's variants, Some/None, true/false, Ok/Failed), quick fixes on unknown names, formatting, semantic tokens |
 | VS Code extension | `editors/vscode` | TextMate grammar + LSP client |
 
 ## 10. Grammar sketch

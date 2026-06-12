@@ -362,6 +362,9 @@ impl Server {
         if let Some(items) = self.member_completion(&uri, src, offset) {
             return Some(CompletionResponse::Array(items));
         }
+        if let Some(items) = self.arm_completion(&uri, src, offset) {
+            return Some(CompletionResponse::Array(items));
+        }
         let (checked, _mods, _base) = check_document(&uri, src, &self.documents);
         let mut items: Vec<CompletionItem> = Vec::new();
         for def in &checked.info.defs {
@@ -544,6 +547,114 @@ impl Server {
             items.push(CompletionItem { label: name, kind: Some(kind), ..Default::default() });
         }
         items
+    }
+
+    /// Completions in pattern position inside `catch { ... }` / `match
+    /// scrutinee { ... }`: the error types of the caught expression's row,
+    /// or the scrutinee's variants (Some/None, true/false, Ok/Failed, enum
+    /// variants). Returns None when the cursor is not in arm position.
+    fn arm_completion(&self, uri: &Url, src: &str, offset: u32) -> Option<Vec<CompletionItem>> {
+        // Pattern position: before the `->` of the arm being typed.
+        let line_start = src[..offset as usize].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        if src[line_start..offset as usize].contains("->") {
+            return None;
+        }
+        // A placeholder arm makes a half-typed pattern parse: `Bo` becomes
+        // the typed-bind `Bo zzq -> 0`, a bare cursor becomes `zzq -> 0`.
+        let patched =
+            format!("{} zzq -> 0\n{}", &src[..offset as usize], &src[offset as usize..]);
+        let (checked, _mods, base) = check_document(uri, &patched, &self.documents);
+        let g = offset + base;
+        let catch = checked
+            .info
+            .catch_rows
+            .iter()
+            .filter(|(s, _)| s.contains(g))
+            .min_by_key(|(s, _)| s.end - s.start);
+        let mtch = checked
+            .info
+            .match_ctxs
+            .iter()
+            .filter(|(s, key)| s.contains(g) && g > key.1)
+            .min_by_key(|(s, _)| s.end - s.start);
+        // Innermost wins when nested.
+        let use_catch = match (catch, mtch) {
+            (Some((cs, _)), Some((ms, _))) => cs.end - cs.start <= ms.end - ms.start,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => return None,
+        };
+        let enum_variants = |name: &str| -> Vec<String> {
+            checked
+                .program
+                .decls
+                .iter()
+                .filter_map(|d| match d {
+                    inga_core::ast::Decl::Enum(e) if e.name == name => {
+                        Some(e.variants.iter().map(|v| v.name.clone()).collect::<Vec<_>>())
+                    }
+                    _ => None,
+                })
+                .next()
+                .unwrap_or_default()
+        };
+        let mut items = Vec::new();
+        let mut push = |label: String, kind: CompletionItemKind, detail: String| {
+            items.push(CompletionItem {
+                label,
+                kind: Some(kind),
+                detail: Some(detail),
+                ..Default::default()
+            });
+        };
+        if use_catch {
+            let (_, row) = catch?;
+            for err in row {
+                push(
+                    err.clone(),
+                    CompletionItemKind::STRUCT,
+                    format!("in the error row — `{err}` or bind with `{err} e`"),
+                );
+                for v in enum_variants(err) {
+                    push(
+                        v.clone(),
+                        CompletionItemKind::ENUM_MEMBER,
+                        format!("variant of `{err}` (in the error row)"),
+                    );
+                }
+            }
+            if items.is_empty() {
+                return None; // empty row: nothing to catch
+            }
+        } else {
+            let (_, key) = mtch?;
+            use inga_core::check::CType;
+            match checked.info.expr_types.get(key)? {
+                CType::Enum(n) => {
+                    for v in enum_variants(n) {
+                        push(v.clone(), CompletionItemKind::ENUM_MEMBER, format!("variant of `{n}`"));
+                    }
+                }
+                CType::Option(_) => {
+                    push("Some".into(), CompletionItemKind::ENUM_MEMBER, "Some(value)".into());
+                    push("None".into(), CompletionItemKind::ENUM_MEMBER, "None".into());
+                }
+                CType::Bool => {
+                    push("true".into(), CompletionItemKind::VALUE, "Bool".into());
+                    push("false".into(), CompletionItemKind::VALUE, "Bool".into());
+                }
+                CType::Outcome(_) => {
+                    push("Ok".into(), CompletionItemKind::ENUM_MEMBER, "Ok(value)".into());
+                    push(
+                        "Failed".into(),
+                        CompletionItemKind::ENUM_MEMBER,
+                        "Failed(error) — patterns speak catch's language".into(),
+                    );
+                }
+                _ => return None,
+            }
+        }
+        Some(items)
     }
 
     /// Quick fixes (cmd+.): on an unknown-name family diagnostic, offer the
@@ -1314,6 +1425,75 @@ mod member_tests {
         let (server, uri) = server_with(&dir.join("m3.inga"), src);
         let items = server.member_completion(&uri, src, offset_of(src, "cards.")).unwrap();
         assert_eq!(labels(&items), vec!["rankName"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod arm_tests {
+    use super::*;
+
+    fn server_with(path: &std::path::Path, src: &str) -> (Server, Url) {
+        std::fs::write(path, src).unwrap();
+        let uri = Url::from_file_path(path).unwrap();
+        let mut docs = HashMap::new();
+        docs.insert(uri.clone(), src.to_string());
+        (Server { documents: docs }, uri)
+    }
+
+    fn labels(items: &[CompletionItem]) -> Vec<String> {
+        items.iter().map(|i| i.label.clone()).collect()
+    }
+
+    #[test]
+    fn catch_and_match_arms_complete() {
+        let dir = std::env::temp_dir().join(format!("inga-arm-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // catch: the error row's types (and an enum row entry's variants).
+        let src = "struct DbError = { String cause }\nenum NetError = Refused | Reset { Int code }\n\nrisky :: () -> Int ! DbError, NetError {\n    fail DbError(\"x\")\n}\n\nmain :: () {\n    n = risky() |> catch {\n        \n    }\n    println(n)\n}\n";
+        let (server, uri) = server_with(&dir.join("a1.inga"), src);
+        let offset = (src.find("catch {").unwrap() + "catch {\n        ".len()) as u32;
+        let items = server.arm_completion(&uri, src, offset).expect("catch arm items");
+        let ls = labels(&items);
+        assert!(ls.contains(&"DbError".to_string()), "got: {ls:?}");
+        assert!(ls.contains(&"NetError".to_string()));
+        assert!(ls.contains(&"Refused".to_string()));
+        assert!(ls.contains(&"Reset".to_string()));
+
+        // catch with a partial pattern already typed.
+        let src2 = src.replace("catch {\n        \n", "catch {\n        Db\n");
+        let (server, uri) = server_with(&dir.join("a2.inga"), &src2);
+        let offset = (src2.find("        Db").unwrap() + "        Db".len()) as u32;
+        let items = server.arm_completion(&uri, &src2, offset).expect("partial arm items");
+        assert!(labels(&items).contains(&"DbError".to_string()));
+
+        // body position (after ->) must NOT offer arm completions.
+        let src3 = src.replace("catch {\n        \n", "catch {\n        DbError -> \n");
+        let (server, uri) = server_with(&dir.join("a3.inga"), &src3);
+        let offset = (src3.find("DbError -> ").unwrap() + "DbError -> ".len()) as u32;
+        assert!(server.arm_completion(&uri, &src3, offset).is_none());
+
+        // match on an enum: variants.
+        let src = "enum Shape = Circle { Float radius } | Dot\n\nmain :: () {\n    s = Dot\n    n = match s {\n        \n    }\n    println(n)\n}\n";
+        let (server, uri) = server_with(&dir.join("a4.inga"), src);
+        let offset = (src.find("match s {").unwrap() + "match s {\n        ".len()) as u32;
+        let items = server.arm_completion(&uri, src, offset).expect("match arm items");
+        assert_eq!(labels(&items), vec!["Circle", "Dot"]);
+
+        // match on an option / an outcome.
+        let src = "main :: () {\n    o = at([1], 0)\n    n = match o {\n        \n    }\n    println(n)\n}\n";
+        let (server, uri) = server_with(&dir.join("a5.inga"), src);
+        let offset = (src.find("match o {").unwrap() + "match o {\n        ".len()) as u32;
+        let items = server.arm_completion(&uri, src, offset).expect("option arm items");
+        assert_eq!(labels(&items), vec!["Some", "None"]);
+
+        let src = "use std/fiber\n\nstruct WeirdError = { Int n }\n\nrisky :: () -> Int ! WeirdError {\n    fail WeirdError(1)\n}\n\nmain :: () {\n    o = risky() |> fiber.settle\n    n = match o {\n        \n    }\n    println(n)\n}\n";
+        let (server, uri) = server_with(&dir.join("a6.inga"), src);
+        let offset = (src.find("match o {").unwrap() + "match o {\n        ".len()) as u32;
+        let items = server.arm_completion(&uri, src, offset).expect("outcome arm items");
+        assert_eq!(labels(&items), vec!["Ok", "Failed"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

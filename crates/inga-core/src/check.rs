@@ -71,6 +71,12 @@ pub struct CheckInfo {
     pub expr_types: HashMap<(u32, u32), CType>,
     /// Effect-row facts per function and per service method.
     pub facts: Facts,
+    /// Per `catch`: (span of `catch { ... }`, the error row of the caught
+    /// expression) — drives pattern completion in the arms.
+    pub catch_rows: Vec<(Span, Vec<String>)>,
+    /// Per `match`: (span of the whole match, scrutinee expression key into
+    /// `expr_types`) — drives pattern completion in the arms.
+    pub match_ctxs: Vec<(Span, (u32, u32))>,
 }
 
 /// Codegen-facing view of a fully resolved type. Unresolved type variables
@@ -1422,7 +1428,14 @@ impl<'a> Checker<'a> {
                 }
             }
             ExprKind::Pipe { lhs, target } => self.check_pipe(lhs, target, expr.span),
-            ExprKind::Match { scrutinee, arms } => self.check_match(scrutinee, arms),
+            ExprKind::Match { scrutinee, arms } => {
+                if self.record_info {
+                    self.info
+                        .match_ctxs
+                        .push((expr.span, (scrutinee.span.start, scrutinee.span.end)));
+                }
+                self.check_match(scrutinee, arms)
+            }
             ExprKind::Fail { error } => {
                 let ty = self.check_expr(error);
                 self.add_fail_row(&ty, error.span, "fail");
@@ -3105,6 +3118,11 @@ impl<'a> Checker<'a> {
             }
             PipeTarget::Catch { arms, span: catch_span } => {
                 let (lhs_ty, mut rows) = self.with_rows(|s| s.check_expr(lhs));
+                if self.record_info {
+                    self.info
+                        .catch_rows
+                        .push((*catch_span, rows.errors.iter().cloned().collect()));
+                }
                 if rows.errors.is_empty() {
                     if let Type::Fiber(_, errs) = self.ctx.resolve(&lhs_ty) {
                         if !errs.borrow().is_empty() {

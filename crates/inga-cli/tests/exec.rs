@@ -443,12 +443,14 @@ main :: () {
 #[test]
 fn encode_decode_roundtrip() {
     let out = run(r#"
+use std/json
+
 struct User = { Int id, String name }
 
 main :: () {
-    raw = encode(User(7, "Ada"))
+    raw = json.encode(User(7, "Ada"))
     println(raw)
-    user = decode(raw, User) |> catch { DecodeError e -> User(0, e.message) }
+    user = json.decode(raw, User) |> catch { DecodeError e -> User(0, e.message) }
     println(user.name)
 }
 "#);
@@ -456,12 +458,24 @@ main :: () {
 }
 
 #[test]
+fn json_is_a_module_not_a_builtin() {
+    let errs = check_errors("main :: () {\n    println(encode(1))\n}\n");
+    assert!(errs.iter().any(|e| e.contains("unknown name `encode`")), "{errs:?}");
+    let errs = check_errors(
+        "use std/json\n\nmain :: () {\n    println(json.parse(\"x\"))\n}\n",
+    );
+    assert!(errs.iter().any(|e| e.contains("`std/json` has no member `parse`")), "{errs:?}");
+}
+
+#[test]
 fn decode_failure_is_typed() {
     let out = run(r#"
+use std/json
+
 struct User = { Int id, String name }
 
 main :: () {
-    user = decode("not json", User) |> catch { DecodeError(msg) -> User(-1, "bad") }
+    user = json.decode("not json", User) |> catch { DecodeError(msg) -> User(-1, "bad") }
     println(user.id, user.name)
 }
 "#);

@@ -1651,10 +1651,6 @@ impl<'a> Checker<'a> {
                 let a = self.ctx.fresh();
                 Some(func(vec![a], Type::Str))
             }
-            "encode" => {
-                let a = self.ctx.fresh();
-                Some(func(vec![a], Type::Str))
-            }
             _ if BUILTIN_NAMES.contains(&name) => {
                 // Other builtins need call-site special handling.
                 None
@@ -1809,6 +1805,7 @@ impl<'a> Checker<'a> {
             "std/schedule" => return self.check_schedule_call(member, member_span, args, span),
             "std/fiber" => return self.check_fiber_call(member, member_span, args, span),
             "std/http" => return self.check_http_call(member, member_span, args, span),
+            "std/json" => return self.check_json_call(member, member_span, args, span),
             _ => {}
         }
         let Some(target) = self.modules.iter().position(|m| m.key == import.target) else {
@@ -2398,6 +2395,71 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `json.*` — std/json: JSON text to and from Inga values.
+    fn check_json_call(
+        &mut self,
+        member: &str,
+        member_span: Span,
+        args: &[&Expr],
+        span: Span,
+    ) -> Type {
+        let arity = |s: &mut Self, n: usize| -> bool {
+            if args.len() != n {
+                s.error(
+                    span,
+                    format!("`json.{member}` expects {n} argument(s), found {}", args.len()),
+                );
+                for arg in args {
+                    s.check_expr(arg);
+                }
+                return false;
+            }
+            true
+        };
+        match member {
+            "encode" => {
+                if !arity(self, 1) {
+                    return Type::Unknown;
+                }
+                self.check_expr(args[0]);
+                Type::Str
+            }
+            "decode" => {
+                if !arity(self, 2) {
+                    return Type::Unknown;
+                }
+                let raw_ty = self.check_expr(args[0]);
+                self.unify_at(&Type::Str, &raw_ty, args[0].span, "json.decode input");
+                self.add_error_row(DECODE_ERROR);
+                let tag_ty = self.check_expr(args[1]);
+                match self.ctx.resolve(&tag_ty) {
+                    Type::Tag(type_name) if self.structs.contains_key(&type_name) => {
+                        Type::Named(type_name)
+                    }
+                    Type::Unknown => Type::Unknown,
+                    other => {
+                        let rendered = self.render(&other);
+                        self.error(
+                            args[1].span,
+                            format!("`json.decode` needs a struct name (like `User`), found {rendered}"),
+                        );
+                        Type::Unknown
+                    }
+                }
+            }
+            _ => {
+                self.error(
+                    member_span,
+                    format!("`std/json` has no member `{member}` (encode, decode)"),
+                );
+                for arg in args {
+                    self.check_expr(arg);
+                }
+                Type::Unknown
+            }
+        }
+    }
+
     fn check_gfx_call(
         &mut self,
         name: &str,
@@ -2511,34 +2573,11 @@ impl<'a> Checker<'a> {
                 }
                 Type::Unit
             }
-            "show" | "encode" => {
+            "show" => {
                 if check_arity(self, 1) {
                     self.check_expr(args[0]);
                 }
                 Type::Str
-            }
-            "decode" => {
-                if !check_arity(self, 2) {
-                    return Some(Type::Unknown);
-                }
-                let raw_ty = self.check_expr(args[0]);
-                self.unify_at(&Type::Str, &raw_ty, args[0].span, "decode input");
-                self.add_error_row(DECODE_ERROR);
-                let tag_ty = self.check_expr(args[1]);
-                match self.ctx.resolve(&tag_ty) {
-                    Type::Tag(type_name) if self.structs.contains_key(&type_name) => {
-                        Type::Named(type_name)
-                    }
-                    Type::Unknown => Type::Unknown,
-                    other => {
-                        let rendered = self.render(&other);
-                        self.error(
-                            args[1].span,
-                            format!("`decode` needs a struct name (like `User`), found {rendered}"),
-                        );
-                        Type::Unknown
-                    }
-                }
             }
             "map" => {
                 if !check_arity(self, 2) {
@@ -4069,6 +4108,13 @@ impl<'a> Checker<'a> {
                 ));
                 return;
             }
+            "std/json" => {
+                self.info.hovers.push((
+                    u.path_span,
+                    "std/json — JSON: json.encode(value), json.decode(raw, StructName)".to_string(),
+                ));
+                return;
+            }
             _ => {}
         }
         let ref_module = self.module_of(u.path_span);
@@ -4241,6 +4287,10 @@ pub fn std_module_members(target: &str) -> &'static [(&'static str, &'static str
             ("within", "fiber.within(lazy action, deadline) -> a ! E, TimeoutError uses Fibers"),
             ("partition", "fiber.partition(outcomes) -> ([a], [Outcome<a ! E>])"),
         ],
+        "std/json" => &[
+            ("encode", "json.encode(value) -> String — JSON"),
+            ("decode", "json.decode(raw, StructName) -> a ! DecodeError — parse JSON into a struct"),
+        ],
         "std/http" => &[
             ("get", "http.get(url) -> HttpResponse ! HttpError uses Http — a non-2xx status is data, not a failure"),
             ("post", "http.post(url, body) -> HttpResponse ! HttpError uses Http"),
@@ -4276,12 +4326,10 @@ pub fn builtin_doc(name: &str) -> Option<&'static str> {
     builtin_completions().into_iter().find(|(n, _)| *n == name).map(|(_, doc)| doc)
 }
 
-const BUILTIN_NAMES: [&str; 36] = [
+const BUILTIN_NAMES: [&str; 34] = [
     "println",
     "print",
     "show",
-    "encode",
-    "decode",
     "map",
     "getOrElse",
     "orFail",
@@ -4321,8 +4369,6 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("println", "println(values...) -> Unit — print space-separated, with a newline"),
         ("print", "print(values...) -> Unit"),
         ("show", "show(value) -> String — developer-facing rendering (quotes strings)"),
-        ("encode", "encode(value) -> String — JSON"),
-        ("decode", "decode(raw, StructName) -> a ! DecodeError — parse JSON into a struct"),
         ("map", "map(container, f) -> mapped — over a list or an option"),
         ("getOrElse", "getOrElse(option, default) -> a"),
         ("orFail", "orFail(option, error) -> a — unwrap Some, or fail with `error`"),
@@ -4371,5 +4417,7 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("None", "None : a?"),
         ("schedule.exponential", "schedule.exponential(base) -> Schedule"),
         ("schedule.fixed", "schedule.fixed(interval) -> Schedule"),
+        ("json.encode", "json.encode(value) -> String — JSON"),
+        ("json.decode", "json.decode(raw, StructName) -> a ! DecodeError — parse JSON into a struct"),
     ]
 }

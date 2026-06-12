@@ -1,6 +1,7 @@
 // The user-service example: typed errors, inferred effect rows, capability
 // injection, retries — run it with `inga run examples/user_service.inga`.
 
+use std/json
 use std/schedule
 
 struct UserNotFound = { Int id }
@@ -37,7 +38,7 @@ cached :: (id) {
     Logger logger
 
     cache.get("user:${id}")
-        |> decode(User)
+        |> json.decode(User)
         |> Some
         |> catch {
             CacheMiss     -> None
@@ -63,7 +64,7 @@ fetchAndCache :: (id) {
             }
         }
 
-    cache.set("user:${id}", encode(user), 5.minutes) |> ignoreFailure
+    cache.set("user:${id}", json.encode(user), 5.minutes) |> ignoreFailure
     logger.info("cache refreshed for ${id}")
     user
 }

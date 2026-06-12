@@ -299,7 +299,7 @@ fn builtins_hover_with_their_signature() {
     // them shows the builtin's signature + doc, not just "(builtin)".
     assert!(has("retry(lazy action, schedule) -> a"), "retry hover missing");
     assert!(has("orFail(option, error) -> a"), "orFail hover missing");
-    assert!(has("decode(raw, StructName) -> a ! DecodeError"), "decode hover missing");
+    assert!(has("json.decode(raw, StructName) -> a ! DecodeError"), "decode hover missing");
     assert!(has("schedule.exponential(base) -> Schedule"), "schedule hover missing");
     assert!(
         !checked.info.hovers.iter().any(|(_, t)| t.ends_with("(builtin)")),

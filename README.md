@@ -8,6 +8,7 @@ structs and enums; `fail` raises *any* value, and the `!` row names the
 types of the values a function can fail with.
 
 ```inga
+use std/json
 use std/schedule
 
 struct UserNotFound = { Int id }
@@ -37,7 +38,7 @@ fetchAndCache :: (id) {
             }
         }
 
-    cache.set("user:${id}", encode(user), 5.minutes) |> ignoreFailure
+    cache.set("user:${id}", json.encode(user), 5.minutes) |> ignoreFailure
     logger.info("cache refreshed for ${id}")
     user
 }
@@ -242,7 +243,7 @@ on two of them.
 
 v0.3 — a complete, tested vertical slice: language (structs/enums/tuples,
 record update, generics, exhaustive `match`, typed errors over any value),
-inference, a **native-only LLVM backend** (`show`/`==`/`encode`/`decode`/
+inference, a **native-only LLVM backend** (`show`/`==`/`json.encode`/`json.decode`/
 functions-as-values all compile; the reference interpreter served its
 purpose and was removed), Perceus-style ARC + arenas with copy-out,
 **`std/fiber` concurrency** (fork / structural join / settle / race /

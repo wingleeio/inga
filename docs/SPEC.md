@@ -92,7 +92,7 @@ fetchAndCache :: (id) { ... }                // a function
   makes the signature a real promise.
 - Constructors are positional in field order: `User(42, "Wing")`,
   `Circle(2.0)`; a fieldless variant is a value (`Dot`). A bare struct name
-  is a *type tag* for `decode(raw, User)`.
+  is a *type tag* for `json.decode(raw, User)`.
 - **Named-field construction** spells the fields out, in any order, comma-
   or newline-separated — every field must appear exactly once:
 
@@ -213,7 +213,7 @@ provides real implementations.
 - **Functions are values**: a top-level function passed where a callback is
   expected (`map(xs, double)`) closes over its evidence like a lambda.
 - **Builtins** (a deliberate, small prelude — no imports needed):
-  `println print show encode decode len map filter fold at concat reverse
+  `println print show len map filter fold at concat reverse
   range` (lists), `split slice indexOf trim parseInt toFloat floor`
   (strings/numbers), `getOrElse orFail` (options), `retry ignoreFailure
   tap tapError then sleep` (effects), `assert assertEq` (tests),
@@ -258,7 +258,7 @@ away**:
 - **Runtime type descriptors** make data-generic operations native: the
   compiler serializes each type's shape into a compact string; a small
   interpreter in the runtime walks value + descriptor to implement `show`,
-  structural `==`, JSON `encode`/`decode`, deep copy (arena copy-out), and
+  structural `==`, JSON `json.encode`/`json.decode`, deep copy (arena copy-out), and
   freezing (task captures) — one mechanism instead of per-type glue.
 
 Measured result (bench/README.md): the compiled benchmarks beat Node/V8 on
@@ -518,7 +518,7 @@ readAll :: (HttpStream s, String acc) -> String ! HttpError uses Http {
 ```
 
 `HttpStream { Int handle, Int status }` reports the response status at
-open. Bodies decode with the existing `decode(resp.body, User)`. The
+open. Bodies decode with `json.decode(resp.body, User)` (std/json). The
 client is blocking (rustls underneath) — exactly right for
 thread-per-fiber, and the M:N reactor adopts these calls in phase 2.
 

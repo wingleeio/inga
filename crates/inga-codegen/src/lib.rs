@@ -1068,6 +1068,9 @@ impl<'a> Cg<'a> {
                     if module == "http" {
                         return self.gen_http(f, name, args, span);
                     }
+                    if module == "json" {
+                        return self.gen_json(f, name, args, span);
+                    }
                     if let Some(v) = self.gen_qualified(f, module, name, args, span) {
                         return v;
                     }
@@ -1251,6 +1254,9 @@ impl<'a> Cg<'a> {
                 }
                 if module == "http" {
                     return self.gen_http(f, name, args, span);
+                }
+                if module == "json" {
+                    return self.gen_json(f, name, args, span);
                 }
                 if let Some(v) = self.gen_qualified(f, module, name, args, span) {
                     return v;
@@ -2798,15 +2804,6 @@ impl<'a> Cg<'a> {
                 f.line(format!("{out} = fptosi double {fl} to i64"));
                 out
             }
-            "encode" if args.len() == 1 => {
-                let cty = self.ctype_of(args[0]);
-                let v = self.gen_expr(f, args[0]);
-                let desc = self.desc_const(&cty);
-                let out = self.tmp();
-                f.line(format!("{out} = call i64 @rt_encode_desc(i64 {v}, i64 {desc})"));
-                self.pool_value(f, &out, &CType::Str);
-                out
-            }
             "assert" if args.len() == 1 => {
                 let c = self.gen_expr(f, args[0]);
                 let (fail_l, ok_l) = (self.label("assert.fail"), self.label("assert.ok"));
@@ -2845,6 +2842,29 @@ impl<'a> Cg<'a> {
                 f.start_block(&ok_l);
                 "0".to_string()
             }
+            _ => return None,
+        };
+        Some(v)
+    }
+
+    /// `json.*` — std/json: descriptor-driven JSON text to and from values.
+    fn gen_json(
+        &mut self,
+        f: &mut FnCtx,
+        name: &str,
+        args: &[&Expr],
+        span: Span,
+    ) -> String {
+        match name {
+            "encode" if args.len() == 1 => {
+                let cty = self.ctype_of(args[0]);
+                let v = self.gen_expr(f, args[0]);
+                let desc = self.desc_const(&cty);
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_encode_desc(i64 {v}, i64 {desc})"));
+                self.pool_value(f, &out, &CType::Str);
+                out
+            }
             "decode" if args.len() == 2 => {
                 let raw = self.gen_expr(f, args[0]);
                 let rcty = self.ctype_of_span(span);
@@ -2872,9 +2892,11 @@ impl<'a> Cg<'a> {
                 self.pool_value(f, &payload, &rcty);
                 payload
             }
-            _ => return None,
-        };
-        Some(v)
+            _ => {
+                self.unsupported(span, &format!("`json.{name}`"));
+                "0".to_string()
+            }
+        }
     }
 
     /// len("n=${n}") = const + digits(n), with no allocation.

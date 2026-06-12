@@ -15,6 +15,7 @@
 use std/graphics
 use std/fiber
 use std/http
+use std/json
 
 struct Pokemon = { Int id, String name, Int height, Int weight, Int base_experience }
 
@@ -75,7 +76,7 @@ fetchPokemon :: (Int id) -> Pokemon ! HttpError, DecodeError uses Http {
     if resp.status != 200 {
         fail HttpError(resp.status, "pokemon ${id}")
     }
-    decode(resp.body, Pokemon)
+    json.decode(resp.body, Pokemon)
 }
 
 // The sprite endpoint serves PNG bytes; an Inga string is a length-prefixed

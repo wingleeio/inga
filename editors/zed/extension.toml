@@ -12,5 +12,5 @@ languages = ["Inga"]
 
 [grammars.inga]
 repository = "https://github.com/wingleeio/inga"
-rev = "f956ba4d1feec03aafd2eb180f0de0257f473dcc"
+rev = "062bf60ddd8e1052d88582cb8183c77e1c7c0866"
 path = "tree-sitter-inga"

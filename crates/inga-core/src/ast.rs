@@ -287,6 +287,16 @@ pub enum PatternKind {
     TypedBind { ty: String, ty_span: Span, name: String },
     /// `(a, b)` — destructures a tuple.
     Tuple(Vec<Pattern>),
+    /// A string template: literal text must match, `${Type name}`
+    /// holes capture the text between and bind it.
+    StrTemplate(Vec<StrPatPiece>),
+}
+
+#[derive(Debug)]
+pub enum StrPatPiece {
+    Text(String),
+    /// `${Int id}` / `${String slug}` / `${name}` (String when omitted).
+    Hole { ty: Option<String>, name: String, span: Span },
 }
 
 #[derive(Debug)]

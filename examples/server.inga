@@ -1,15 +1,18 @@
 // A tiny JSON API — std/http's server side. The handler is an ordinary
-// function (HttpRequest) -> HttpResponse; state lives in a service it
-// `uses`; a handler failure answers that client 500 and re-raises at
-// `serve` (catch inside the handler to keep serving).
+// function (HttpRequest) -> HttpResponse; routes are string-template
+// patterns ("${Int id}" captures and binds when the segment parses);
+// state lives in a service the handler `uses`; a handler failure
+// answers that client 500 and re-raises at `serve`.
 //
 //   inga run examples/server.inga
 //   curl localhost:8080/visit
+//   curl localhost:8080/users/42
 
 use std/http
 use std/json
 
 struct Stats = { Int visits }
+struct User  = { Int id, String name }
 
 service Counter {
     bump :: () -> Int
@@ -28,8 +31,9 @@ memCounter :: Counter {
 handle :: (HttpRequest req) -> HttpResponse uses Counter {
     Counter counter
     match req.path {
-        "/visit" -> HttpResponse(200, json.encode(Stats { visits: counter.bump() }))
-        _        -> HttpResponse(404, "try /visit")
+        "/visit"           -> HttpResponse(200, json.encode(Stats { visits: counter.bump() }))
+        "/users/${Int id}" -> HttpResponse(200, json.encode(User { id: id, name: "user-${id}" }))
+        _                  -> HttpResponse(404, "try /visit or /users/42")
     }
 }
 

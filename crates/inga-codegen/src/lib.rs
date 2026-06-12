@@ -1902,6 +1902,13 @@ impl<'a> Cg<'a> {
                 f.line(format!("{m} = icmp ne i64 {eq}, 0"));
                 f.line(format!("br i1 {m}, label %{ok}, label %{fail}"));
             }
+            PatternKind::StrTemplate(pieces) => {
+                let val_l = self.label("strtplpat");
+                if !tag_test(self, f, "String", &val_l) {
+                    return;
+                }
+                self.gen_str_template_test(f, pieces, payload, ok, fail);
+            }
             PatternKind::Bind(name) => {
                 self.bind_local(f, name, payload);
                 f.line(format!("br label %{ok}"));
@@ -1990,6 +1997,59 @@ impl<'a> Cg<'a> {
         out
     }
 
+    /// Test a string-template pattern: encode the pieces for the runtime
+    /// matcher (`T<len>:<text>` / `I` / `S`), call it, and bind the captures.
+    fn gen_str_template_test(
+        &mut self,
+        f: &mut FnCtx,
+        pieces: &[StrPatPiece],
+        v: &str,
+        ok: &str,
+        fail: &str,
+    ) {
+        let mut desc = String::new();
+        let mut holes: Vec<(&str, CType)> = Vec::new();
+        for piece in pieces {
+            match piece {
+                StrPatPiece::Text(t) if t.is_empty() => {}
+                StrPatPiece::Text(t) => {
+                    desc.push('T');
+                    desc.push_str(&t.len().to_string());
+                    desc.push(':');
+                    desc.push_str(t);
+                }
+                StrPatPiece::Hole { ty, name, .. } => {
+                    if ty.as_deref() == Some("Int") {
+                        desc.push('I');
+                        holes.push((name, CType::Int));
+                    } else {
+                        desc.push('S');
+                        holes.push((name, CType::Str));
+                    }
+                }
+            }
+        }
+        let dc = self.str_const(&desc);
+        let r = self.tmp();
+        f.line(format!("{r} = call i64 @rt_str_template_match(i64 {v}, i64 {dc})"));
+        let c = self.tmp();
+        let caps_l = self.label("strtpl");
+        f.line(format!("{c} = icmp ne i64 {r}, 0"));
+        f.line(format!("br i1 {c}, label %{caps_l}, label %{fail}"));
+        f.start_block(&caps_l);
+        for (i, (name, cty)) in holes.iter().enumerate() {
+            let val = self.load_slot_from_int(f, &r, i as i64);
+            if *cty == CType::Str {
+                // Fresh from the matcher; the pool owns it, the local borrows.
+                self.pool_value(f, &val, &CType::Str);
+            }
+            self.bind_local_typed(f, name, &val, cty.clone());
+        }
+        // The capture box itself (its slots are owned by the pool above).
+        self.pool_value(f, &r, &CType::Tuple(vec![CType::Int; holes.len().max(1)]));
+        f.line(format!("br label %{ok}"));
+    }
+
     /// Emit a test for `pat` against value `v`; on success fall through to
     /// `ok` (bindings done), else branch to `fail`.
     fn gen_pattern_test(
@@ -2024,6 +2084,9 @@ impl<'a> Cg<'a> {
                 let c = self.tmp();
                 f.line(format!("{c} = icmp ne i64 {eq}, 0"));
                 f.line(format!("br i1 {c}, label %{ok}, label %{fail}"));
+            }
+            PatternKind::StrTemplate(pieces) => {
+                self.gen_str_template_test(f, pieces, v, ok, fail);
             }
             PatternKind::Ctor { name, args, .. } => match name.as_str() {
                 // Outcome {disc, tag, payload}: Ok matches disc 0 and tests
@@ -5398,6 +5461,7 @@ declare i64 @rt_dup(i64)
 declare i64 @rt_release(i64)
 declare void @rt_free(i64)
 declare i64 @rt_range(i64)
+declare i64 @rt_str_template_match(i64, i64)
 declare i64 @rt_str_split(i64, i64)
 declare i64 @rt_str_slice(i64, i64, i64)
 declare i64 @rt_str_index_of(i64, i64)

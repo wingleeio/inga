@@ -172,7 +172,18 @@ is an ordinary `(HttpRequest) -> HttpResponse` function: it captures
 services like any closure (`uses Counter` shows up in its row), and a
 handler failure answers that client 500 *and re-raises at the serve
 site* — so a silently crash-looping server is unrepresentable; catch in
-the handler to keep serving. Try it, then curl localhost:8080/visit:
+the handler to keep serving. Routing is **string-template matching** —
+no router library, just patterns:
+
+```inga
+match req.path {
+    "/visit"           -> visit()
+    "/users/${Int id}" -> getUser(id)   // binds id when the segment parses
+    _                  -> notFound()
+}
+```
+
+Try it, then curl localhost:8080/visit and localhost:8080/users/42:
 `inga run examples/server.inga`.
 
 The disk works the same way: `std/fs` is the file system, `uses Fs` in a

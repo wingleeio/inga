@@ -105,6 +105,13 @@ fn binding_hovers_reflect_later_constraints() {
 }
 
 #[test]
+fn string_template_captures_hover_typed() {
+    let src = "route :: (String p) -> String {\n    match p {\n        \"/users/${Int id}/${slug}\" -> \"${id} ${slug}\"\n        _ -> \"x\"\n    }\n}\n\nmain :: () {\n    println(route(\"/users/1/a\"))\n}\n";
+    assert_eq!(hover_at(src, "id}/"), "id : Int");
+    assert_eq!(hover_at(src, "slug}\" ->"), "slug : String");
+}
+
+#[test]
 fn tuple_index_and_suffix_hovers() {
     assert_eq!(hover_at(SRC, "0\n    dur"), ".0 : Int");
     assert_eq!(hover_at(SRC, "millis"), ".millis — Int to Duration");

@@ -83,6 +83,8 @@
 
 (record_update type: (type_identifier) @type)
 (field_initializer field: (identifier) @property)
+(interpolation type: (type_identifier) @type)
+(interpolation name: (identifier) @variable)
 
 ; Option constructors and builtin functions.
 ((type_identifier) @constructor

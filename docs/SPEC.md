@@ -108,6 +108,25 @@ fetchAndCache :: (id) { ... }                // a function
 - `match` over an enum, `Bool`, or option must be **exhaustive**: cover
   every variant (or both literals / `Some` and `None`) or end with a
   catch-all arm.
+- **String templates** match in patterns: literal text anchors, holes
+  capture the text between and bind it — typed-bind style, like
+  parameters:
+
+  ```inga
+  match req.path {
+      "/visit"                            -> visit()
+      "/users/${Int id}"                  -> getUser(id)
+      "/users/${Int id}/posts/${Int p}"   -> getPost(id, p)
+      "/files/${String name}.txt"         -> textFile(name)
+      _                                   -> notFound()
+  }
+  ```
+
+  Captures are `Int` or `String` (`${name}` alone is String). An `Int`
+  hole only matches when its text parses — `/users/abc` simply falls
+  through to the next arm. The matcher backtracks across repeated
+  literal text, and adjacent holes (no text between) are rejected at
+  compile time. Works in `catch` too (against `String`-typed errors).
 
 ## 3. Errors
 

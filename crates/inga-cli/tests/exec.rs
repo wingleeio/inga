@@ -1010,6 +1010,49 @@ fn named_field_construction_is_checked() {
 }
 
 #[test]
+fn string_template_patterns_route() {
+    let out = run(r#"
+route :: (String path) -> String {
+    match path {
+        "/visit" -> "visited"
+        "/users/${Int id}" -> "user ${id}"
+        "/users/${Int id}/posts/${Int postId}" -> "user ${id} post ${postId}"
+        "/files/${String name}.txt" -> "text file: ${name}"
+        "/echo/${rest}" -> "echo ${rest}"
+        _ -> "404"
+    }
+}
+
+main :: () {
+    println(route("/visit"))
+    println(route("/users/42"))
+    println(route("/users/7/posts/99"))
+    println(route("/users/abc"))
+    println(route("/files/notes.txt"))
+    println(route("/echo/a/b/c"))
+    println(route("/users/"))
+}
+"#);
+    assert_eq!(
+        out,
+        "visited\nuser 42\nuser 7 post 99\n404\ntext file: notes\necho a/b/c\n404\n"
+    );
+}
+
+#[test]
+fn string_template_patterns_are_checked() {
+    let errs = check_errors(
+        "route :: (String p) -> String {\n    match p {\n        \"/x/${id}${rest}\" -> \"a\"\n        \"/f/${Float x}\" -> \"b\"\n        \"/d/${Int a}/${Int a}\" -> \"c\"\n        _ -> \"d\"\n    }\n}\n\nmain :: () {\n    println(route(\"/x\"))\n}\n",
+    );
+    assert!(errs.iter().any(|e| e.contains("adjacent capture holes")), "{errs:?}");
+    assert!(
+        errs.iter().any(|e| e.contains("string captures are `Int` or `String`")),
+        "{errs:?}"
+    );
+    assert!(errs.iter().any(|e| e.contains("capture `a` is bound twice")), "{errs:?}");
+}
+
+#[test]
 fn match_on_bare_variant_is_not_a_record_literal() {
     // `match Red {` must still parse as a match block, not `Red { ... }`.
     let out = run(

@@ -4103,6 +4103,12 @@ impl<'a> Checker<'a> {
                                 self.warn_unreachable_arm(arm.pattern.span, "String");
                             }
                         }
+                        PatternKind::StrTemplate(pieces) => {
+                            if !rows.errors.contains("String") {
+                                self.warn_unreachable_arm(arm.pattern.span, "String");
+                            }
+                            self.check_str_template(pieces, arm.pattern.span);
+                        }
                         PatternKind::Bool(_) => {
                             if !rows.errors.contains("Bool") {
                                 self.warn_unreachable_arm(arm.pattern.span, "Bool");
@@ -4370,6 +4376,52 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Validate a string-template pattern and bind its capture holes.
+    /// Holes capture Int or String (omitted = String); adjacent holes have
+    /// no text boundary to split on and are rejected.
+    fn check_str_template(&mut self, pieces: &[StrPatPiece], span: Span) {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut prev_was_hole = false;
+        for piece in pieces {
+            match piece {
+                StrPatPiece::Text(t) => {
+                    if !t.is_empty() {
+                        prev_was_hole = false;
+                    }
+                }
+                StrPatPiece::Hole { ty, name, span: hspan } => {
+                    if prev_was_hole {
+                        self.error(
+                            *hspan,
+                            "adjacent capture holes are ambiguous; put literal text between them",
+                        );
+                    }
+                    prev_was_hole = true;
+                    let bound = match ty.as_deref() {
+                        None | Some("String") => Type::Str,
+                        Some("Int") => Type::Int,
+                        Some(other) => {
+                            self.error(
+                                *hspan,
+                                format!("string captures are `Int` or `String`, not `{other}`"),
+                            );
+                            Type::Unknown
+                        }
+                    };
+                    if seen.contains(&name.as_str()) {
+                        self.error(*hspan, format!("capture `{name}` is bound twice"));
+                    }
+                    seen.push(name);
+                    self.scopes.last_mut().unwrap().insert(name.clone(), bound.clone());
+                    if self.record_info {
+                        self.typed_hovers.push((*hspan, name.clone(), bound));
+                    }
+                }
+            }
+        }
+        let _ = span;
+    }
+
     fn check_pattern(&mut self, pat: &Pattern, expected: &Type) {
         self.check_pattern_against(pat, expected);
     }
@@ -4388,6 +4440,10 @@ impl<'a> Checker<'a> {
             }
             PatternKind::Str(_) => {
                 self.unify_at(&Type::Str, scrut_ty, pat.span, "pattern");
+            }
+            PatternKind::StrTemplate(pieces) => {
+                self.unify_at(&Type::Str, scrut_ty, pat.span, "pattern");
+                self.check_str_template(pieces, pat.span);
             }
             PatternKind::Bool(_) => {
                 self.unify_at(&Type::Bool, scrut_ty, pat.span, "pattern");

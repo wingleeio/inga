@@ -837,6 +837,36 @@ fn render_pattern(pat: &Pattern) -> String {
         PatternKind::Bind(name) => name.clone(),
         PatternKind::Int(n) => n.to_string(),
         PatternKind::Str(s) => format!("{s:?}"),
+        PatternKind::StrTemplate(pieces) => {
+            let mut out = String::from("\"");
+            for piece in pieces {
+                match piece {
+                    StrPatPiece::Text(t) => {
+                        for c in t.chars() {
+                            match c {
+                                '"' => out.push_str("\\\""),
+                                '\\' => out.push_str("\\\\"),
+                                '\n' => out.push_str("\\n"),
+                                '\t' => out.push_str("\\t"),
+                                '$' => out.push_str("\\$"),
+                                c => out.push(c),
+                            }
+                        }
+                    }
+                    StrPatPiece::Hole { ty, name, .. } => {
+                        out.push_str("${");
+                        if let Some(ty) = ty {
+                            out.push_str(ty);
+                            out.push(' ');
+                        }
+                        out.push_str(name);
+                        out.push('}');
+                    }
+                }
+            }
+            out.push('"');
+            out
+        }
         PatternKind::Bool(b) => b.to_string(),
         PatternKind::TypedBind { ty, name, .. } => format!("{ty} {name}"),
         PatternKind::Tuple(pats) => {

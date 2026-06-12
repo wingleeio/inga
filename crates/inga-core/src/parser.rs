@@ -1379,17 +1379,63 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Str(parts, _) => {
                 self.bump();
-                let text = match parts.as_slice() {
-                    [StrPart::Text(t)] => t.clone(),
-                    _ => {
-                        self.diagnostics.push(Diagnostic::error(
-                            start,
-                            "string patterns cannot contain interpolation",
-                        ));
-                        String::new()
+                // Plain text is a literal pattern; `${...}` holes make it a
+                // template that captures with `${Int id}` / `${name}`.
+                if parts.iter().all(|p| matches!(p, StrPart::Text(_))) {
+                    let text = parts
+                        .iter()
+                        .map(|p| match p {
+                            StrPart::Text(t) => t.as_str(),
+                            _ => unreachable!(),
+                        })
+                        .collect::<String>();
+                    return Pattern { kind: PatternKind::Str(text), span: start };
+                }
+                let mut pieces = Vec::new();
+                for part in &parts {
+                    match part {
+                        StrPart::Text(t) => pieces.push(StrPatPiece::Text(t.clone())),
+                        StrPart::Expr(tokens) => {
+                            let words: Vec<(String, Span, bool)> = tokens
+                                .iter()
+                                .filter_map(|t| match &t.kind {
+                                    TokenKind::Ident(n) => Some((n.clone(), t.span, true)),
+                                    TokenKind::Newline | TokenKind::Eof => None,
+                                    _ => Some((String::new(), t.span, false)),
+                                })
+                                .collect();
+                            let hole_span = tokens
+                                .first()
+                                .map(|t| t.span.to(tokens.last().unwrap().span))
+                                .unwrap_or(start);
+                            match words.as_slice() {
+                                [(name, span, true)] if !is_upper(name) => {
+                                    pieces.push(StrPatPiece::Hole {
+                                        ty: None,
+                                        name: name.clone(),
+                                        span: *span,
+                                    });
+                                }
+                                [(ty, _, true), (name, nspan, true)]
+                                    if is_upper(ty) && !is_upper(name) =>
+                                {
+                                    pieces.push(StrPatPiece::Hole {
+                                        ty: Some(ty.clone()),
+                                        name: name.clone(),
+                                        span: *nspan,
+                                    });
+                                }
+                                _ => {
+                                    self.diagnostics.push(Diagnostic::error(
+                                        hole_span,
+                                        "string pattern holes capture with `${Int name}`, `${String name}`, or `${name}`",
+                                    ));
+                                }
+                            }
+                        }
                     }
-                };
-                Pattern { kind: PatternKind::Str(text), span: start }
+                }
+                Pattern { kind: PatternKind::StrTemplate(pieces), span: start }
             }
             TokenKind::KwTrue => {
                 self.bump();

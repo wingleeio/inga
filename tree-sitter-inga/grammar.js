@@ -370,7 +370,17 @@ module.exports = grammar({
 
     escape_sequence: $ => token.immediate(/\\[ntr0"\\$]/),
 
-    interpolation: $ => seq('${', $._expression, '}'),
+    // `${expr}` in strings; in string patterns also the typed capture
+    // hole `${Int id}`.
+    interpolation: $ =>
+      seq(
+        '${',
+        choice(
+          seq(field('type', $.type_identifier), field('name', $.identifier)),
+          $._expression
+        ),
+        '}'
+      ),
 
     number: $ => /\d[\d_]*(\.\d[\d_]*)?/,
 

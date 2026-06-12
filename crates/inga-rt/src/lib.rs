@@ -2886,6 +2886,132 @@ pub extern "C" fn rt_str_join(list: i64, sep: i64) -> i64 {
     make_str(&out)
 }
 
+// ---- string-template patterns ------------------------------------------------------
+// `"/users/${Int id}"` compiles to an encoded template (`T<len>:<text>`,
+// `I`, `S`); the matcher anchors the literal pieces and captures the text
+// between, backtracking over later occurrences so `${Int id}/posts/...`
+// still matches when an earlier capture can't parse.
+
+enum TplPiece {
+    Text(std::ops::Range<usize>),
+    IntHole,
+    StrHole,
+}
+
+fn tpl_decode(desc: &[u8]) -> Vec<TplPiece> {
+    let mut pieces = Vec::new();
+    let mut i = 0;
+    while i < desc.len() {
+        match desc[i] {
+            b'I' => {
+                pieces.push(TplPiece::IntHole);
+                i += 1;
+            }
+            b'S' => {
+                pieces.push(TplPiece::StrHole);
+                i += 1;
+            }
+            b'T' => {
+                i += 1;
+                let mut len = 0usize;
+                while i < desc.len() && desc[i].is_ascii_digit() {
+                    len = len * 10 + (desc[i] - b'0') as usize;
+                    i += 1;
+                }
+                i += 1; // the `:`
+                pieces.push(TplPiece::Text(i..i + len));
+                i += len;
+            }
+            _ => break,
+        }
+    }
+    pieces
+}
+
+fn tpl_parse_int(text: &[u8]) -> Option<i64> {
+    std::str::from_utf8(text).ok()?.parse().ok()
+}
+
+/// Match `s[pos..]` against `pieces[pi..]`, pushing captures; backtracks.
+fn tpl_match(s: &[u8], pos: usize, desc: &[u8], pieces: &[TplPiece], pi: usize, caps: &mut Vec<i64>) -> bool {
+    let Some(piece) = pieces.get(pi) else {
+        return pos == s.len();
+    };
+    match piece {
+        TplPiece::Text(r) => {
+            let text = &desc[r.clone()];
+            s[pos..].starts_with(text) && tpl_match(s, pos + text.len(), desc, pieces, pi + 1, caps)
+        }
+        hole => {
+            let is_int = matches!(hole, TplPiece::IntHole);
+            // The checker rejects adjacent holes, so what follows is text
+            // (anchor on each occurrence, shortest capture first) or the end.
+            match pieces.get(pi + 1) {
+                None => {
+                    let cap = &s[pos..];
+                    match is_int {
+                        true => match tpl_parse_int(cap) {
+                            Some(n) => {
+                                caps.push(n);
+                                true
+                            }
+                            None => false,
+                        },
+                        false => {
+                            caps.push(make_str(cap));
+                            true
+                        }
+                    }
+                }
+                Some(TplPiece::Text(r)) => {
+                    let text = &desc[r.clone()];
+                    let mut at = pos;
+                    while at + text.len() <= s.len() {
+                        if s[at..].starts_with(text) {
+                            let cap = &s[pos..at];
+                            let cap_val = if is_int {
+                                match tpl_parse_int(cap) {
+                                    Some(n) => Some(n),
+                                    None => None,
+                                }
+                            } else {
+                                Some(make_str(cap))
+                            };
+                            if let Some(v) = cap_val {
+                                caps.push(v);
+                                if tpl_match(s, at + text.len(), desc, pieces, pi + 2, caps) {
+                                    return true;
+                                }
+                                caps.pop();
+                            }
+                        }
+                        at += 1;
+                    }
+                    false
+                }
+                Some(_) => false,
+            }
+        }
+    }
+}
+
+/// 0 on no match; else a box of the captures in hole order (Int captures
+/// are parsed values, String captures fresh strings).
+#[no_mangle]
+pub extern "C" fn rt_str_template_match(s: i64, desc: i64) -> i64 {
+    let (s, desc) = unsafe { (str_bytes(s), str_bytes(desc)) };
+    let pieces = tpl_decode(desc);
+    let mut caps = Vec::new();
+    if !tpl_match(s, 0, desc, &pieces, 0, &mut caps) {
+        return 0;
+    }
+    let p = rt_alloc(8 * caps.len().max(1) as i64) as *mut i64;
+    for (i, v) in caps.iter().enumerate() {
+        unsafe { *p.add(i) = *v };
+    }
+    p as i64
+}
+
 // ---- bytes -------------------------------------------------------------------------
 
 /// The i-th byte as Some(0–255); None (0) out of bounds.

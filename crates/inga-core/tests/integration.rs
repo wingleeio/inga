@@ -245,6 +245,16 @@ fn formatter_is_idempotent_on_examples() {
 }
 
 #[test]
+fn formatter_keeps_postfix_parens() {
+    // `(f |> mw)(x)` must not become `f |> mw(x)` — different program.
+    let src = "main :: () {\n    r = (f |> mw)(5)\n    s = ((x) -> x + 1)(2)\n    t = (a + b).0\n    println(r, s, t)\n}\n";
+    let formatted = fmt::format(src).unwrap();
+    assert!(formatted.contains("(f |> mw)(5)"), "got:\n{formatted}");
+    assert!(formatted.contains("((x) -> x + 1)(2)"), "got:\n{formatted}");
+    assert!(formatted.contains("(a + b).0"), "got:\n{formatted}");
+}
+
+#[test]
 fn formatter_preserves_comments() {
     let src = "// leading comment\nmain :: () {\n    println(1) // trailing\n}\n";
     let formatted = fmt::format(src).unwrap();

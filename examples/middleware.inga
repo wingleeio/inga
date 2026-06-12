@@ -103,15 +103,13 @@ withLogging :: (Handler inner) {
 main :: () {
     provide Http, consoleLogger
 
-    // Route-level stacks: auth only where it's needed.
-    profileRoute = profile |> withAuth
-    adminRoute = adminPanel |> withAdminAuth
-
+    // Route-level middleware, inline: each arm wraps its handler with
+    // exactly the stack that route needs.
     router = (HttpRequest req) -> {
         match req.path {
             "/"        -> home(req)
-            "/profile" -> profileRoute(req)
-            "/admin"   -> adminRoute(req)
+            "/profile" -> (profile |> withAuth)(req)
+            "/admin"   -> (adminPanel |> withAdminAuth)(req)
             _          -> HttpResponse(404, "try /, /profile, /admin")
         }
     }

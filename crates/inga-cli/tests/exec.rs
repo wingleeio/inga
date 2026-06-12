@@ -1059,6 +1059,52 @@ fn type_alias_cycles_error() {
 }
 
 #[test]
+fn inline_middleware_in_match_arms() {
+    // `(handler |> middleware)(req)` — wrap and call in one expression.
+    let out = run(r#"
+struct User = { Int id, String name }
+
+service Session {
+    User user
+}
+
+loggedIn :: Session {
+    User user
+}
+
+type Authed = (String) -> String uses Session
+
+profile :: (String q) -> String uses Session {
+    Session session
+    "profile of ${session.user.name}"
+}
+
+withAuth :: (Authed inner) {
+    (q) -> {
+        match q {
+            "token=${Int id}" -> {
+                provide loggedIn(User { id: id, name: "user-${id}" })
+                inner(q)
+            }
+            other -> "401"
+        }
+    }
+}
+
+main :: () {
+    router = (String q) -> {
+        match q {
+            "home" -> "welcome"
+            other  -> (profile |> withAuth)(q)
+        }
+    }
+    println(router("home"), router("token=7"), router("nope"))
+}
+"#);
+    assert_eq!(out, "welcome profile of user-7 401\n");
+}
+
+#[test]
 fn route_level_middleware() {
     // Each route picks its own middleware stack; auth only where needed,
     // and the auth middleware provides the Session per call.

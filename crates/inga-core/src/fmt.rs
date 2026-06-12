@@ -473,7 +473,11 @@ impl Printer {
                 format!("({})", inner.join(", "))
             }
             ExprKind::TupleIndex { recv, index, .. } => {
-                format!("{}.{index}", self.render_expr(recv, indent))
+                let mut recv_str = self.render_expr(recv, indent);
+                if postfix_operand_needs_parens(recv) {
+                    recv_str = format!("({recv_str})");
+                }
+                format!("{recv_str}.{index}")
             }
             ExprKind::RecordUpdate { name, base, fields, .. } => {
                 let mut parts = Vec::new();
@@ -490,19 +494,28 @@ impl Printer {
                 format!("[{}]", inner.join(", "))
             }
             ExprKind::Call { callee, args } => {
-                let callee_str = self.render_expr(callee, indent);
+                let mut callee_str = self.render_expr(callee, indent);
+                if postfix_operand_needs_parens(callee) {
+                    callee_str = format!("({callee_str})");
+                }
                 let args_str: Vec<String> =
                     args.iter().map(|a| self.render_expr(a, indent)).collect();
                 format!("{callee_str}({})", args_str.join(", "))
             }
             ExprKind::Method { recv, name, args, .. } => {
-                let recv_str = self.render_expr(recv, indent);
+                let mut recv_str = self.render_expr(recv, indent);
+                if postfix_operand_needs_parens(recv) {
+                    recv_str = format!("({recv_str})");
+                }
                 let args_str: Vec<String> =
                     args.iter().map(|a| self.render_expr(a, indent)).collect();
                 format!("{recv_str}.{name}({})", args_str.join(", "))
             }
             ExprKind::Field { recv, name, .. } => {
-                let recv_str = self.render_expr(recv, indent);
+                let mut recv_str = self.render_expr(recv, indent);
+                if postfix_operand_needs_parens(recv) {
+                    recv_str = format!("({recv_str})");
+                }
                 format!("{recv_str}.{name}")
             }
             ExprKind::Binary { op, lhs, rhs } => {
@@ -781,6 +794,22 @@ impl Printer {
 }
 
 // ---- pure render helpers -----------------------------------------------------
+
+/// A postfix form (`f(x)`, `v.field`, `v.0`) binds tighter than pipes,
+/// operators, and lambdas — those operands must keep their parentheses
+/// or the printed program changes meaning: `(f |> mw)(x)`.
+fn postfix_operand_needs_parens(e: &Expr) -> bool {
+    matches!(
+        e.kind,
+        ExprKind::Pipe { .. }
+            | ExprKind::Binary { .. }
+            | ExprKind::Unary { .. }
+            | ExprKind::Lambda { .. }
+            | ExprKind::Match { .. }
+            | ExprKind::If { .. }
+            | ExprKind::Fail { .. }
+    )
+}
 
 fn pub_prefix(is_pub: bool) -> &'static str {
     if is_pub { "pub " } else { "" }

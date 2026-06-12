@@ -1101,6 +1101,9 @@ impl<'a> Cg<'a> {
                     if module == "time" {
                         return self.gen_time(f, name, args, span);
                     }
+                    if module == "term" {
+                        return self.gen_term(f, name, args, span);
+                    }
                     if let Some(v) = self.gen_qualified(f, module, name, args, span) {
                         return v;
                     }
@@ -1299,6 +1302,9 @@ impl<'a> Cg<'a> {
                 }
                 if module == "time" {
                     return self.gen_time(f, name, args, span);
+                }
+                if module == "term" {
+                    return self.gen_term(f, name, args, span);
                 }
                 if let Some(v) = self.gen_qualified(f, module, name, args, span) {
                     return v;
@@ -2195,6 +2201,10 @@ impl<'a> Cg<'a> {
             }
             if item.name == "Net" {
                 f.evidence.insert("Net".to_string(), "0".to_string());
+                continue;
+            }
+            if item.name == "Term" {
+                f.evidence.insert("Term".to_string(), "0".to_string());
                 continue;
             }
             if item.name == "Runtime" {
@@ -4100,6 +4110,38 @@ impl<'a> Cg<'a> {
         a
     }
 
+    /// `term.*` — std/term: the controlling terminal.
+    fn gen_term(&mut self, f: &mut FnCtx, name: &str, args: &[&Expr], span: Span) -> String {
+        match (name, args.len()) {
+            ("rawOn", 0) => {
+                let boxed = self.tmp();
+                f.line(format!("{boxed} = call i64 @rt_term_raw_on()"));
+                self.gen_fs_unpack(f, &boxed, span);
+                "0".to_string()
+            }
+            ("rawOff", 0) => {
+                f.line("call void @rt_term_raw_off()".to_string());
+                "0".to_string()
+            }
+            ("readKey", 0) => {
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_term_read_key()"));
+                self.pool_value(f, &out, &CType::Str);
+                out
+            }
+            ("size", 0) => {
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_term_size()"));
+                self.pool_value(f, &out, &CType::Tuple(vec![CType::Int, CType::Int]));
+                out
+            }
+            _ => {
+                self.unsupported(span, "this `term` operation shape");
+                "0".to_string()
+            }
+        }
+    }
+
     /// `time.*` — std/time: the wall clock.
     fn gen_time(&mut self, f: &mut FnCtx, name: &str, args: &[&Expr], span: Span) -> String {
         match (name, args.len()) {
@@ -5405,6 +5447,10 @@ declare i64 @rt_byte_at(i64, i64)
 declare i64 @rt_int_to_bytes(i64, i64)
 declare i64 @rt_bytes_to_int(i64, i64, i64)
 declare i64 @rt_bytes_from_list(i64)
+declare i64 @rt_term_raw_on()
+declare void @rt_term_raw_off()
+declare i64 @rt_term_read_key()
+declare i64 @rt_term_size()
 declare i64 @rt_time_now()
 declare i64 @rt_time_utc(i64)
 declare i64 @rt_time_iso(i64)

@@ -44,6 +44,9 @@ pub const IO_ERROR: &str = "IoError";
 /// `provide Net`. Shared, so sockets cross fiber boundaries.
 pub const NET_SERVICE: &str = "Net";
 pub const NET_ERROR: &str = "NetError";
+/// The capability every `std/term` operation needs; satisfied by
+/// `provide Term`.
+pub const TERM_SERVICE: &str = "Term";
 
 /// Surface names of primitive types that can appear in a `!` row.
 pub const PRIMITIVE_TAGS: [&str; 5] = ["Int", "Float", "Bool", "String", "Duration"];
@@ -341,7 +344,7 @@ impl<'a> Checker<'a> {
                 },
             );
         }
-        for name in [HTTP_SERVICE, FS_SERVICE, NET_SERVICE] {
+        for name in [HTTP_SERVICE, FS_SERVICE, NET_SERVICE, TERM_SERVICE] {
             checker.services.insert(
                 name.to_string(),
                 ServiceInfo {
@@ -1839,6 +1842,7 @@ impl<'a> Checker<'a> {
             "std/process" => return self.check_process_call(member, member_span, args, span),
             "std/net" => return self.check_net_call(member, member_span, args, span),
             "std/time" => return self.check_time_call(member, member_span, args, span),
+            "std/term" => return self.check_term_call(member, member_span, args, span),
             _ => {}
         }
         let Some(target) = self.modules.iter().position(|m| m.key == import.target) else {
@@ -2579,6 +2583,71 @@ impl<'a> Checker<'a> {
                 self.error(
                     member_span,
                     format!("`std/fs` has no member `{member}` (read, write, append, exists, list, remove, createDir, open, readAt, writeAt, size, sync, close)"),
+                );
+                for arg in args {
+                    self.check_expr(arg);
+                }
+                Type::Unknown
+            }
+        }
+    }
+
+    /// `term.*` — std/term: the controlling terminal (raw mode, keys,
+    /// size). ANSI output goes through plain `print`.
+    fn check_term_call(
+        &mut self,
+        member: &str,
+        member_span: Span,
+        args: &[&Expr],
+        span: Span,
+    ) -> Type {
+        let arity = |s: &mut Self, n: usize| -> bool {
+            if args.len() != n {
+                s.error(
+                    span,
+                    format!("`term.{member}` expects {n} argument(s), found {}", args.len()),
+                );
+                for arg in args {
+                    s.check_expr(arg);
+                }
+                return false;
+            }
+            true
+        };
+        match member {
+            "rawOn" => {
+                if !arity(self, 0) {
+                    return Type::Unknown;
+                }
+                self.add_cap_row(TERM_SERVICE);
+                self.add_error_row(IO_ERROR);
+                Type::Unit
+            }
+            "rawOff" => {
+                if !arity(self, 0) {
+                    return Type::Unknown;
+                }
+                self.add_cap_row(TERM_SERVICE);
+                Type::Unit
+            }
+            "readKey" => {
+                if !arity(self, 0) {
+                    return Type::Unknown;
+                }
+                self.add_cap_row(TERM_SERVICE);
+                Type::Str
+            }
+            "size" => {
+                if !arity(self, 0) {
+                    return Type::Unknown;
+                }
+                self.add_cap_row(TERM_SERVICE);
+                Type::Tuple(vec![Type::Int, Type::Int])
+            }
+            _ => {
+                self.error(
+                    member_span,
+                    format!("`std/term` has no member `{member}` (rawOn, rawOff, readKey, size)"),
                 );
                 for arg in args {
                     self.check_expr(arg);
@@ -4395,6 +4464,23 @@ impl<'a> Checker<'a> {
                 provided.insert(NET_SERVICE.to_string());
                 continue;
             }
+            if item.name == "Term" {
+                if let Some(args) = &item.args {
+                    self.error(item.name_span, "`Term` takes no arguments: `provide Term`");
+                    for arg in args {
+                        self.check_expr(arg);
+                    }
+                }
+                if self.record_info {
+                    self.info.hovers.push((
+                        item.name_span,
+                        "Term — the controlling terminal; satisfies `Term` for this scope"
+                            .to_string(),
+                    ));
+                }
+                provided.insert(TERM_SERVICE.to_string());
+                continue;
+            }
             if item.name == "Runtime" {
                 // The fiber runtime: `provide Runtime(n)` (n workers; default
                 // = cores). Satisfies the builtin `Fibers` capability.
@@ -4837,6 +4923,13 @@ impl<'a> Checker<'a> {
                 ));
                 return;
             }
+            "std/term" => {
+                self.info.hovers.push((
+                    u.path_span,
+                    "std/term — the terminal: term.rawOn/rawOff/readKey/size; needs `provide Term`".to_string(),
+                ));
+                return;
+            }
             _ => {}
         }
         let ref_module = self.module_of(u.path_span);
@@ -5028,6 +5121,12 @@ pub fn std_module_members(target: &str) -> &'static [(&'static str, &'static str
         "std/json" => &[
             ("encode", "json.encode(value) -> String — JSON"),
             ("decode", "json.decode(raw, StructName) -> a ! DecodeError — parse JSON into a struct"),
+        ],
+        "std/term" => &[
+            ("rawOn", "term.rawOn() -> Unit ! IoError uses Term — raw mode: no echo, keys arrive immediately; restored at exit even on a crash"),
+            ("rawOff", "term.rawOff() uses Term — restore the terminal"),
+            ("readKey", "term.readKey() -> String uses Term — one key, blocking: up/down/left/right, enter, esc, tab, space, backspace, home, end, ctrl+<letter>, a character, or eof"),
+            ("size", "term.size() -> (Int, Int) uses Term — (cols, rows); (0, 0) off-terminal"),
         ],
         "std/time" => &[
             ("now", "time.now() -> Int — unix milliseconds (wall clock; nowMillis is monotonic)"),

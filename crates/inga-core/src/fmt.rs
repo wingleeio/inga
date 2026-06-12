@@ -554,6 +554,7 @@ impl Printer {
                             '\n' => out.push_str("\\n"),
                             '\t' => out.push_str("\\t"),
                             '\r' => out.push_str("\\r"),
+                            '\x1b' => out.push_str("\\e"),
                             '$' => out.push_str("\\$"),
                             c => out.push(c),
                         }

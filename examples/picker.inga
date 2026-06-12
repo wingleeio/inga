@@ -1,0 +1,48 @@
+// A tiny TUI — std/term in one screen. Raw mode, decoded keys
+// (up/down/enter/esc), ANSI redraw through plain print, and the
+// terminal restored on every exit path (even a crash: the runtime
+// registers an atexit guard when rawOn first runs).
+//
+//   inga run examples/picker.inga
+
+use std/term
+
+draw :: ([String] items, Int cursor) uses Term {
+    print("\e[2J\e[H")
+    println("pick a language feature (arrows + enter, q quits)\r")
+    items
+        |> map((item) -> {
+            selected = at(items, cursor) |> getOrElse("")
+            marker = if selected == item {
+                "▸"
+            } else {
+                " "
+            }
+            println(" ${marker} ${item}\r")
+        })
+}
+
+pick :: ([String] items, Int cursor) -> String? uses Term {
+    draw(items, cursor)
+    match term.readKey() {
+        "up"    -> pick(items, max(cursor - 1, 0))
+        "down"  -> pick(items, min(cursor + 1, len(items) - 1))
+        "enter" -> at(items, cursor)
+        "esc"   -> None
+        "q"     -> None
+        "eof"   -> None
+        other   -> pick(items, cursor)
+    }
+}
+
+main :: () {
+    provide Term
+    term.rawOn() |> catch { IoError(p, m) -> println("not a terminal: ${m}") }
+    choice = pick(["typed errors", "capability rows", "fibers", "arenas"], 0)
+    term.rawOff()
+    print("\e[2J\e[H")
+    match choice {
+        Some(item) -> println("you picked: ${item}")
+        None       -> println("nothing picked")
+    }
+}

@@ -247,6 +247,7 @@ impl<'a> Lexer<'a> {
                         b'"' => text.push('"'),
                         b'$' => text.push('$'),
                         b'0' => text.push('\0'),
+                        b'e' => text.push('\x1b'),
                         other => {
                             let span = self.span_from(esc_start);
                             self.error(
@@ -311,6 +312,7 @@ impl<'a> Lexer<'a> {
                         b'"' => text.push('"'),
                         b'$' => text.push('$'),
                         b'0' => text.push('\0'),
+                        b'e' => text.push('\x1b'),
                         other => {
                             let span = self.span_from(esc_start);
                             self.error(

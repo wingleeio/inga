@@ -336,6 +336,7 @@ dependencies = [
 name = "inga-rt"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "macroquad",
  "ureq",
 ]

@@ -569,6 +569,23 @@ fn process_args_and_exit() {
 }
 
 #[test]
+fn term_degrades_cleanly_off_terminal() {
+    // Headless: rawOn raises IoError, size is (0, 0), readKey sees eof.
+    let out = run(r#"
+use std/term
+
+main :: () {
+    provide Term
+    term.rawOn() |> catch { IoError(p, m) -> println("raw: ${m}") }
+    println(term.size())
+    println(term.readKey())
+    term.rawOff()
+}
+"#);
+    assert_eq!(out, "raw: stdin is not a terminal\n(0, 0)\neof\n");
+}
+
+#[test]
 fn wall_clock_time_and_utc_parts() {
     let out = run(r#"
 use std/time

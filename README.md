@@ -178,9 +178,26 @@ the handler to keep serving. Try it, then curl localhost:8080/visit:
 The disk works the same way: `std/fs` is the file system, `uses Fs` in a
 signature is how you know a function touches it, and failures raise
 `IoError { path, message }` — the path rides in the error.
-`fs.read/write/append/exists/list/remove/createDir`, all blocking on the
-calling fiber, all binary-safe (a file body and an http body are the same
-kind of string). Try it: `inga run examples/notes.inga`.
+`fs.read/write/append/exists/list/remove/createDir` for whole files, plus
+**file handles** (`fs.open/readAt/writeAt/size/sync/close`) for the
+random-access tier — positional I/O against `File { handle }`, `sync` for
+write-ahead discipline. All blocking on the calling fiber, all binary-safe
+(a file body and an http body are the same kind of string). Try it:
+`inga run examples/notes.inga`.
+
+Below HTTP sits `std/net` — raw TCP (`net.connect/listen/accept/read/
+write/close/stop` behind `provide Net`, `! NetError`), and with the
+bits-and-bytes builtins (`bitAnd/shiftL/byteAt/intToBytes/bytesToInt/…`)
+custom wire protocols and storage formats are ordinary code. `MutList`
+joins `MutMap` for in-place mutation, `std/time` is the wall clock
+(`time.now()`, `time.utc`, `time.iso`), and `readLine()` means stdin
+exists — pipes and prompts both work.
+
+And the terminal is a capability too: `std/term` gives raw mode, decoded
+key events (`up`/`enter`/`ctrl+c`/…), and the window size, with the
+runtime restoring the terminal on every exit path. ANSI goes through
+plain `print` (`\e` is ESC). A TUI is ~40 lines:
+`inga run examples/picker.inga`.
 
 ## Graphics, and a game
 
@@ -225,7 +242,7 @@ crates/inga-lsp       language server (lsp-server / lsp-types)
 editors/vscode        VS Code extension + TextMate grammar
 editors/zed           Zed extension (tree-sitter highlighting + LSP)
 tree-sitter-inga      tree-sitter grammar (used by the Zed extension)
-examples/             hello.inga, retry.inga, shapes.inga, arena.inga, fibers.inga, fiber_errors.inga, http_client.inga, pokedex.inga, notes.inga, server.inga, modules.inga (+ geometry.inga), user_service.inga
+examples/             hello.inga, retry.inga, shapes.inga, arena.inga, fibers.inga, fiber_errors.inga, http_client.inga, pokedex.inga, notes.inga, server.inga, picker.inga, modules.inga (+ geometry.inga), user_service.inga
 games/                balatro.inga (+ game, util, cards, jokers, poker, state, logic_test) — a Balatro-style deckbuilder
 bench/                the same workloads in Inga, JavaScript, and Rust (see bench/README.md)
 docs/SPEC.md          language design: semantics, effect rows, execution strategy
@@ -264,8 +281,10 @@ functions-as-values all compile; the reference interpreter served its
 purpose and was removed), Perceus-style ARC + arenas with copy-out,
 **`std/fiber` concurrency** (fork / structural join / settle / race /
 within, `shared` services, drop-is-supervision), a system-level std
-(`std/http` client **and server**, `std/fs`, `std/json`, `std/process`,
-sort/string/number builtins), a built-in test runner,
+(`std/http` client **and server**, `std/fs` with random-access file
+handles, `std/net` raw TCP, `std/json`, `std/process`, `std/time`,
+`std/term`, stdin, `MutList`, sort/string/number/bit/byte builtins), a
+built-in test runner,
 formatter, LSP, editor tooling (`cargo test` covers all of it). Not yet: a
 package manager, the M:N fiber scheduler (fibers run thread-per-fiber
 today — same semantics, that's the point of the `Runtime` promise),

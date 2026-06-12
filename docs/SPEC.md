@@ -648,6 +648,26 @@ time.iso (Int millis) -> String     YYYY-MM-DDTHH:MM:SS.mmmZ
 Ambient like `env`. Timestamps in storage formats are
 `intToBytes(time.now(), 8)`; human-readable ones are `time.iso`.
 
+## 8.9 The terminal: `std/term`
+
+TUIs are raw mode + decoded keys + ANSI strings — output is plain
+`print` (the `\e` escape is ESC):
+
+```
+term.rawOn  () -> Unit ! IoError uses Term   no echo, keys arrive immediately
+term.rawOff () uses Term                     restore the terminal
+term.readKey() -> String uses Term           one key, blocking
+term.size   () -> (Int, Int) uses Term       (cols, rows); (0, 0) off-terminal
+```
+
+`readKey` decodes: `up down left right enter esc tab space backspace
+home end`, `ctrl+<letter>`, a literal character (UTF-8 aware), or `eof`.
+Raw mode is restored by `rawOff` *and* by an atexit hook the runtime
+registers at the first `rawOn` — a crash or `process.exit` never leaves
+the user's shell broken. `rawOn` off-terminal raises `IoError`, so a TUI
+piped from a file fails as a typed error, not a hang. See
+`examples/picker.inga` — an arrow-key menu in ~40 lines.
+
 ## 9. Tooling (all in this repo)
 
 | Tool | Where | Notes |

@@ -2636,6 +2636,134 @@ pub extern "C" fn rt_process_exit(code: i64) {
     std::process::exit(code as i32);
 }
 
+// ---- terminal ----------------------------------------------------------------------
+// Raw mode via termios on stdin. The original settings are saved on the
+// first rawOn and restored by rawOff — and by an atexit hook, so a crash
+// or process.exit never leaves the user's terminal broken.
+
+static TERM_ORIG: std::sync::Mutex<Option<libc::termios>> = std::sync::Mutex::new(None);
+
+extern "C" fn term_restore_at_exit() {
+    if let Some(orig) = TERM_ORIG.lock().unwrap().take() {
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &orig) };
+    }
+}
+
+/// Enter raw mode (no echo, no line buffering, keys arrive immediately).
+/// Returns the fs-style `{ok, path, message}` box — failing on a non-tty
+/// raises IoError { "/dev/tty", message }.
+#[no_mangle]
+pub extern "C" fn rt_term_raw_on() -> i64 {
+    unsafe {
+        if libc::isatty(0) == 0 {
+            return fs_fail("/dev/tty", "stdin is not a terminal");
+        }
+        let mut orig: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(0, &mut orig) != 0 {
+            return fs_fail("/dev/tty", std::io::Error::last_os_error());
+        }
+        let mut guard = TERM_ORIG.lock().unwrap();
+        let first_time = guard.is_none();
+        if first_time {
+            *guard = Some(orig);
+        }
+        let mut raw = orig;
+        libc::cfmakeraw(&mut raw);
+        // Keep output post-processing so println's \n still means \r\n.
+        raw.c_oflag |= libc::OPOST;
+        if libc::tcsetattr(0, libc::TCSANOW, &raw) != 0 {
+            return fs_fail("/dev/tty", std::io::Error::last_os_error());
+        }
+        if first_time {
+            libc::atexit(term_restore_at_exit);
+        }
+    }
+    fs_ok(0)
+}
+
+#[no_mangle]
+pub extern "C" fn rt_term_raw_off() {
+    if let Some(orig) = TERM_ORIG.lock().unwrap().take() {
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &orig) };
+    }
+}
+
+fn term_read_byte() -> Option<u8> {
+    let mut b = 0u8;
+    match unsafe { libc::read(0, &mut b as *mut u8 as *mut libc::c_void, 1) } {
+        1 => Some(b),
+        _ => None,
+    }
+}
+
+/// A byte from stdin without blocking; None when nothing is pending.
+fn term_read_byte_nb() -> Option<u8> {
+    unsafe {
+        let flags = libc::fcntl(0, libc::F_GETFL);
+        libc::fcntl(0, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        let b = term_read_byte();
+        libc::fcntl(0, libc::F_SETFL, flags);
+        b
+    }
+}
+
+/// One decoded key press, blocking: "up"/"down"/"left"/"right",
+/// "enter", "esc", "tab", "space", "backspace", "home", "end",
+/// "ctrl+<letter>", a literal character, or "eof".
+#[no_mangle]
+pub extern "C" fn rt_term_read_key() -> i64 {
+    let key: String = match term_read_byte() {
+        None => "eof".into(),
+        Some(0x1b) => {
+            // Escape sequences arrive as a burst; drain what's pending.
+            match term_read_byte_nb() {
+                Some(b'[') => match term_read_byte_nb() {
+                    Some(b'A') => "up".into(),
+                    Some(b'B') => "down".into(),
+                    Some(b'C') => "right".into(),
+                    Some(b'D') => "left".into(),
+                    Some(b'H') => "home".into(),
+                    Some(b'F') => "end".into(),
+                    _ => "esc".into(),
+                },
+                Some(_) | None => "esc".into(),
+            }
+        }
+        Some(b'\r') | Some(b'\n') => "enter".into(),
+        Some(b'\t') => "tab".into(),
+        Some(b' ') => "space".into(),
+        Some(0x7f) | Some(0x08) => "backspace".into(),
+        Some(b) if b < 0x20 => format!("ctrl+{}", (b'a' + b - 1) as char),
+        Some(b) if b < 0x80 => (b as char).to_string(),
+        Some(b) => {
+            // UTF-8 continuation: the leading byte fixes the length.
+            let extra = if b >= 0xf0 { 3 } else if b >= 0xe0 { 2 } else { 1 };
+            let mut bytes = vec![b];
+            for _ in 0..extra {
+                if let Some(c) = term_read_byte() {
+                    bytes.push(c);
+                }
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    };
+    make_str(key.as_bytes())
+}
+
+/// (cols, rows) as a 2-slot tuple; (0, 0) when stdout is not a terminal.
+#[no_mangle]
+pub extern "C" fn rt_term_size() -> i64 {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) } == 0;
+    let (cols, rows) = if ok { (ws.ws_col as i64, ws.ws_row as i64) } else { (0, 0) };
+    let p = rt_alloc(16) as *mut i64;
+    unsafe {
+        *p = cols;
+        *p.add(1) = rows;
+    }
+    p as i64
+}
+
 // ---- wall-clock time ---------------------------------------------------------------
 
 /// Unix time in milliseconds (wall clock; nowMillis is monotonic).

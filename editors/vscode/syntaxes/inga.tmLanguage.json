@@ -33,7 +33,7 @@
       "patterns": [
         {
           "comment": "struct / enum declarations: `struct User = { Int id }`, `enum Shape = Circle | Dot`",
-          "match": "\\b(struct|enum)\\s+([A-Z][A-Za-z0-9_]*)",
+          "match": "\\b(struct|type|enum)\\s+([A-Z][A-Za-z0-9_]*)",
           "captures": {
             "1": { "name": "keyword.declaration.inga" },
             "2": { "name": "entity.name.type.inga" }
@@ -89,7 +89,7 @@
         },
         {
           "name": "keyword.other.inga",
-          "match": "\\b(use|pub|shared|struct|enum|service|provide|uses|lazy)\\b"
+          "match": "\\b(use|pub|shared|struct|type|enum|service|provide|uses|lazy)\\b"
         },
         {
           "name": "constant.language.inga",

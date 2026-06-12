@@ -192,7 +192,9 @@ capabilities at each call, so a `provide` around the call site reaches
 them:
 
 ```inga
-withAuth :: (((HttpRequest) -> HttpResponse uses Session) inner) {
+type Authed = (HttpRequest) -> HttpResponse uses Session
+
+withAuth :: (Authed inner) {
     (req) -> {
         provide loggedIn(authenticate(req))   // a parameterized impl: per-request state
         inner(req)                            // the handler's `uses Session`, satisfied here

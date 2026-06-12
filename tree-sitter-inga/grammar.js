@@ -54,6 +54,7 @@ module.exports = grammar({
     _declaration: $ =>
       choice(
         $.use_declaration,
+        $.type_alias_declaration,
         $.struct_declaration,
         $.enum_declaration,
         $.service_declaration,
@@ -76,6 +77,10 @@ module.exports = grammar({
 
     struct_declaration: $ =>
       seq(optional('pub'), 'struct', field('name', $.type_identifier), '=', $.fields),
+
+    // `type Handler = (HttpRequest) -> HttpResponse uses Session`
+    type_alias_declaration: $ =>
+      seq(optional('pub'), 'type', field('name', $.type_identifier), '=', $._type),
 
     // `enum Shape = Circle { Float radius } | Rect { Float w, Float h } | Dot`
     // A newline may precede each `|`, which works out because newlines are

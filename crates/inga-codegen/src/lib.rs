@@ -227,7 +227,7 @@ impl<'a> Cg<'a> {
         let mut next_tag_id = self.tag_ids.len() as i64;
         for decl in &self.program.decls {
             match decl {
-                Decl::Const(_) => {}
+                Decl::Const(_) | Decl::TypeAlias(_) => {}
                 Decl::Struct(d) => {
                     self.struct_meta
                         .insert(d.name.clone(), d.fields.iter().map(|f| f.name.clone()).collect());

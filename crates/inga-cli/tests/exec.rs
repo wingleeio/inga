@@ -1010,6 +1010,55 @@ fn named_field_construction_is_checked() {
 }
 
 #[test]
+fn type_aliases_resolve_everywhere() {
+    let out = run(r#"
+struct User = { Int id, String name }
+
+service Session {
+    User user
+}
+
+loggedIn :: Session {
+    User user
+}
+
+type Handler = (String) -> String uses Session
+type Names = [String]
+
+dashboard :: (String path) -> String uses Session {
+    Session session
+    "${session.user.name} at ${path}"
+}
+
+withAuth :: (Handler inner) {
+    (req) -> {
+        provide loggedIn(User { id: 1, name: "wing" })
+        inner(req)
+    }
+}
+
+shout :: (Names xs) -> Names {
+    xs |> map((x) -> toUpper(x))
+}
+
+main :: () {
+    app = dashboard |> withAuth
+    println(app("/home"))
+    println(shout(["a", "b"]))
+}
+"#);
+    assert_eq!(out, "wing at /home\n[\"A\", \"B\"]\n");
+}
+
+#[test]
+fn type_alias_cycles_error() {
+    let errs = check_errors(
+        "type A = B\ntype B = A\n\nmain :: () {\n    A x = 1\n    println(x)\n}\n",
+    );
+    assert!(errs.iter().any(|e| e.contains("alias cycle")), "{errs:?}");
+}
+
+#[test]
 fn provide_reaches_contracted_callbacks() {
     // The middleware pattern: a callback whose type declares `uses Session`
     // receives evidence at each call, so a `provide` around the call site

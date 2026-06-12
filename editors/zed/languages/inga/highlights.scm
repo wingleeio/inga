@@ -17,6 +17,7 @@
   "use"
   "pub"
   "struct"
+  "type"
   "enum"
   "service"
   "shared"
@@ -81,6 +82,7 @@
 (enum_variant name: (type_identifier) @constructor)
 (typed_pattern name: (identifier) @variable)
 
+(type_alias_declaration name: (type_identifier) @type)
 (record_update type: (type_identifier) @type)
 (field_initializer field: (identifier) @property)
 (interpolation type: (type_identifier) @type)

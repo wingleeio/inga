@@ -60,6 +60,7 @@ pub enum DefKind {
     Impl,
     Method,
     Const,
+    Alias,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +163,13 @@ impl Rows {
         self.errors.extend(other.errors.iter().cloned());
         self.caps.extend(other.caps.iter().cloned());
     }
+}
+
+struct AliasInfo<'a> {
+    ty: &'a TypeExpr,
+    name_span: Span,
+    module: usize,
+    is_pub: bool,
 }
 
 struct ConstInfo {
@@ -304,6 +312,10 @@ struct Checker<'a> {
     typed_hovers: Vec<(Span, String, Type)>,
     /// Top-level constants: type, declaration index (init order), origin.
     consts: HashMap<String, ConstInfo>,
+    /// Transparent type aliases, resolved at use sites.
+    aliases: HashMap<String, AliasInfo<'a>>,
+    /// Aliases currently being expanded (cycle detection).
+    alias_stack: Vec<String>,
     /// Set while checking a constant's initializer: its declaration index,
     /// so references to later constants (uninitialized at that point) error.
     current_const: Option<usize>,
@@ -335,6 +347,8 @@ impl<'a> Checker<'a> {
             record_info: false,
             typed_hovers: Vec::new(),
             consts: HashMap::new(),
+            aliases: HashMap::new(),
+            alias_stack: Vec::new(),
             current_const: None,
             current_rigid: std::collections::HashSet::new(),
             raw_expr_types: HashMap::new(),
@@ -524,6 +538,7 @@ impl<'a> Checker<'a> {
                 Decl::Impl(d) => (&d.name, d.name_span, DefKind::Impl, d.is_pub),
                 Decl::Func(d) => (&d.name, d.name_span, DefKind::Func, d.is_pub),
                 Decl::Const(d) => (&d.name, d.name_span, DefKind::Const, d.is_pub),
+                Decl::TypeAlias(d) => (&d.name, d.name_span, DefKind::Alias, d.is_pub),
             };
             let module = self.module_of(span);
             let dup = match kind {
@@ -536,6 +551,12 @@ impl<'a> Checker<'a> {
                 }
                 DefKind::Const => {
                     self.consts.contains_key(name) || self.funcs.contains_key(name)
+                }
+                DefKind::Alias => {
+                    self.aliases.contains_key(name)
+                        || self.structs.contains_key(name)
+                        || self.enums.contains_key(name)
+                        || self.services.contains_key(name)
                 }
             };
             if dup {
@@ -576,6 +597,14 @@ impl<'a> Checker<'a> {
                     );
                     next_const += 1;
                 }
+                DefKind::Alias => {
+                    if let Decl::TypeAlias(d) = decl {
+                        self.aliases.insert(
+                            name.clone(),
+                            AliasInfo { ty: &d.ty, name_span: span, module, is_pub },
+                        );
+                    }
+                }
                 _ => {}
             }
         }
@@ -583,7 +612,7 @@ impl<'a> Checker<'a> {
         // Second sweep: full signatures.
         for decl in &self.program.decls {
             match decl {
-                Decl::Use(_) | Decl::Const(_) => {}
+                Decl::Use(_) | Decl::Const(_) | Decl::TypeAlias(_) => {}
                 Decl::Struct(d) => {
                     let mut fields = Vec::new();
                     let mut tyvars = HashMap::new();
@@ -713,16 +742,8 @@ impl<'a> Checker<'a> {
                 Decl::Func(d) => {
                     let mut tyvars = HashMap::new();
                     for (i, p) in d.sig.params.iter().enumerate() {
-                        if let Some(TypeExpr::Func { caps, .. }) = &p.ty {
-                            if !caps.is_empty() {
-                                let mut names: Vec<String> =
-                                    caps.iter().map(|(n, _)| n.clone()).collect();
-                                names.sort();
-                                self.info
-                                    .facts
-                                    .param_contracts
-                                    .insert((d.name.clone(), i), names);
-                            }
+                        if let Some(caps) = p.ty.as_ref().and_then(|t| self.callback_contract(t)) {
+                            self.info.facts.param_contracts.insert((d.name.clone(), i), caps);
                         }
                     }
                     let params: Vec<Type> = d
@@ -852,6 +873,33 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The `uses` row of a function-type annotation (through aliases):
+    /// such a callback parameter receives evidence per call.
+    fn callback_contract(&self, ty: &TypeExpr) -> Option<Vec<String>> {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut current = ty;
+        loop {
+            match current {
+                TypeExpr::Func { caps, .. } => {
+                    if caps.is_empty() {
+                        return None;
+                    }
+                    let mut names: Vec<String> = caps.iter().map(|(n, _)| n.clone()).collect();
+                    names.sort();
+                    return Some(names);
+                }
+                TypeExpr::Name(n, _) if !seen.contains(&n.as_str()) => {
+                    seen.push(n);
+                    match self.aliases.get(n) {
+                        Some(info) => current = info.ty,
+                        None => return None,
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+
     fn resolve_type_expr(&mut self, ty: &TypeExpr, tyvars: &mut HashMap<String, Type>) -> Type {
         match ty {
             TypeExpr::Name(name, span) => match name.as_str() {
@@ -862,6 +910,26 @@ impl<'a> Checker<'a> {
                 "Unit" => Type::Unit,
                 "Duration" => Type::Duration,
                 "Schedule" => Type::Schedule,
+                _ if self.aliases.contains_key(name) => {
+                    if self.alias_stack.contains(name) {
+                        self.error(
+                            *span,
+                            format!("type alias `{name}` refers to itself (alias cycle)"),
+                        );
+                        return Type::Unknown;
+                    }
+                    let info = &self.aliases[name];
+                    let (target, m, p, def_span) =
+                        (info.ty, info.module, info.is_pub, info.name_span);
+                    self.gate(name, m, p, *span);
+                    if self.record_info {
+                        self.info.refs.push((*span, def_span));
+                    }
+                    self.alias_stack.push(name.clone());
+                    let resolved = self.resolve_type_expr(target, tyvars);
+                    self.alias_stack.pop();
+                    resolved
+                }
                 _ if self.structs.contains_key(name) => {
                     let info = &self.structs[name];
                     let (m, p) = (info.module, info.is_pub);
@@ -5244,6 +5312,16 @@ impl<'a> Checker<'a> {
                     kind: DefKind::Impl,
                     detail: format!("{} :: {}", d.name, d.service),
                 },
+                Decl::TypeAlias(d) => {
+                    let mut tyvars = HashMap::new();
+                    let resolved = self.resolve_type_expr(&d.ty, &mut tyvars);
+                    DefInfo {
+                        name: d.name.clone(),
+                        span: d.name_span,
+                        kind: DefKind::Alias,
+                        detail: format!("type {} = {}", d.name, self.render(&resolved)),
+                    }
+                }
                 Decl::Const(d) => {
                     let ty =
                         self.consts.get(&d.name).map(|i| i.ty.clone()).unwrap_or(Type::Unknown);

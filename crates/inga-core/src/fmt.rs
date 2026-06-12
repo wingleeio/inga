@@ -188,6 +188,15 @@ impl Printer {
                 Decl::Service(d) => self.print_service(d),
                 Decl::Impl(d) => self.print_impl(d),
                 Decl::Func(d) => self.print_func(d, 0),
+                Decl::TypeAlias(d) => {
+                    self.flush_comments_before(d.span.start, 0);
+                    self.blank_line_if_gap(self.lines.line(d.span.start));
+                    self.out.push_str(pub_prefix(d.is_pub));
+                    self.out.push_str(&format!("type {} = {}", d.name, render_type(&d.ty)));
+                    self.attach_trailing_comment(d.span.end);
+                    self.out.push('\n');
+                    self.prev_end_line = Some(self.lines.line(d.span.end));
+                }
                 Decl::Const(d) => {
                     self.flush_comments_before(d.span.start, 0);
                     self.blank_line_if_gap(self.lines.line(d.span.start));
@@ -786,6 +795,7 @@ fn decl_span(decl: &Decl) -> Span {
         Decl::Impl(d) => d.span,
         Decl::Func(d) => d.span,
         Decl::Const(d) => d.span,
+        Decl::TypeAlias(d) => d.span,
     }
 }
 

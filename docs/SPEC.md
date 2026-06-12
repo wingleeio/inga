@@ -75,6 +75,7 @@ memoryCache :: Cache {                       // an implementation
 }
 fetchAndCache :: (id) { ... }                // a function
 maxRetries = 3                               // a constant (also `Int port = 8080`)
+type Handler = (Int) -> String uses Cache    // a transparent type alias
 ```
 
 - Type-before-name everywhere: `(String id)` in parameters, `{ Int id }` in
@@ -85,6 +86,11 @@ maxRetries = 3                               // a constant (also `Int port = 808
   `cache.defaultTtl`, no getter needed. Every impl must define a field of
   that name at that type; impl fields *not* declared by the service stay
   private instance state. The service declaration is the public interface.
+- **Type aliases** (`type Handler = (HttpRequest) -> HttpResponse uses
+  Session`) are transparent: the alias resolves wherever the name appears
+  in a type, including a function type's rows — the idiomatic way to name
+  a callback contract once instead of spelling it at every middleware.
+  Alias cycles are compile errors. `pub` exports them.
 - **Constants** are top-level `name = expr` (optionally typed:
   `Int port = 8080`), evaluated once at startup in declaration order — a
   constant may reference earlier constants, not later ones. Initializers
@@ -252,7 +258,9 @@ A `provide` around the call site therefore reaches the callback, which
 is the middleware pattern:
 
 ```inga
-withAuth :: (((HttpRequest) -> HttpResponse uses Session) inner) {
+type Authed = (HttpRequest) -> HttpResponse uses Session
+
+withAuth :: (Authed inner) {
     (req) -> {
         provide loggedIn(authenticate(req))
         inner(req)                 // Session = the one provided just above

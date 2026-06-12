@@ -27,6 +27,18 @@ pub enum Decl {
     /// `maxRetries = 3` — a top-level constant, evaluated once at startup
     /// in declaration order. Initializers are pure (no `!`, no `uses`).
     Const(ConstDecl),
+    /// `type Handler = (HttpRequest) -> HttpResponse uses Session` — a
+    /// transparent alias, resolved wherever the name appears in a type.
+    TypeAlias(TypeAliasDecl),
+}
+
+#[derive(Debug)]
+pub struct TypeAliasDecl {
+    pub is_pub: bool,
+    pub name: String,
+    pub name_span: Span,
+    pub ty: TypeExpr,
+    pub span: Span,
 }
 
 #[derive(Debug)]

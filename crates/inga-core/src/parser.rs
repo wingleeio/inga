@@ -223,6 +223,30 @@ impl<'a> Parser<'a> {
                 d.is_pub = is_pub;
                 Some(Decl::Struct(d))
             }
+            TokenKind::KwType => {
+                let start = self.peek().span;
+                self.bump();
+                let (name, name_span) = self.expect_ident("a type alias name");
+                if !is_upper(&name) && name != "<error>" {
+                    self.diagnostics.push(Diagnostic::error(
+                        name_span,
+                        format!("type alias names start with an uppercase letter: `{name}`"),
+                    ));
+                }
+                self.expect(&TokenKind::Eq, "`=`");
+                self.skip_newlines();
+                let Some(ty) = self.try_parse_type() else {
+                    self.error_here("expected a type after `=`");
+                    return None;
+                };
+                Some(Decl::TypeAlias(TypeAliasDecl {
+                    is_pub,
+                    name,
+                    name_span,
+                    ty,
+                    span: start.to(self.prev_span()),
+                }))
+            }
             TokenKind::KwEnum => {
                 self.bump();
                 let mut d = self.parse_enum_decl();

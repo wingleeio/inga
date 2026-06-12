@@ -7,7 +7,8 @@
 //     and the frame `fiber.poll`s it, drawing a loading note meanwhile;
 //   - sprites become textures with `graphics.imageNew` (on the GL thread,
 //     once, when the page lands) and draw with `graphics.image`;
-//   - prev/next buttons page through gen 1; pages cache in MutMaps.
+//   - prev/next buttons page through gen 1; all state lives in one `Dex`
+//     service provided in main — no threading maps through signatures.
 //
 //   inga run examples/pokedex.inga   (needs network access)
 
@@ -16,6 +17,44 @@ use std/fiber
 use std/http
 
 struct Pokemon = { Int id, String name, Int height, Int weight, Int base_experience }
+
+// One service owns the dex's state; every function below just says
+// `uses Dex` (inferred) instead of threading five maps around.
+service Dex {
+    ui :: () -> MutMap<String, Int>
+    pending :: () -> MutMap<Int, Fiber<([Pokemon], [String]) ! HttpError, DecodeError>>
+    cache :: () -> MutMap<Int, [Pokemon]>
+    sprites :: () -> MutMap<Int, Int>
+    failed :: () -> MutMap<Int, Int>
+}
+
+freshDex :: Dex {
+    uiM = MutMap()
+    pendingM = MutMap()
+    cacheM = MutMap()
+    spritesM = MutMap()
+    failedM = MutMap()
+
+    ui :: () {
+        uiM
+    }
+
+    pending :: () {
+        pendingM
+    }
+
+    cache :: () {
+        cacheM
+    }
+
+    sprites :: () {
+        spritesM
+    }
+
+    failed :: () {
+        failedM
+    }
+}
 
 perPage :: () -> Int {
     6
@@ -157,28 +196,33 @@ drawCard :: (Pokemon p, Int i, Int sprite) {
 
 // Kick off a background load for `page` unless it is cached, failed, or
 // already in flight. The render fiber never waits: `frame` polls.
-ensurePage :: (Int page, pending, cache, failed) uses Http, Fibers {
-    if cache.get(page) == None && pending.get(page) == None && failed.get(page) == None {
-        pending.set(page, fetchPage(page) |> fiber.fork)
+ensurePage :: (Int page) uses Dex, Http, Fibers {
+    Dex dex
+    fresh = dex.cache().get(page) == None && dex.pending().get(page) == None && dex.failed().get(page) == None
+    if fresh {
+        dex.pending().set(page, fetchPage(page) |> fiber.fork)
     }
 }
 
 // Poll the in-flight page; when it lands, turn the sprite bytes into
 // textures (here, on the GL thread) and cache the page.
-pollPage :: (Int page, pending, cache, sprites, failed) uses Fibers {
+pollPage :: (Int page) uses Dex, Fibers {
+    Dex dex
+    pending = dex.pending()
+    sprites = dex.sprites()
     match pending.get(page) {
         Some(f) -> {
             polled = fiber.poll(f)
                 |> catch {
                     HttpError(status, m) -> {
                         println("page ${page + 1} failed (${status}): ${m}")
-                        failed.set(page, 1)
+                        dex.failed().set(page, 1)
                         pending.delete(page)
                         None
                     }
                     DecodeError(m) -> {
                         println("page ${page + 1} decode failed: ${m}")
-                        failed.set(page, 1)
+                        dex.failed().set(page, 1)
                         pending.delete(page)
                         None
                     }
@@ -195,7 +239,7 @@ pollPage :: (Int page, pending, cache, sprites, failed) uses Fibers {
                         sprites.set(id, graphics.imageNew(data))
                         0
                     })
-                    cache.set(page, pokes)
+                    dex.cache().set(page, pokes)
                     pending.delete(page)
                     0
                 }
@@ -207,19 +251,20 @@ pollPage :: (Int page, pending, cache, sprites, failed) uses Fibers {
     }
 }
 
-frame :: (ui, pending, cache, sprites, failed) uses Http, Fibers {
+frame :: () uses Dex, Http, Fibers {
     provide Arena(256.kb)
+    Dex dex
     graphics.clear(24, 26, 32)
-    page = ui.get("page") |> getOrElse(0)
+    page = dex.ui().get("page") |> getOrElse(0)
     centerText("INGA-DEX", 480, 36, 30, 14423100)
 
-    pollPage(page, pending, cache, sprites, failed)
-    match cache.get(page) {
+    pollPage(page)
+    match dex.cache().get(page) {
         Some(pokes) -> {
             map(range(len(pokes)), (i) -> {
                 match at(pokes, i) {
                     Some(p) -> {
-                        drawCard(p, i, sprites.get(p.id) |> getOrElse(-1))
+                        drawCard(p, i, dex.sprites().get(p.id) |> getOrElse(-1))
                         0
                     }
                     None    -> 0
@@ -228,7 +273,7 @@ frame :: (ui, pending, cache, sprites, failed) uses Http, Fibers {
             0
         }
         None -> {
-            msg = if failed.get(page) == None {
+            msg = if dex.failed().get(page) == None {
                 "loading page ${page + 1}..."
             } else {
                 "page ${page + 1} failed to load"
@@ -238,25 +283,20 @@ frame :: (ui, pending, cache, sprites, failed) uses Http, Fibers {
         }
     }
 
-    idle = pending.get(page) == None
+    idle = dex.pending().get(page) == None
     if button("< prev", 320, 498, 100, 32, idle && page > 0) {
-        ui.set("page", page - 1)
-        ensurePage(page - 1, pending, cache, failed)
+        dex.ui().set("page", page - 1)
+        ensurePage(page - 1)
     }
     if button("next >", 540, 498, 100, 32, idle && page < lastPage()) {
-        ui.set("page", page + 1)
-        ensurePage(page + 1, pending, cache, failed)
+        dex.ui().set("page", page + 1)
+        ensurePage(page + 1)
     }
     centerText("page ${page + 1} / ${lastPage() + 1}", 480, 521, 14, 9342618)
 }
 
 main :: () {
-    provide Http, Runtime(8)
-    ui = MutMap()
-    pending = MutMap()
-    cache = MutMap()
-    sprites = MutMap()
-    failed = MutMap()
-    ensurePage(0, pending, cache, failed)
-    graphics.run(960, 540, "INGA-DEX", () -> frame(ui, pending, cache, sprites, failed))
+    provide Http, Runtime(8), freshDex
+    ensurePage(0)
+    graphics.run(960, 540, "INGA-DEX", () -> frame())
 }

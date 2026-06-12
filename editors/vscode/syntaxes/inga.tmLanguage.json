@@ -221,7 +221,7 @@
       "patterns": [
         {
           "name": "support.function.builtin.inga",
-          "match": "\\b(println|print|show|map|filter|fold|at|concat|reverse|split|join|contains|startsWith|endsWith|replace|toUpper|toLower|sort|sortBy|min|max|abs|slice|indexOf|trim|parseInt|toFloat|floor|getOrElse|orFail|retry|upTo|ignoreFailure|tap|tapError|then|sleep|assert|assertEq|len|range|random|nowMillis|nowMicros|MutMap)(?=\\s*\\()"
+          "match": "\\b(println|print|show|readLine|map|filter|fold|at|concat|reverse|split|join|contains|startsWith|endsWith|replace|toUpper|toLower|sort|sortBy|min|max|abs|slice|indexOf|trim|parseInt|toFloat|floor|getOrElse|orFail|retry|upTo|ignoreFailure|tap|tapError|then|sleep|assert|assertEq|len|range|random|nowMillis|nowMicros|MutMap)(?=\\s*\\()"
         },
         {
           "match": "\\b([a-z][A-Za-z0-9_]*)(?=\\s*\\()",

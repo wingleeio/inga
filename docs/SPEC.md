@@ -213,7 +213,7 @@ provides real implementations.
 - **Functions are values**: a top-level function passed where a callback is
   expected (`map(xs, double)`) closes over its evidence like a lambda.
 - **Builtins** (a deliberate, small prelude — no imports needed):
-  `println print show len map filter fold at concat reverse sort sortBy
+  `println print show readLine len map filter fold at concat reverse sort sortBy
   range` (lists), `split join slice indexOf contains startsWith endsWith
   replace toUpper toLower trim parseInt toFloat floor min max abs`
   (strings/numbers), `getOrElse orFail` (options), `retry ignoreFailure

@@ -88,4 +88,4 @@
 ((type_identifier) @constructor
   (#match? @constructor "^(Some|None)$"))
 ((identifier) @function.builtin
-  (#match? @function.builtin "^(println|print|show|map|filter|fold|at|concat|reverse|split|join|contains|startsWith|endsWith|replace|toUpper|toLower|sort|sortBy|min|max|abs|slice|indexOf|trim|parseInt|toFloat|floor|getOrElse|orFail|retry|ignoreFailure|tap|tapError|then|sleep|assert|assertEq|len|range|random|nowMillis|nowMicros)$"))
+  (#match? @function.builtin "^(println|print|show|readLine|map|filter|fold|at|concat|reverse|split|join|contains|startsWith|endsWith|replace|toUpper|toLower|sort|sortBy|min|max|abs|slice|indexOf|trim|parseInt|toFloat|floor|getOrElse|orFail|retry|ignoreFailure|tap|tapError|then|sleep|assert|assertEq|len|range|random|nowMillis|nowMicros)$"))

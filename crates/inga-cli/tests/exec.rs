@@ -467,6 +467,25 @@ main :: () {
 }
 
 #[test]
+fn read_line_consumes_stdin_until_eof() {
+    use std::io::Write;
+    let path = write_temp(
+        "upAll :: ([String] acc) -> [String] {\n    match readLine() {\n        Some(line) -> upAll(concat(acc, [toUpper(line)]))\n        None -> acc\n    }\n}\n\nmain :: () {\n    println(join(upAll([]), \"|\"))\n}\n",
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_inga"))
+        .arg("run")
+        .arg(&path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"alpha\nbeta\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ALPHA|BETA\n");
+}
+
+#[test]
 fn string_predicates_and_transforms() {
     let out = run(r#"
 main :: () {

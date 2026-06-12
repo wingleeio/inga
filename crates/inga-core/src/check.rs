@@ -3023,6 +3023,12 @@ impl<'a> Checker<'a> {
                 }
                 Type::List(Box::new(Type::Str))
             }
+            "readLine" => {
+                if !check_arity(self, 0) {
+                    return Some(Type::Option(Box::new(Type::Str)));
+                }
+                Type::Option(Box::new(Type::Str))
+            }
             "contains" | "startsWith" | "endsWith" => {
                 if !check_arity(self, 2) {
                     return Some(Type::Bool);
@@ -4666,10 +4672,11 @@ pub fn builtin_doc(name: &str) -> Option<&'static str> {
     builtin_completions().into_iter().find(|(n, _)| *n == name).map(|(_, doc)| doc)
 }
 
-const BUILTIN_NAMES: [&str; 46] = [
+const BUILTIN_NAMES: [&str; 47] = [
     "println",
     "print",
     "show",
+    "readLine",
     "map",
     "contains",
     "startsWith",
@@ -4721,6 +4728,7 @@ pub fn builtin_completions() -> Vec<(&'static str, &'static str)> {
         ("println", "println(values...) -> Unit — print space-separated, with a newline"),
         ("print", "print(values...) -> Unit"),
         ("show", "show(value) -> String — developer-facing rendering (quotes strings)"),
+        ("readLine", "readLine() -> String? — one line from stdin, without the newline; None at end of input"),
         ("map", "map(container, f) -> mapped — over a list or an option"),
         ("getOrElse", "getOrElse(option, default) -> a"),
         ("orFail", "orFail(option, error) -> a — unwrap Some, or fail with `error`"),

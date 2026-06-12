@@ -2322,6 +2322,27 @@ pub extern "C" fn rt_fs_create_dir(path: i64) -> i64 {
     }
 }
 
+// ---- stdin -------------------------------------------------------------------------
+
+/// One line from stdin without the trailing newline; None (0) at EOF.
+#[no_mangle]
+pub extern "C" fn rt_read_line() -> i64 {
+    use std::io::BufRead;
+    let mut line = String::new();
+    match std::io::stdin().lock().read_line(&mut line) {
+        Ok(0) | Err(_) => 0,
+        Ok(_) => {
+            while line.ends_with('\n') || line.ends_with('\r') {
+                line.pop();
+            }
+            let s = make_str(line.as_bytes());
+            let p = rt_alloc(8) as *mut i64;
+            unsafe { *p = s };
+            p as i64
+        }
+    }
+}
+
 // ---- process ----------------------------------------------------------------------
 
 /// Command-line arguments after the program name.

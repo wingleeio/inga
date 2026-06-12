@@ -2770,6 +2770,12 @@ impl<'a> Cg<'a> {
                 self.pool_value(f, &out, &rcty);
                 out
             }
+            "readLine" if args.is_empty() => {
+                let out = self.tmp();
+                f.line(format!("{out} = call i64 @rt_read_line()"));
+                self.pool_value(f, &out, &CType::Option(Box::new(CType::Str)));
+                out
+            }
             "contains" | "startsWith" | "endsWith" if args.len() == 2 => {
                 let s = self.gen_expr(f, args[0]);
                 let n = self.gen_expr(f, args[1]);
@@ -5041,6 +5047,7 @@ declare i64 @rt_fs_exists(i64)
 declare i64 @rt_fs_list(i64)
 declare i64 @rt_fs_remove(i64)
 declare i64 @rt_fs_create_dir(i64)
+declare i64 @rt_read_line()
 declare i64 @rt_process_args()
 declare i64 @rt_process_cwd()
 declare void @rt_process_exit(i64)

@@ -1,5 +1,7 @@
 /target
 /editors/zed/target
+/editors/zed/extension.wasm
+/editors/zed/grammars/
 node_modules
 *.vsix
 .DS_Store

@@ -1,7 +1,7 @@
 id = "inga"
 name = "Inga"
 description = "Inga language support: tree-sitter syntax highlighting and the Inga language server"
-version = "0.1.0"
+version = "0.1.1"
 schema_version = 1
 authors = ["Wing <wing@anara.com>"]
 repository = "https://github.com/wingleeio/inga"
@@ -12,5 +12,5 @@ languages = ["Inga"]
 
 [grammars.inga]
 repository = "https://github.com/wingleeio/inga"
-rev = "dd951815ffc0aaa6ee2dd4dbd18cbff199bd99e7"
+rev = "31bf987b338133871d586828a779d07305c3722c"
 path = "tree-sitter-inga"

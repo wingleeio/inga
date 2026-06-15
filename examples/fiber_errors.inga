@@ -9,8 +9,8 @@
 
 use std/fiber
 
-struct Flaky    = { String url }
-struct Critical = { String why }
+struct Flaky    { String url }
+struct Critical { String why }
 
 fetch :: (String url, Bool up) -> String ! Flaky {
     if up {

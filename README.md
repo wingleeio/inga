@@ -11,9 +11,9 @@ types of the values a function can fail with.
 use std/json
 use std/schedule
 
-struct UserNotFound = { Int id }
-struct DbError      = { String cause }
-struct CacheMiss    = { String key }
+struct UserNotFound { Int id }
+struct DbError { String cause }
+struct CacheMiss { String key }
 
 // Fully annotated — but every annotation here is optional and inferred:
 getUserById :: (Int id) -> User ! UserNotFound uses Database, Cache, Logger {
@@ -57,7 +57,7 @@ dependency:
 
 ```inga
 main :: () {
-    provide consoleLogger, memoryCache, fakeDb {
+    provide ConsoleLogger, MemoryCache, FakeDb {
         user = getUserById(42) |> catch { UserNotFound -> User(0, "anonymous", "n/a") }
         println("fetched: ${user.name}")
     }
@@ -123,7 +123,7 @@ the compiler reminds you the same way it guards `main`. `join` is
 structural (a fiber, a tuple of fibers, or a list), `settle` turns the
 error channel into data (`Outcome` — match `Ok`/`Failed` per element), and
 `race`/`within` give deadlines. Services cross into fibers only when
-declared `shared service` (scalar-only state, checked at every impl);
+declared `shared service` (scalar-only state, checked at every provider);
 captured values are frozen so refcounts never race; an unjoined fiber is
 interrupted when its handle drops — no leaks, no daemons. Parallelism shows
 up in the row (`uses Fibers`), so a library that forks says so in its
@@ -186,31 +186,62 @@ match req.path {
 Try it, then curl localhost:8080/visit and localhost:8080/users/42:
 `inga run examples/server.inga`.
 
-And middleware is just functions — including middleware that **provides**.
-A callback type may carry a `uses` row; such callbacks get their
-capabilities at each call, so a `provide` around the call site reaches
-them:
+And middleware **is a provider**. Because a provider is a function that can
+fail and depend on other services, the auth layer is just a provider that
+authenticates a request and yields a `Session` — or raises a typed error.
+Authorization stacks on top (`WithAdmin uses Session`, so provide order
+matters). A route `provide`s the stack it needs; the handler just says what
+it `uses`. No handler piping, no lambda adapters, and the route block still
+has the request and any captured route params in scope:
 
 ```inga
-type Authed = (HttpRequest) -> HttpResponse uses Session
-
-withAuth :: (Authed inner) {
-    (req) -> {
-        provide loggedIn(authenticate(req))   // a parameterized impl: per-request state
-        inner(req)                            // the handler's `uses Session`, satisfied here
-    }
+provider WithSession :: (HttpRequest req) {
+    Session { user: authenticate(req.query) }   // `! AuthError` inferred, rides at the provide
 }
 
-main :: () {
-    app = dashboard |> withAuth |> withLogging   // main never provides Session
-    http.serve(8080, app)
+provider WithAdmin :: () {
+    Session session                       // provided just before — `uses Session` inferred
+    if session.user.id != adminId { fail ForbiddenError("admins only") }
+    Admin { user: session.user }
+}
+
+router = (HttpRequest req) -> {
+    match req.path {
+        "/" -> home(req)
+        "/profile" -> {
+            provide WithSession(req)
+            profile(req)                  // uses Session, satisfied for this route
+        }
+        "/admin" -> {
+            provide WithSession(req)
+            provide WithAdmin()           // stacks on the Session above
+            adminPanel(req)
+        }
+        _ -> HttpResponse(404, "not found")
+    }
 }
 ```
 
-Sessions live exactly as long as one request, setup failures are typed
-errors at the provide site, and `service Session { User user }` exposes
-the value directly (`session.user`, no getter). Try it:
-`inga run examples/middleware.inga`, then curl /dash?token=42.
+The providers raise typed errors, but the router stays pure routing — one
+edge middleware maps every domain error to a status code, so the error
+*type* decides the code (401 vs 403) regardless of which route or provider
+failed:
+
+```inga
+withErrors :: (Route inner) {           // Route = (HttpRequest) -> HttpResponse ! AuthError, ForbiddenError
+    (req) -> inner(req) |> catch {
+        AuthError(why)      -> HttpResponse(401, why)
+        ForbiddenError(why) -> HttpResponse(403, why)
+    }
+}
+
+http.serve(port, router |> withErrors |> withLogging)
+```
+
+Sessions live exactly as long as one request, and `service Session { User
+user }` exposes the value directly (`session.user`, no getter). Try it:
+`inga run examples/middleware.inga`, then curl '/profile?token=42' and
+'/admin?token=42' (403 — authed but not an admin).
 
 The disk works the same way: `std/fs` is the file system, `uses Fs` in a
 signature is how you know a function touches it, and failures raise
@@ -325,4 +356,4 @@ built-in test runner,
 formatter, LSP, editor tooling (`cargo test` covers all of it). Not yet: a
 package manager, the M:N fiber scheduler (fibers run thread-per-fiber
 today — same semantics, that's the point of the `Runtime` promise),
-per-implementation capability precision, resumable handlers.
+per-provider capability precision, resumable handlers.

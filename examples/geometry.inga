@@ -3,7 +3,7 @@
 
 pub enum Shape = Circle { Float radius } | Rect { Float w, Float h } | Dot
 
-pub struct TooBig = { Float area }
+pub struct TooBig { Float area }
 
 pub area :: (Shape s) -> Float {
     match s {

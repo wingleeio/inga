@@ -260,6 +260,12 @@ impl<'a> Parser<'a> {
                 d.is_shared = is_shared;
                 Some(Decl::Service(d))
             }
+            TokenKind::KwProvider => {
+                self.bump();
+                let mut d = self.parse_provider_decl();
+                d.is_pub = is_pub;
+                Some(Decl::Provider(d))
+            }
             // `maxRetries = 3` / `Int port = 8080` — top-level constants.
             TokenKind::Ident(name)
                 if !is_upper(&name) && self.nth(1).kind == TokenKind::Eq =>
@@ -309,11 +315,21 @@ impl<'a> Parser<'a> {
                     d.is_pub = is_pub;
                     Some(Decl::Func(d))
                 } else if self.at_ident() {
-                    let mut d = self.parse_impl_decl(name, name_span);
-                    d.is_pub = is_pub;
-                    Some(Decl::Impl(d))
+                    // The old `name :: Service { ... }` implementation form.
+                    let span = self.peek().span;
+                    let (service, _) = self.expect_ident("a service name");
+                    self.diagnostics.push(Diagnostic::error(
+                        span,
+                        format!("implementations are now providers: write `provider {name} :: () {{ {service} {{ … }} }}` (a provider is a function whose result constructs the service)"),
+                    ));
+                    // Consume the body so we don't cascade errors.
+                    self.skip_newlines();
+                    if self.at(&TokenKind::LBrace) {
+                        let _ = self.parse_block();
+                    }
+                    None
                 } else {
-                    self.error_here("expected `(` (function) or a service name (implementation) after `::`");
+                    self.error_here("expected `(` (function) after `::`, or declare a provider with `provider`");
                     None
                 }
             }
@@ -331,7 +347,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// After `struct`: `Name = { fields }`
+    /// After `struct`: `Name { fields }` (a legacy `=` before the brace is
+    /// still accepted).
     fn parse_struct_decl(&mut self) -> StructDecl {
         let start = self.prev_span();
         let (name, name_span) = self.expect_ident("a type name");
@@ -341,7 +358,9 @@ impl<'a> Parser<'a> {
                 format!("type names start with an uppercase letter: `{name}`"),
             ));
         }
-        self.expect(&TokenKind::Eq, "`=`");
+        if self.at(&TokenKind::Eq) {
+            self.bump();
+        }
         let mut fields = Vec::new();
         if self.expect(&TokenKind::LBrace, "`{`") {
             fields = self.parse_field_list();
@@ -504,61 +523,37 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_impl_decl(&mut self, name: String, name_span: Span) -> ImplDecl {
-        let (service, service_span) = self.expect_ident("a service name");
-        let mut params = Vec::new();
-        let mut fields = Vec::new();
-        let mut methods = Vec::new();
-        if self.expect(&TokenKind::LBrace, "`{`") {
-            loop {
-                self.skip_newlines();
-                if self.at(&TokenKind::RBrace) || self.at(&TokenKind::Eof) {
-                    break;
-                }
-                // `Type name` with no `=` is a parameter field, supplied by
-                // `provide name(args…)`.
-                let is_param = matches!(&self.peek().kind, TokenKind::Ident(n) if is_upper(n))
-                    || matches!(self.peek().kind, TokenKind::LBracket);
-                if is_param {
-                    let Some(ty) = self.try_parse_type() else {
-                        self.error_here("expected a type for the parameter field");
-                        break;
-                    };
-                    let (p_name, p_span) = self.expect_ident("a parameter name");
-                    if p_name == "<error>" {
-                        break;
-                    }
-                    params.push(Field { ty: Some(ty), name: p_name, span: p_span });
-                    continue;
-                }
-                let (item_name, item_span) = self.expect_ident("a field or method");
-                if item_name == "<error>" {
-                    break;
-                }
-                if self.at(&TokenKind::Eq) {
-                    self.bump();
-                    let value = self.parse_expr();
-                    fields.push((item_name, item_span, value));
-                } else if self.at(&TokenKind::ColonColon) {
-                    self.bump();
-                    methods.push(self.parse_func_decl(item_name, item_span));
-                } else {
-                    self.error_here("expected `=` (field), `::` (method), or `Type name` (parameter)");
-                    break;
-                }
-            }
-            self.expect(&TokenKind::RBrace, "`}`");
+    /// `provider Name :: (params) [! Errs] [uses Deps] { body }`. The body is
+    /// a function body whose result constructs the service it provides
+    /// (`Session { … }`); the service, rows, and return are all inferred.
+    fn parse_provider_decl(&mut self) -> ProviderDecl {
+        let start = self.prev_span();
+        let (name, name_span) = self.expect_ident("a provider name");
+        self.expect(&TokenKind::ColonColon, "`::`");
+        let sig = self.parse_sig();
+        if let Some(ret) = &sig.ret {
+            self.diagnostics.push(Diagnostic::error(
+                ret.span(),
+                "a provider has no return type — its result is the service it constructs in the body (`Session { … }`)",
+            ));
         }
-        ImplDecl {
+        self.skip_newlines();
+        let body = if self.at(&TokenKind::LBrace) {
+            self.parse_block()
+        } else {
+            self.error_here("expected `{` to start the provider body");
+            Block { stmts: Vec::new(), span: self.peek().span }
+        };
+        // The service is inferred from the body's trailing construction.
+        ProviderDecl {
             is_pub: false,
             name,
             name_span,
-            service,
-            service_span,
-            params,
-            fields,
-            methods,
-            span: name_span.to(self.prev_span()),
+            service: String::new(),
+            service_span: name_span,
+            sig,
+            body,
+            span: start.to(self.prev_span()),
         }
     }
 

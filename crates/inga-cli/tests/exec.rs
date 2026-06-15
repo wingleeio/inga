@@ -159,7 +159,7 @@ main :: () {
 #[test]
 fn fail_and_catch() {
     let out = run(r#"
-struct Boom = { String why }
+struct Boom { String why }
 
 risky :: (Bool go) {
     if go {
@@ -180,7 +180,7 @@ main :: () {
 #[test]
 fn catch_all_with_binding() {
     let out = run(r#"
-struct Boom = { Int code }
+struct Boom { Int code }
 
 main :: () {
     n = { fail Boom(7) } |> catch { e -> e.code }
@@ -193,7 +193,7 @@ main :: () {
 #[test]
 fn or_fail_converts_none() {
     let out = run(r#"
-struct Missing = { String key }
+struct Missing { String key }
 
 lookup :: (String key) {
     None |> orFail(Missing(key))
@@ -300,9 +300,9 @@ service Greeter {
     greet :: (String name) -> String
 }
 
-shouty :: Greeter {
-    greet :: (name) {
-        "HELLO ${name}"
+provider Shouty :: () {
+    Greeter {
+        greet: (name) -> "HELLO ${name}"
     }
 }
 
@@ -312,7 +312,7 @@ welcome :: (name) {
 }
 
 main :: () {
-    provide shouty {
+    provide Shouty {
         println(welcome("wing"))
     }
 }
@@ -327,21 +327,23 @@ service Store {
     bump :: () -> Int
 }
 
-counter :: Store {
+provider Counter :: () {
     state = MutMap()
 
-    bump :: () {
-        n = state.get("n") |> getOrElse(0)
-        state.set("n", n + 1)
-        n
+    Store {
+        bump: () -> {
+            n = state.get("n") |> getOrElse(0)
+            state.set("n", n + 1)
+            n
+        }
     }
 }
 
 main :: () {
-    provide counter {
+    provide Counter {
         Store s
         println(s.bump(), s.bump())
-        provide counter {
+        provide Counter {
             Store fresh
             println(fresh.bump())
         }
@@ -358,19 +360,21 @@ fn retry_reevaluates_until_success() {
     let out = run(r#"
 use std/schedule
 
-struct Flaky = { Int n }
+struct Flaky { Int n }
 
 service Counter {
     next :: () -> Int
 }
 
-mem :: Counter {
+provider Mem :: () {
     state = MutMap()
 
-    next :: () {
-        n = state.get("n") |> getOrElse(0)
-        state.set("n", n + 1)
-        n
+    Counter {
+        next: () -> {
+            n = state.get("n") |> getOrElse(0)
+            state.set("n", n + 1)
+            n
+        }
     }
 }
 
@@ -384,7 +388,7 @@ attempt :: () {
 }
 
 main :: () {
-    provide mem {
+    provide Mem {
         // retry does not clear the error row — a retried action can still
         // fail — so main still has to catch.
         n = attempt()
@@ -400,7 +404,7 @@ main :: () {
 #[test]
 fn ignore_failure_swallows_errors() {
     let out = run(r#"
-struct Boom = { Int x }
+struct Boom { Int x }
 
 main :: () {
     { fail Boom(1) } |> ignoreFailure
@@ -413,7 +417,7 @@ main :: () {
 #[test]
 fn lazy_params_defer_evaluation() {
     let out = run(r#"
-struct Boom = { Int x }
+struct Boom { Int x }
 
 pick :: (Bool first, lazy Int a, lazy Int b) -> Int {
     if first {
@@ -454,7 +458,7 @@ fn encode_decode_roundtrip() {
     let out = run(r#"
 use std/json
 
-struct User = { Int id, String name }
+struct User { Int id, String name }
 
 main :: () {
     raw = json.encode(User(7, "Ada"))
@@ -488,7 +492,7 @@ fn read_line_consumes_stdin_until_eof() {
 #[test]
 fn mutlist_push_pop_get_set() {
     let out = run(r#"
-struct Node = { Int key, String label }
+struct Node { Int key, String label }
 
 main :: () {
     xs = MutList()
@@ -538,7 +542,7 @@ main :: () {
 #[test]
 fn sort_and_sort_by() {
     let out = run(r#"
-struct Card = { String name, Int rank }
+struct Card { String name, Int rank }
 
 main :: () {
     println(sort([3, 1, 2]), sort([2.5, 1.5]), sort(["pear", "apple"]))
@@ -669,7 +673,7 @@ fn http_serve_handler_failure_is_500_and_reraises() {
 use std/fiber
 use std/http
 
-struct Boom = { String why }
+struct Boom { String why }
 
 handle :: (HttpRequest req) -> HttpResponse ! Boom {
     fail Boom("handler exploded")
@@ -766,7 +770,7 @@ fn decode_failure_is_typed() {
     let out = run(r#"
 use std/json
 
-struct User = { Int id, String name }
+struct User { Int id, String name }
 
 main :: () {
     user = json.decode("not json", User) |> catch { DecodeError(msg) -> User(-1, "bad") }
@@ -788,25 +792,25 @@ service Db {
     get :: () -> String
 }
 
-quiet :: Logger {
-    log :: (m) {
-        println("[q] ${m}")
+provider Quiet :: () {
+    Logger {
+        log: (m) -> println("[q] ${m}")
     }
 }
 
-db :: Db {
+provider RealDb :: () {
     banner = {
         Logger logger
         logger.log("connect")
         "up"
     }
-    get :: () {
-        banner
+    Db {
+        get: () -> banner
     }
 }
 
 main :: () {
-    provide quiet, db
+    provide Quiet, RealDb
     Db d
     println(d.get())
 }
@@ -865,7 +869,7 @@ main :: () {
 #[test]
 fn function_types_annotate_callbacks() {
     let out = run(r#"
-struct Boom = { Int code }
+struct Boom { Int code }
 
 twice :: ((Int) -> Int f, Int x) -> Int {
     f(f(x))
@@ -968,7 +972,7 @@ main :: () {
 #[test]
 fn record_update_copies_and_overrides() {
     let out = run(r#"
-struct User = { Int id, String name, Int score }
+struct User { Int id, String name, Int score }
 
 main :: () {
     u = User(7, "Ada", 10)
@@ -982,7 +986,7 @@ main :: () {
 #[test]
 fn named_field_construction() {
     let out = run(r#"
-struct Pokemon = { Int id, String name, Bool shiny }
+struct Pokemon { Int id, String name, Bool shiny }
 
 main :: () {
     p = Pokemon {
@@ -1002,7 +1006,7 @@ main :: () {
 #[test]
 fn named_field_construction_is_checked() {
     let errs = check_errors(
-        "struct Pokemon = { Int id, String name, Bool shiny }\n\nmain :: () {\n    p = Pokemon { id: 1 }\n    q = Pokemon { id: 2, id: 3, name: \"x\", shiny: false, level: 9 }\n    println(p.name, q.name)\n}\n",
+        "struct Pokemon { Int id, String name, Bool shiny }\n\nmain :: () {\n    p = Pokemon { id: 1 }\n    q = Pokemon { id: 2, id: 3, name: \"x\", shiny: false, level: 9 }\n    println(p.name, q.name)\n}\n",
     );
     assert!(errs.iter().any(|e| e.contains("missing fields `name`, `shiny`")), "{errs:?}");
     assert!(errs.iter().any(|e| e.contains("field `id` is given twice")), "{errs:?}");
@@ -1012,14 +1016,14 @@ fn named_field_construction_is_checked() {
 #[test]
 fn type_aliases_resolve_everywhere() {
     let out = run(r#"
-struct User = { Int id, String name }
+struct User { Int id, String name }
 
 service Session {
     User user
 }
 
-loggedIn :: Session {
-    User user
+provider LoggedIn :: (User user) {
+    Session { user: user }
 }
 
 type Handler = (String) -> String uses Session
@@ -1032,7 +1036,7 @@ dashboard :: (String path) -> String uses Session {
 
 withAuth :: (Handler inner) {
     (req) -> {
-        provide loggedIn(User { id: 1, name: "wing" })
+        provide LoggedIn(User { id: 1, name: "wing" })
         inner(req)
     }
 }
@@ -1062,14 +1066,14 @@ fn type_alias_cycles_error() {
 fn inline_middleware_in_match_arms() {
     // `(handler |> middleware)(req)` — wrap and call in one expression.
     let out = run(r#"
-struct User = { Int id, String name }
+struct User { Int id, String name }
 
 service Session {
     User user
 }
 
-loggedIn :: Session {
-    User user
+provider LoggedIn :: (User user) {
+    Session { user: user }
 }
 
 type Authed = (String) -> String uses Session
@@ -1083,7 +1087,7 @@ withAuth :: (Authed inner) {
     (q) -> {
         match q {
             "token=${Int id}" -> {
-                provide loggedIn(User { id: id, name: "user-${id}" })
+                provide LoggedIn(User { id: id, name: "user-${id}" })
                 inner(q)
             }
             other -> "401"
@@ -1109,14 +1113,14 @@ fn route_params_flow_through_middleware() {
     // The arm's capture flows into the handler via a lambda adapter that
     // closes over it — the lambda is itself the contracted handler.
     let out = run(r#"
-struct User = { Int id, String name }
+struct User { Int id, String name }
 
 service Session {
     User user
 }
 
-loggedIn :: Session {
-    User user
+provider LoggedIn :: (User user) {
+    Session { user: user }
 }
 
 type Authed = (String) -> String uses Session
@@ -1130,7 +1134,7 @@ withAuth :: (Authed inner) {
     (q) -> {
         match q {
             "${String path}?token=${Int who}" -> {
-                provide loggedIn(User { id: who, name: "user-${who}" })
+                provide LoggedIn(User { id: who, name: "user-${who}" })
                 inner(path)
             }
             other -> "401"
@@ -1158,14 +1162,14 @@ fn route_level_middleware() {
     // Each route picks its own middleware stack; auth only where needed,
     // and the auth middleware provides the Session per call.
     let out = run(r#"
-struct User = { Int id, String name }
+struct User { Int id, String name }
 
 service Session {
     User user
 }
 
-loggedIn :: Session {
-    User user
+provider LoggedIn :: (User user) {
+    Session { user: user }
 }
 
 type Authed = (String) -> String uses Session
@@ -1184,7 +1188,7 @@ withAuth :: (Authed inner) {
     (q) -> {
         match q {
             "token=${Int id}" -> {
-                provide loggedIn(User { id: id, name: "user-${id}" })
+                provide LoggedIn(User { id: id, name: "user-${id}" })
                 inner(q)
             }
             other -> "401"
@@ -1223,14 +1227,14 @@ fn provide_reaches_contracted_callbacks() {
     // (inside another function, inside a lambda) reaches it. main never
     // provides Session.
     let out = run(r#"
-struct User = { Int id, String name }
+struct User { Int id, String name }
 
 service Session {
     User user
 }
 
-loggedIn :: Session {
-    User user
+provider LoggedIn :: (User user) {
+    Session { user: user }
 }
 
 dashboard :: (String path) -> String uses Session {
@@ -1242,7 +1246,7 @@ withAuth :: (((String) -> String uses Session) inner) {
     (req) -> {
         match req {
             "${String path}?u=${String name}" -> {
-                provide loggedIn(User { id: 1, name: name })
+                provide LoggedIn(User { id: 1, name: name })
                 inner(path)
             }
             other -> "401"
@@ -1268,21 +1272,21 @@ service Greeter {
     hello :: () -> String
 }
 
-en :: Greeter {
-    hello :: () {
-        "hello"
+provider En :: () {
+    Greeter {
+        hello: () -> "hello"
     }
 }
 
-fr :: Greeter {
-    hello :: () {
-        "bonjour"
+provider Fr :: () {
+    Greeter {
+        hello: () -> "bonjour"
     }
 }
 
 twice :: ((() -> String uses Greeter) f) -> String {
-    a = { provide en; f() }
-    b = { provide fr; f() }
+    a = { provide En; f() }
+    b = { provide Fr; f() }
     "${a} / ${b}"
 }
 
@@ -1299,20 +1303,20 @@ main :: () {
 #[test]
 fn parameterized_impls_provide_args() {
     let out = run(r#"
-struct User = { Int id, String name }
-struct AuthError = { String why }
+struct User { Int id, String name }
+struct AuthError { String why }
 
 service Session {
     User user
     greeting :: () -> String
 }
 
-loggedIn :: Session {
-    User user
+provider LoggedIn :: (User user) {
     banner = "hi, ${user.name}"
 
-    greeting :: () {
-        banner
+    Session {
+        user: user
+        greeting: () -> banner
     }
 }
 
@@ -1329,7 +1333,7 @@ dashboard :: () -> String uses Session {
 }
 
 serveOne :: (String token) -> String ! AuthError {
-    provide loggedIn(authenticate(token))
+    provide LoggedIn(authenticate(token))
     dashboard()
 }
 
@@ -1344,7 +1348,7 @@ main :: () {
 #[test]
 fn provide_args_are_checked() {
     let errs = check_errors(
-        "service Tagger {\n    label :: () -> String\n}\n\ntagged :: Tagger {\n    String tag\n\n    label :: () {\n        tag\n    }\n}\n\nmain :: () {\n    provide tagged\n    Tagger t\n    println(t.label())\n}\n",
+        "service Tagger {\n    label :: () -> String\n}\n\nprovider Tagged :: (String tag) {\n    Tagger {\n        label: () -> tag\n    }\n}\n\nmain :: () {\n    provide Tagged\n    Tagger t\n    println(t.label())\n}\n",
     );
     assert!(
         errs.iter().any(|e| e.contains("takes (String tag) in `provide`")),
@@ -1355,7 +1359,7 @@ fn provide_args_are_checked() {
 #[test]
 fn service_value_members() {
     let out = run(r#"
-struct User = { Int id, String name }
+struct User { Int id, String name }
 
 service Session {
     User user
@@ -1363,13 +1367,14 @@ service Session {
     label :: () -> String
 }
 
-demoSession :: Session {
+provider DemoSession :: () {
     user = User { id: 7, name: "wing" }
-    startedAt = 1000
     secret = "private"
 
-    label :: () {
-        "${user.name}/${secret}"
+    Session {
+        user: user
+        startedAt: 1000
+        label: () -> "${user.name}/${secret}"
     }
 }
 
@@ -1379,7 +1384,7 @@ whoami :: () -> String uses Session {
 }
 
 main :: () {
-    provide demoSession
+    provide DemoSession
     println(whoami())
     Session s
     println(s.label())
@@ -1391,14 +1396,14 @@ main :: () {
 #[test]
 fn service_values_are_checked() {
     let errs = check_errors(
-        "service Session {\n    Int startedAt\n}\n\nbadSession :: Session {\n    other = 5\n}\n\nmain :: () {\n    provide badSession\n    Session s\n    println(s.other)\n}\n",
+        "service Session {\n    Int startedAt\n}\n\nprovider BadSession :: () {\n    Session { other: 5 }\n}\n\nmain :: () {\n    provide BadSession\n    Session s\n    println(s.startedAt)\n}\n",
     );
     assert!(
-        errs.iter().any(|e| e.contains("must define the value member `startedAt`")),
+        errs.iter().any(|e| e.contains("missing member `startedAt`")),
         "{errs:?}"
     );
     assert!(
-        errs.iter().any(|e| e.contains("no value member `other`")),
+        errs.iter().any(|e| e.contains("no member `other`")),
         "{errs:?}"
     );
 }
@@ -1496,7 +1501,7 @@ fn match_on_bare_variant_is_not_a_record_literal() {
 #[test]
 fn arena_scopes_copy_their_value_out() {
     let out = run(
-        "struct Stats = { Int count, [Int] kept }\n\nsummarize :: ([Int] xs) -> Stats {\n    provide Arena(64.kb)\n    evens = filter(xs, (x) -> x % 2 == 0)\n    Stats(len(evens), evens)\n}\n\nmain :: () {\n    println(summarize(range(6)))\n}\n",
+        "struct Stats { Int count, [Int] kept }\n\nsummarize :: ([Int] xs) -> Stats {\n    provide Arena(64.kb)\n    evens = filter(xs, (x) -> x % 2 == 0)\n    Stats(len(evens), evens)\n}\n\nmain :: () {\n    println(summarize(range(6)))\n}\n",
     );
     assert_eq!(out, "Stats(count: 3, kept: [0, 2, 4])\n");
 }
@@ -1516,13 +1521,13 @@ fn asserts_fail_with_assert_failed() {
 fn mutmap_and_task_have_surface_types() {
     // The forms hover renders are writable: MutMap<K, V> and Task<T>.
     let out = run(
-        "use std/fiber\n\nservice Stats {\n    counts :: () -> MutMap<String, Int>\n}\n\nmemStats :: Stats {\n    m = MutMap()\n\n    counts :: () {\n        m\n    }\n}\n\nbump :: (String k) -> Int uses Stats {\n    Stats stats\n    n = stats.counts().get(k) |> getOrElse(0)\n    stats.counts().set(k, n + 1)\n    n + 1\n}\n\nslowDouble :: (Int n) -> Int {\n    n * 2\n}\n\nstartDouble :: (Int n) -> Fiber<Int> uses Fibers {\n    slowDouble(n) |> fiber.fork\n}\n\nmain :: () {\n    provide Runtime(1), memStats\n    bump(\"a\")\n    println(bump(\"a\"), fiber.join(startDouble(21)))\n}\n",
+        "use std/fiber\n\nservice Stats {\n    counts :: () -> MutMap<String, Int>\n}\n\nprovider MemStats :: () {\n    m = MutMap()\n\n    Stats {\n        counts: () -> m\n    }\n}\n\nbump :: (String k) -> Int uses Stats {\n    Stats stats\n    n = stats.counts().get(k) |> getOrElse(0)\n    stats.counts().set(k, n + 1)\n    n + 1\n}\n\nslowDouble :: (Int n) -> Int {\n    n * 2\n}\n\nstartDouble :: (Int n) -> Fiber<Int> uses Fibers {\n    slowDouble(n) |> fiber.fork\n}\n\nmain :: () {\n    provide Runtime(1), MemStats\n    bump(\"a\")\n    println(bump(\"a\"), fiber.join(startDouble(21)))\n}\n",
     );
     assert_eq!(out, "2 42\n");
 
     // Other names take no type arguments.
     let errs = check_errors(
-        "struct User = { Int id }\n\nf :: (User<Int> u) -> Int {\n    1\n}\n\nmain :: () {\n    println(f(User(1)))\n}\n",
+        "struct User { Int id }\n\nf :: (User<Int> u) -> Int {\n    1\n}\n\nmain :: () {\n    println(f(User(1)))\n}\n",
     );
     assert!(
         errs.iter().any(|m| m.contains("does not take type arguments")),
@@ -1595,13 +1600,13 @@ fn fibers_fork_join_round_trip() {
 #[test]
 fn fiber_errors_reraise_at_join() {
     let out = run(
-        "use std/fiber\n\nstruct Boom = { Int n }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(7)\n}\n\nmain :: () {\n    provide Runtime(1)\n    t = risky() |> fiber.fork\n    println(fiber.join(t) |> catch { Boom(n) -> n * 10 })\n}\n",
+        "use std/fiber\n\nstruct Boom { Int n }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(7)\n}\n\nmain :: () {\n    provide Runtime(1)\n    t = risky() |> fiber.fork\n    println(fiber.join(t) |> catch { Boom(n) -> n * 10 })\n}\n",
     );
     assert_eq!(out, "70\n");
 
     // Left unhandled, the row reaches main like any other error.
     let errs = check_errors(
-        "use std/fiber\n\nstruct Boom = { Int n }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(1)\n}\n\nmain :: () {\n    provide Runtime(1)\n    println(fiber.join(risky() |> fiber.fork))\n}\n",
+        "use std/fiber\n\nstruct Boom { Int n }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(1)\n}\n\nmain :: () {\n    provide Runtime(1)\n    println(fiber.join(risky() |> fiber.fork))\n}\n",
     );
     assert!(
         errs.iter().any(|m| m.contains("`main` does not handle the error `Boom`")),
@@ -1626,13 +1631,13 @@ fn structural_join_tuples_and_lists() {
 #[test]
 fn settle_outcome_and_partition() {
     let out = run(
-        "use std/fiber\n\nstruct TooBig = { Int n }\n\ncheck :: (Int n) -> Int ! TooBig {\n    if n > 10 {\n        fail TooBig(n)\n    }\n    n * 2\n}\n\nmain :: () {\n    provide Runtime(1)\n    outcomes = map([1, 50, 3], (n) -> check(n) |> fiber.settle)\n    parts = fiber.partition(outcomes)\n    println(len(parts.0), len(parts.1))\n    map(outcomes, (o) -> match o {\n        Ok(v) -> println(\"ok\", v)\n        Failed(TooBig(n)) -> println(\"big\", n)\n    })\n    println(check(4) |> fiber.settle |> fiber.unsettle |> catch { TooBig -> -1 })\n}\n",
+        "use std/fiber\n\nstruct TooBig { Int n }\n\ncheck :: (Int n) -> Int ! TooBig {\n    if n > 10 {\n        fail TooBig(n)\n    }\n    n * 2\n}\n\nmain :: () {\n    provide Runtime(1)\n    outcomes = map([1, 50, 3], (n) -> check(n) |> fiber.settle)\n    parts = fiber.partition(outcomes)\n    println(len(parts.0), len(parts.1))\n    map(outcomes, (o) -> match o {\n        Ok(v) -> println(\"ok\", v)\n        Failed(TooBig(n)) -> println(\"big\", n)\n    })\n    println(check(4) |> fiber.settle |> fiber.unsettle |> catch { TooBig -> -1 })\n}\n",
     );
     assert_eq!(out, "2 1\nok 2\nbig 50\nok 6\n8\n");
 
     // settle is row-free: no Runtime needed for sequential batches.
     let out = run(
-        "use std/fiber\n\nstruct Nope = { Int n }\n\nf :: (Int n) -> Int ! Nope {\n    if n < 0 {\n        fail Nope(n)\n    }\n    n\n}\n\nmain :: () {\n    o = f(-1) |> fiber.settle\n    match o {\n        Ok(v) -> println(v)\n        Failed(Nope(n)) -> println(\"nope\", n)\n    }\n}\n",
+        "use std/fiber\n\nstruct Nope { Int n }\n\nf :: (Int n) -> Int ! Nope {\n    if n < 0 {\n        fail Nope(n)\n    }\n    n\n}\n\nmain :: () {\n    o = f(-1) |> fiber.settle\n    match o {\n        Ok(v) -> println(v)\n        Failed(Nope(n)) -> println(\"nope\", n)\n    }\n}\n",
     );
     assert_eq!(out, "nope -1\n");
 }
@@ -1648,22 +1653,23 @@ fn parmap_race_and_within() {
 #[test]
 fn shared_services_cross_fibers() {
     let out = run(
-        "use std/fiber\n\nshared service Adder {\n    add :: (Int a, Int b) -> Int\n}\n\nplainAdder :: Adder {\n    add :: (a, b) {\n        a + b\n    }\n}\n\ndouble :: (Int n) -> Int uses Adder {\n    Adder adder\n    adder.add(n, n)\n}\n\nmain :: () {\n    provide Runtime(2), plainAdder\n    println(fiber.join(double(21) |> fiber.fork))\n}\n",
+        "use std/fiber\n\nshared service Adder {\n    add :: (Int a, Int b) -> Int\n}\n\nprovider PlainAdder :: () {\n    Adder {\n        add: (a, b) -> a + b\n    }\n}\n\ndouble :: (Int n) -> Int uses Adder {\n    Adder adder\n    adder.add(n, n)\n}\n\nmain :: () {\n    provide Runtime(2), PlainAdder\n    println(fiber.join(double(21) |> fiber.fork))\n}\n",
     );
     assert_eq!(out, "42\n");
 
     // Unshared services are rejected with guidance...
     let errs = check_errors(
-        "use std/fiber\n\nservice Store {\n    put :: (Int k, Int v)\n}\n\nmemStore :: Store {\n    m = MutMap()\n\n    put :: (k, v) {\n        m.set(k, v)\n    }\n}\n\nuseStore :: () uses Store {\n    Store store\n    store.put(1, 2)\n}\n\nmain :: () {\n    provide Runtime(1), memStore\n    fiber.join(useStore() |> fiber.fork)\n}\n",
+        "use std/fiber\n\nservice Store {\n    put :: (Int k, Int v)\n}\n\nprovider MemStore :: () {\n    m = MutMap()\n\n    Store {\n        put: (k, v) -> m.set(k, v)\n    }\n}\n\nuseStore :: () uses Store {\n    Store store\n    store.put(1, 2)\n}\n\nmain :: () {\n    provide Runtime(1), MemStore\n    fiber.join(useStore() |> fiber.fork)\n}\n",
     );
     assert!(errs.iter().any(|m| m.contains("only `shared` services")), "got: {errs:?}");
 
-    // ...and a shared declaration is enforced at every impl.
+    // ...and a `shared` service may carry only scalar value members.
     let errs = check_errors(
-        "shared service Store {\n    put :: (Int k, Int v)\n}\n\nmemStore :: Store {\n    m = MutMap()\n\n    put :: (k, v) {\n        m.set(k, v)\n    }\n}\n\nmain :: () {\n    provide memStore\n    Store store\n    store.put(1, 1)\n}\n",
+        "shared service Store {\n    MutMap<Int, Int> m\n    put :: (Int k, Int v)\n}\n\nprovider MemStore :: () {\n    store = MutMap()\n\n    Store {\n        m: store\n        put: (k, v) -> store.set(k, v)\n    }\n}\n\nmain :: () {\n    provide MemStore\n    Store s\n    s.put(1, 1)\n}\n",
     );
     assert!(
-        errs.iter().any(|m| m.contains("shared services may carry only scalar state")),
+        errs.iter().any(|m| m.contains("shared service `Store`")
+            && m.contains("may carry only scalar value members")),
         "got: {errs:?}"
     );
 }
@@ -1671,7 +1677,7 @@ fn shared_services_cross_fibers() {
 #[test]
 fn catch_after_fork_is_guided() {
     let errs = check_errors(
-        "use std/fiber\n\nstruct Boom = { Int n }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(1)\n}\n\nmain :: () {\n    provide Runtime(1)\n    t = risky() |> fiber.fork |> catch { Boom -> 0 }\n    fiber.join(t) |> catch { Boom -> -1 }\n}\n",
+        "use std/fiber\n\nstruct Boom { Int n }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(1)\n}\n\nmain :: () {\n    provide Runtime(1)\n    t = risky() |> fiber.fork |> catch { Boom -> 0 }\n    fiber.join(t) |> catch { Boom -> -1 }\n}\n",
     );
     assert!(
         errs.iter().any(|m| m.contains("surface at `fiber.join`")),
@@ -1682,13 +1688,13 @@ fn catch_after_fork_is_guided() {
 #[test]
 fn tap_and_tap_error_observe_without_transforming() {
     let out = run(
-        "struct Boom = { Int code }\n\nrisky :: (Int n) -> Int ! Boom {\n    if n > 10 {\n        fail Boom(n)\n    }\n    n * 2\n}\n\nmain :: () {\n    total = [1, 2, 3]\n        |> tap((xs) -> println(\"saw\", len(xs)))\n        |> fold(0, (a, b) -> a + b)\n    println(total)\n    ok = risky(3) |> tapError((e) -> println(\"failed\", e.code)) |> catch { Boom -> -1 }\n    bad = risky(99) |> tapError((e) -> println(\"failed\", e.code)) |> catch { Boom(c) -> c }\n    println(ok, bad)\n}\n",
+        "struct Boom { Int code }\n\nrisky :: (Int n) -> Int ! Boom {\n    if n > 10 {\n        fail Boom(n)\n    }\n    n * 2\n}\n\nmain :: () {\n    total = [1, 2, 3]\n        |> tap((xs) -> println(\"saw\", len(xs)))\n        |> fold(0, (a, b) -> a + b)\n    println(total)\n    ok = risky(3) |> tapError((e) -> println(\"failed\", e.code)) |> catch { Boom -> -1 }\n    bad = risky(99) |> tapError((e) -> println(\"failed\", e.code)) |> catch { Boom(c) -> c }\n    println(ok, bad)\n}\n",
     );
     assert_eq!(out, "saw 3\n6\nfailed 99\n6 99\n");
 
     // The row is preserved: tapError alone does not satisfy main.
     let errs = check_errors(
-        "struct Boom = { Int code }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(1)\n}\n\nmain :: () {\n    println(risky() |> tapError((e) -> println(e.code)))\n}\n",
+        "struct Boom { Int code }\n\nrisky :: () -> Int ! Boom {\n    fail Boom(1)\n}\n\nmain :: () {\n    println(risky() |> tapError((e) -> println(e.code)))\n}\n",
     );
     assert!(
         errs.iter().any(|m| m.contains("`main` does not handle the error `Boom`")),
@@ -1777,13 +1783,13 @@ fn http_get_post_status_and_streaming() {
 #[test]
 fn then_transforms_the_value_mid_pipe() {
     let out = run(
-        "struct User = { Int id, String name }\nstruct LookupError = { Int id }\n\nfindUser :: (Int id) -> User ! LookupError {\n    if id > 100 {\n        fail LookupError(id)\n    }\n    User(id, \"user-${id}\")\n}\n\nmain :: () {\n    greeting = findUser(7)\n        |> then((u) -> u.name)\n        |> tap((n) -> println(\"saw:\", n))\n        |> then((n) -> \"hello, ${n}!\")\n        |> catch { LookupError(id) -> \"no user ${id}\" }\n    println(greeting)\n    missing = findUser(999)\n        |> then((u) -> u.name)\n        |> catch { LookupError(id) -> \"no user ${id}\" }\n    println(missing)\n    println(21 |> then((n) -> n * 2))\n}\n",
+        "struct User { Int id, String name }\nstruct LookupError { Int id }\n\nfindUser :: (Int id) -> User ! LookupError {\n    if id > 100 {\n        fail LookupError(id)\n    }\n    User(id, \"user-${id}\")\n}\n\nmain :: () {\n    greeting = findUser(7)\n        |> then((u) -> u.name)\n        |> tap((n) -> println(\"saw:\", n))\n        |> then((n) -> \"hello, ${n}!\")\n        |> catch { LookupError(id) -> \"no user ${id}\" }\n    println(greeting)\n    missing = findUser(999)\n        |> then((u) -> u.name)\n        |> catch { LookupError(id) -> \"no user ${id}\" }\n    println(missing)\n    println(21 |> then((n) -> n * 2))\n}\n",
     );
     assert_eq!(out, "saw: user-7\nhello, user-7!\nno user 999\n42\n");
 
     // The function's own rows merge like any call.
     let errs = check_errors(
-        "struct ParseError = { String s }\n\nmain :: () {\n    println(\"x\" |> then((s) -> {\n        fail ParseError(s)\n        1\n    }))\n}\n",
+        "struct ParseError { String s }\n\nmain :: () {\n    println(\"x\" |> then((s) -> {\n        fail ParseError(s)\n        1\n    }))\n}\n",
     );
     assert!(
         errs.iter().any(|m| m.contains("`main` does not handle the error `ParseError`")),

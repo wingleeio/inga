@@ -9,7 +9,7 @@ style instead of wrapper values. You write ordinary code; the compiler tracks
 what can fail and what it needs.
 
 ```inga
-struct UserNotFound = { Int id }
+struct UserNotFound { Int id }
 
 getUserById :: (Int id) -> User ! UserNotFound uses Database, Cache, Logger {
     match cached(id) {
@@ -56,8 +56,8 @@ expression to its left and *subtracts* the handled error names from the row.
 ## 2. Declarations
 
 ```inga
-struct CacheMiss = { String key }            // a struct (fields optional, types optional)
-struct User      = { Int id, String name }
+struct CacheMiss { String key }            // a struct (fields optional, types optional)
+struct User { Int id, String name }
 enum   Shape     = Circle { Float radius }   // a sum type: variants separated by `|`,
        | Rect { Float w, Float h } | Dot     //   each with optional struct-style fields
 service Cache {                              // a capability interface
@@ -67,11 +67,13 @@ service Cache {                              // a capability interface
     get :: (String key) -> String ! CacheMiss
     set :: (String key, String value, Duration ttl)
 }
-memoryCache :: Cache {                       // an implementation
-    defaultTtl = 5.minutes                   //   satisfies the declared value member
-    store = MutMap()                         //   private instance state (not in the service)
-    get :: (key) { store.get(key) |> orFail(CacheMiss(key)) }
-    set :: (key, value, ttl) { store.set(key, value) }
+provider MemoryCache :: () {                 // a provider: a function whose
+    store = MutMap()                         //   result *constructs* a Cache;
+    Cache {                                  //   `store` is captured by the methods
+        defaultTtl: 5.minutes
+        get: (key) -> store.get(key) |> orFail(CacheMiss(key))
+        set: (key, value, ttl) -> store.set(key, value)
+    }
 }
 fetchAndCache :: (id) { ... }                // a function
 maxRetries = 3                               // a constant (also `Int port = 8080`)
@@ -81,11 +83,27 @@ type Handler = (Int) -> String uses Cache    // a transparent type alias
 - Type-before-name everywhere: `(String id)` in parameters, `{ Int id }` in
   fields, `Cache cache` for capability bindings, `String msg` in patterns.
   Omitted types are inferred.
-- **Service value members**: a service may declare typed values
-  (`Duration defaultTtl`) alongside methods — read them as
-  `cache.defaultTtl`, no getter needed. Every impl must define a field of
-  that name at that type; impl fields *not* declared by the service stay
-  private instance state. The service declaration is the public interface.
+- **A service is a record.** It declares typed value members
+  (`Duration defaultTtl`, `MutMap<Int, Card> deck`) read directly as
+  `cache.defaultTtl` / `game.deck` (no getters), and method members
+  (`get :: …`) which are *function-valued* fields. A method member may carry
+  its own **call-time `uses` row** on the interface — `query :: (Int) -> Row
+  ! DbError uses Logger` — and calling it then requires those services (the
+  caller inherits them). A provider **constructs** the record (value members
+  get data, methods get a lambda); each method lambda may bind its declared
+  call-time caps in its body *and* capture the provider's own instances (a
+  connection it opened, the fiber runtime). Those two capability sets are
+  distinct: the **provider's** construction deps are captured and ride at the
+  provide site; the **method's** declared deps ride at each call. A method
+  may *only* use services it declares or the provider captured — nothing
+  implicit. A service with no methods is a **value service**:
+
+  ```inga
+  service Session { User user }
+  provider WithSession :: (HttpRequest req) {
+      Session { user: authenticate(req.query) }   // `authenticate`'s `! AuthError` rides
+  }
+  ```
 - **Type aliases** (`type Handler = (HttpRequest) -> HttpResponse uses
   Session`) are transparent: the alias resolves wherever the name appears
   in a type, including a function type's rows — the idiomatic way to name
@@ -206,63 +224,116 @@ cached :: (id) {
 }
 ```
 
-`provide` instantiates implementations (running their field initializers —
-each `provide` gets fresh instances) and satisfies those services for a
-dynamic extent, *subtracting* them from that extent's `uses` row. It has
-two forms:
+A **provider** supplies a service. A provider is a function whose body
+**constructs** the service it provides — so it has the full inferred
+signature every Inga function has: parameters, an inferred `!` row, an
+inferred `uses` row. There is no `-> ret`: the service (and which one) is
+inferred from the construction the body returns.
+
+```inga
+// A value service: just construct it. `authenticate`'s `! AuthError` rides
+// at the provide site (the construction's field value can fail).
+provider WithSession :: (HttpRequest req) {
+    Session { user: authenticate(req.query) }
+}
+
+// A service with methods: the methods are closures that capture the
+// provider's locals (here `store`). A method may also declare a call-time
+// `uses` row on the interface and bind those services per call, and/or use a
+// service the provider captured (a connection, the runtime).
+provider MemoryCache :: () {
+    store = MutMap()
+    Cache {
+        get: (key) -> store.get(key) |> orFail(CacheMiss(key))
+        set: (key, value, ttl) -> store.set(key, value)
+    }
+}
+```
+
+`provide` runs a provider — its body, each `provide` getting fresh
+instances — and satisfies that service for a dynamic extent, *subtracting*
+it from that extent's `uses` row. A provider that takes parameters is
+called positionally; one that fails or uses other services contributes
+those rows at the provide site. It has two forms:
 
 ```inga
 main :: () {
-    provide prettyLogger, db        // braceless: the rest of this block
+    provide PrettyLogger, Db        // braceless: the rest of this block
     Db handle
     ...
-    provide fakeDb { runTests() }   // braced: just this body
+    provide FakeDb { runTests() }   // braced: just this body
 }
 ```
 
-Items provide **left to right**: a later implementation's field
-initializers run with the earlier services already available, so an impl
-whose setup logs can be written `provide prettyLogger, db`. An item may
-also be a configured builtin resource — `provide Arena(256.kb)` switches
-the scope's allocator (see §6). Capabilities compose transitively: callers
-of `cached` inherit `uses Cache, Logger` without writing anything.
+Items provide **left to right**: a later provider runs with the earlier
+services already available, so a provider whose setup logs can be written
+`provide PrettyLogger, Db`, and `WithSession` above can be provided after
+the `Logger` it uses. An item may also be a configured builtin resource —
+`provide Arena(256.kb)` switches the scope's allocator (see §6).
+Capabilities compose transitively: callers of `cached` inherit
+`uses Cache, Logger` without writing anything.
 
-**Parameterized implementations** take runtime values: a `Type name`
-entry in the impl body with no initializer is a parameter field, supplied
-positionally at the provide site —
+**Providers are middleware.** Because a provider is an ordinary function,
+its construction may fail or depend on other services, and those rows ride
+at the provide site. So request middleware *is* a provider: it
+authenticates (and can fail), it is provided right where it's needed, and
+the route block still has the request and any captured route params in
+scope — no handler piping, no lambda adapters:
 
 ```inga
-loggedIn :: Session {
-    User user                       // parameter (also satisfies a value member)
-    banner = "hi, ${user.name}"     // initializers see the parameters
-
-    greeting :: () { banner }
+provider WithSession :: (HttpRequest req) {
+    Session { user: authenticate(req.query) }   // setup can fail — the row rides out
 }
 
-serveOne :: (String token) -> String ! AuthError {
-    provide loggedIn(authenticate(token))   // setup can fail — the row rides here
-    dashboard()                             // uses Session, satisfied for this extent
+router = (HttpRequest req) -> {
+    match req.path {
+        "/" -> home(req)
+        "/profile" -> {
+            provide WithSession(req)
+            profile(req)               // uses Session, satisfied for this route
+        }
+        "/user/${Int id}" -> {
+            provide WithSession(req)
+            userProfile(req, id)       // the captured `id` is just in scope
+        }
+        _ -> notFound(req)
+    }
 }
 ```
 
-The argument expressions are ordinary expressions at the provide site:
-a fallible or capability-using setup adds to *that* function's rows —
-an Effect-style layer whose construction errors are typed and must be
-handled (or carried) like any other.
+Providers stack, and order matters: a provider may itself `uses` a service
+provided just before it — `provide WithSession(req)` then
+`provide WithAdmin()`, where `WithAdmin uses Session`, reads that session
+and fails `ForbiddenError` if the user is not an admin. The routes raise
+their typed errors; the router stays pure routing, and one edge middleware
+maps every domain error to a response once — the error *type* picks the
+status, so it doesn't matter which route or provider failed:
 
-**Capability contracts on callbacks.** A function-type annotation may
-carry a `uses` row — `(HttpRequest) -> HttpResponse uses Session` — and
-a callback parameter of that type receives evidence for those services
-*at every call*, instead of capturing it where the callback was created.
-A `provide` around the call site therefore reaches the callback, which
-is the middleware pattern:
+```inga
+withErrors :: (Route inner) {   // Route = (HttpRequest) -> HttpResponse ! AuthError, ForbiddenError
+    (req) -> inner(req) |> catch {
+        AuthError(why)      -> HttpResponse(401, why)
+        ForbiddenError(why) -> HttpResponse(403, why)
+    }
+}
+
+http.serve(port, router |> withErrors)
+```
+
+**Capability contracts on callbacks.** Sometimes a wrapper *observes*
+rather than provides — request logging, timing — taking a handler and
+calling it under the ambient capabilities. A function-type annotation may
+carry a `uses` row — `(HttpRequest) -> HttpResponse uses Session` — and a
+callback parameter of that type receives evidence for those services *at
+every call*, instead of capturing it where the callback was created. A
+`provide` around the call site therefore reaches the callback:
 
 ```inga
 type Authed = (HttpRequest) -> HttpResponse uses Session
 
 withAuth :: (Authed inner) {
     (req) -> {
-        provide loggedIn(authenticate(req))
+        provide WithSession(req)
         inner(req)                 // Session = the one provided just above
     }
 }
@@ -279,9 +350,9 @@ lambda runs under different provides at different call sites. Callbacks
 *without* a `uses` annotation keep creation-time capture — graphics
 frame closures, serve handlers, and fork thunks are unchanged.
 
-This is Effect.ts `Layer`/`Context` reduced to two keywords. There are no
-globals and no implicit singletons; tests provide fakes the same way `main`
-provides real implementations.
+This is Effect.ts `Layer`/`Context` reduced to a keyword pair —
+`provider`/`provide`. There are no globals and no implicit singletons;
+tests provide fake providers the same way `main` provides real ones.
 
 ## 5. Type system
 
@@ -292,10 +363,13 @@ provides real implementations.
   structs, enums, services, functions, `MutMap`.
 - **Effect rows**: finite sets of type/service *names*, computed as a
   monotone fixpoint over the call graph. `catch` and `provide` subtract;
-  calls union. Service method rows are the union of all implementations'
-  inferred rows plus the interface's declared `!` annotations (per-impl
-  precision is future work). Higher-order calls conservatively assume a
-  function-typed argument may be invoked.
+  calls union. A service method's call-time row is exactly what the interface
+  sig declares — its `!` errors and its `uses` caps — and a call to it adds
+  that row to the caller (it is *not* inferred from any provider's closure;
+  the provider's own construction deps are captured and never appear at the
+  call).
+  Higher-order calls conservatively assume a function-typed argument may be
+  invoked.
 - **Annotations are contracts**: inferred ⊆ declared is enforced; the
   declared row is what callers see.
 - Field access on an unannotated value uses *unique-field inference*: if
@@ -470,8 +544,8 @@ copied out first); function values, maps, fibers, and outcomes are
 rejected as captures. Capability evidence crosses **iff the service is
 declared `shared`** — `shared service Adder { … }` is the contract, and
 the checker enforces scalar-only instance state (`Int`/`Float`/`Bool`/
-`Duration`) at every implementation, so adding a `MutMap` field errors at
-the impl, not at a distant fork site. Non-shared services are provided
+`Duration`) at every provider, so adding a `MutMap` field errors at
+the provider, not at a distant fork site. Non-shared services are provided
 fresh inside the forked expression.
 
 **Supervision (the no-leak rule).** A fiber whose handle is dropped —
@@ -519,7 +593,7 @@ main :: () { println(area(Circle(2.0))) }
 ```
 
 - `pub` may prefix any top-level declaration (struct, enum, service,
-  implementation, function). Private cross-module references are errors;
+  provider, function). Private cross-module references are errors;
   a bare name reachable only qualified gets a hint
   (``call it as `geometry.area` or import it with `use geometry { area }` ``).
 - Importing an enum name also grants its variants (`Shape` brings
@@ -776,10 +850,10 @@ piped from a file fails as a typed error, not a hang. See
 ```
 program   := decl*
 decl      := 'use' name ('/' name)* ('{' name,* '}')?
-           | 'pub'? 'struct' Upper '=' '{' field,* '}'
+           | 'pub'? 'struct' Upper '{' field,* '}'
            | 'pub'? 'enum' Upper '=' variant ('|' variant)*
-           | 'pub'? 'shared'? 'service' Upper '{' (name '::' sig)* '}'
-           | name '::' Upper '{' (name '=' expr | name '::' sig block)* '}'   -- impl
+           | 'pub'? 'shared'? 'service' Upper '{' (field | name '::' sig)* '}'
+           | 'pub'? 'provider' name '::' sig block   -- body constructs the service (`… Service { … }`)
            | name '::' sig block                                              -- func
 variant   := Upper ('{' field,* '}')?
 sig       := '(' param,* ')' ('->' type)? ('!' Upper,+)? ('uses' Upper,+)?
@@ -793,7 +867,7 @@ stmt      := Upper name                      -- capability bind
            | type? name '=' expr             -- binding
            | 'provide' item,*                -- braceless: scopes over the rest of the block
            | expr
-item      := name ('(' expr,* ')')?          -- impl, or a resource like Arena(256.kb)
+item      := name ('(' expr,* ')')?          -- provider, or a resource like Arena(256.kb)
 expr      := pipe; pipe := or ('|>' (call | 'catch' arms))*
            | match | if | fail | provide | lambda
            | '(' expr ',' expr,* ')'            -- tuple ('.0' indexes)

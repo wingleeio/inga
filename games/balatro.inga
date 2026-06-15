@@ -14,7 +14,7 @@
 // nothing threads state through arguments.
 
 use std/graphics
-use game { Game, freshGame }
+use game { Game, FreshGame }
 use util {
     brighten, button, cap255, centerText, dim, drawBackground, gn, gv, hit, rgb, roundRect, sv,
     textC,
@@ -149,8 +149,8 @@ drawDeck :: () uses Game {
 
 drawJokers :: () uses Game {
     Game game
-    jok = game.jok()
-    av = game.av()
+    jok = game.jok
+    av = game.av
     shx = gv("shx")
     shy = gv("shy")
     owned = gv("jokers")
@@ -246,7 +246,7 @@ drawScorePanel :: (String name, Int chips, Int mult) uses Game {
 // One animation step toward `target` (fixed-point x1000 easing).
 ease :: (Int key, Int target) uses Game {
     Game game
-    av = game.av()
+    av = game.av
     cur = gn(av, key)
     av.set(key, cur + (target - cur) / 4)
 }
@@ -255,9 +255,9 @@ ease :: (Int key, Int target) uses Game {
 // trigger each step (flash + shake + popup), land the total.
 tickScoring :: () uses Game {
     Game game
-    sel = game.sel()
-    steps = game.steps()
-    av = game.av()
+    sel = game.sel
+    steps = game.steps
+    av = game.av
     t = gv("animT")
     nSteps = gv("nSteps")
     // Stage progress for the played cards.
@@ -303,11 +303,11 @@ tickScoring :: () uses Game {
 
 framePlay :: () uses Game {
     Game game
-    hand = game.hand()
-    sel = game.sel()
-    out = game.out()
-    steps = game.steps()
-    av = game.av()
+    hand = game.hand
+    sel = game.sel
+    out = game.out
+    steps = game.steps
+    av = game.av
     // Screen shake: magnitude decays, offset re-rolls every frame.
     mag = gv("shake")
     sv("shake", mag * 7 / 10)
@@ -497,7 +497,7 @@ shopOffer :: (Int slot) uses Game {
         affordable = gv("money") >= jokerPrice(j) && gv("jokers") < 5
         if button("Buy  \$${jokerPrice(j)}", x + 25, 280 - lift, 120, 40, affordable, rgb(60, 130, 246)) {
             sv("money", gv("money") - jokerPrice(j))
-            game.jok().set(gv("jokers"), j)
+            game.jok.set(gv("jokers"), j)
             sv("jokers", gv("jokers") + 1)
             match slot {
                 0 -> sv("bought0", 1)
@@ -599,7 +599,7 @@ frame :: () uses Game {
 }
 
 main :: () {
-    provide freshGame
+    provide FreshGame
     restart()
     graphics.run(960, 540, "INGA-LATRO", () -> frame())
 }

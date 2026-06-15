@@ -1,59 +1,30 @@
 // INGA-LATRO game state: one service owning every table. `main` provides
-// `freshGame` once; any function that needs state binds `Game game` and the
+// `FreshGame` once; any function that needs state binds `Game game` and the
 // compiler threads it everywhere as an inferred `uses Game` capability — no
-// more passing eight maps through every signature. Tests provide their own
+// more passing eight maps through every signature. The tables are value
+// members, read directly as `game.deck` (no getters). Tests provide their own
 // fresh instance the same way (see logic_test.inga).
 
 pub service Game {
-    vals :: () -> MutMap<String, Int> // named scalars: score, money, phase, shake, ...
-    deck :: () -> MutMap<Int, Int> // 52 shuffled card ids
-    hand :: () -> MutMap<Int, Int> // 8 hand slots (-1 = empty)
-    sel :: () -> MutMap<Int, Int> // selection flag per hand slot
-    jok :: () -> MutMap<Int, Int> // owned joker ids by slot
-    out :: () -> MutMap<Int, Int> // poker evaluation results (keys in poker.inga)
-    steps :: () -> MutMap<Int, Int> // scoring choreography (layout in poker.inga)
-    av :: () -> MutMap<Int, Int> // animation values (slots in balatro.inga)
+    MutMap<String, Int> vals // named scalars: score, money, phase, shake, ...
+    MutMap<Int, Int> deck // 52 shuffled card ids
+    MutMap<Int, Int> hand // 8 hand slots (-1 = empty)
+    MutMap<Int, Int> sel // selection flag per hand slot
+    MutMap<Int, Int> jok // owned joker ids by slot
+    MutMap<Int, Int> out // poker evaluation results (keys in poker.inga)
+    MutMap<Int, Int> steps // scoring choreography (layout in poker.inga)
+    MutMap<Int, Int> av // animation values (slots in balatro.inga)
 }
 
-pub freshGame :: Game {
-    valsM = MutMap()
-    deckM = MutMap()
-    handM = MutMap()
-    selM = MutMap()
-    jokM = MutMap()
-    outM = MutMap()
-    stepsM = MutMap()
-    avM = MutMap()
-
-    vals :: () {
-        valsM
-    }
-
-    deck :: () {
-        deckM
-    }
-
-    hand :: () {
-        handM
-    }
-
-    sel :: () {
-        selM
-    }
-
-    jok :: () {
-        jokM
-    }
-
-    out :: () {
-        outM
-    }
-
-    steps :: () {
-        stepsM
-    }
-
-    av :: () {
-        avM
+pub provider FreshGame :: () {
+    Game {
+        vals: MutMap()
+        deck: MutMap()
+        hand: MutMap()
+        sel: MutMap()
+        jok: MutMap()
+        out: MutMap()
+        steps: MutMap()
+        av: MutMap()
     }
 }

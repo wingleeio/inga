@@ -14,12 +14,12 @@ pub gn :: (MutMap<Int, Int> m, Int k) -> Int {
 // Read / write the named game scalars (score, money, phase, ...).
 pub gv :: (String k) -> Int uses Game {
     Game game
-    game.vals().get(k) |> getOrElse(0)
+    game.vals.get(k) |> getOrElse(0)
 }
 
 pub sv :: (String k, Int v) uses Game {
     Game game
-    game.vals().set(k, v)
+    game.vals.set(k, v)
 }
 
 pub rgb :: (Int r, Int g, Int b) -> Int {

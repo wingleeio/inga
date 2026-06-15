@@ -57,9 +57,9 @@ pub handTypeName :: (Int t) -> String {
 
 pub evalSelected :: () uses Game {
     Game game
-    hand = game.hand()
-    sel = game.sel()
-    out = game.out()
+    hand = game.hand
+    sel = game.sel
+    out = game.out
     rc = MutMap() // rank counts
     sc = MutMap() // suit counts
     out.set(0, -1)
@@ -174,10 +174,10 @@ pub evalSelected :: () uses Game {
 // Returns the step count and fills out[7]/out[8] with the totals.
 pub buildSteps :: () -> Int uses Game {
     Game game
-    hand = game.hand()
-    sel = game.sel()
-    out = game.out()
-    steps = game.steps()
+    hand = game.hand
+    sel = game.sel
+    out = game.out
+    steps = game.steps
     evalSelected()
     t = gn(out, 0)
     if t < 0 {

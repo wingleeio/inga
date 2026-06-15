@@ -72,7 +72,7 @@ pub sellPrice :: (Int j) -> Int {
 // Which slot holds joker `j` (-1 when not owned).
 pub jokerSlot :: (Int j) -> Int uses Game {
     Game game
-    jok = game.jok()
+    jok = game.jok
     fold(range(gv("jokers")), -1, (acc, i) -> if gn(jok, i) == j {
         i
     } else {

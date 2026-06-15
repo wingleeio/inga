@@ -13,7 +13,7 @@ use std/fiber
 use std/http
 use std/schedule
 
-struct PageError = { String url }
+struct PageError { String url }
 
 // Deadline + retry around a request — rows compose: the result can fail
 // with HttpError (kept by retry) or TimeoutError (from within).

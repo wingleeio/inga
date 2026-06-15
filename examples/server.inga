@@ -11,21 +11,20 @@
 use std/http
 use std/json
 
-struct Stats = { Int visits }
-struct User  = { Int id, String name }
+struct Stats { Int visits }
+struct User  { Int id, String name }
 
 service Counter {
     bump :: () -> Int
 }
 
-memCounter :: Counter {
+provider MemCounter :: () {
     hits = MutMap()
-
-    bump :: () {
+    Counter { bump: () -> {
         n = hits.get("n") |> getOrElse(0)
         hits.set("n", n + 1)
         n + 1
-    }
+    } }
 }
 
 handle :: (HttpRequest req) -> HttpResponse uses Counter {
@@ -38,7 +37,7 @@ handle :: (HttpRequest req) -> HttpResponse uses Counter {
 }
 
 main :: () {
-    provide Http, memCounter
+    provide Http, MemCounter
     println("serving on http://localhost:8080 — try /visit")
     http.serve(8080, handle) |> catch { HttpError(status, m) -> println("server error: ${m}") }
 }

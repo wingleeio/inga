@@ -27,19 +27,21 @@ const SRC: &str = r#"use std/http
 use std/json
 use std/time
 
-struct Stats = { Int visits, String label }
+struct Stats { Int visits, String label }
 
 service Counter {
     bump :: () -> Int
 }
 
-memCounter :: Counter {
-    hits = MutMap()
+provider MemCounter :: () {
+    MutMap<String, Int> hits = MutMap()
 
-    bump :: () {
-        n = hits.get("k") |> getOrElse(0)
-        hits.set("k", n + 1)
-        n + 1
+    Counter {
+        bump: () -> {
+            n = hits.get("k") |> getOrElse(0)
+            hits.set("k", n + 1)
+            n + 1
+        }
     }
 }
 
@@ -63,7 +65,7 @@ handle :: (HttpRequest req) -> HttpResponse uses Counter {
 }
 
 main :: () {
-    provide Http, memCounter
+    provide Http, MemCounter
     println(handle(HttpRequest("GET", "/visit", "", "")).status)
 }
 "#;
@@ -79,7 +81,7 @@ fn struct_field_access_hovers() {
 #[test]
 fn record_literal_hovers() {
     // The struct name in a literal shows the typed signature...
-    assert_eq!(hover_at(SRC, "Stats {"), "struct Stats = { Int visits, String label }");
+    assert_eq!(hover_at(SRC, "Stats {"), "struct Stats { Int visits, String label }");
     // ...and each field key shows its declared type.
     assert_eq!(hover_at(SRC, "visits:"), "visits : Int");
     assert_eq!(hover_at(SRC, "label:"), "label : String");
@@ -87,8 +89,8 @@ fn record_literal_hovers() {
 
 #[test]
 fn constructor_hovers_show_the_signature() {
-    assert_eq!(hover_at(SRC, "HttpResponse(200"), "struct HttpResponse = { Int status, String body }");
-    assert_eq!(hover_at(SRC, "HttpRequest(\"GET\""), "struct HttpRequest = { String method, String path, String query, String body }");
+    assert_eq!(hover_at(SRC, "HttpResponse(200"), "struct HttpResponse { Int status, String body }");
+    assert_eq!(hover_at(SRC, "HttpRequest(\"GET\""), "struct HttpRequest { String method, String path, String query, String body }");
 }
 
 #[test]

@@ -675,7 +675,7 @@ impl Server {
                 Decl::Service(d) if d.is_pub => (d.name.clone(), CompletionItemKind::INTERFACE),
                 Decl::Const(d) if d.is_pub => (d.name.clone(), CompletionItemKind::CONSTANT),
                 Decl::TypeAlias(d) if d.is_pub => (d.name.clone(), CompletionItemKind::INTERFACE),
-                Decl::Impl(d) if d.is_pub => (d.name.clone(), CompletionItemKind::MODULE),
+                Decl::Provider(d) if d.is_pub => (d.name.clone(), CompletionItemKind::MODULE),
                 _ => continue,
             };
             items.push(CompletionItem { label: name, kind: Some(kind), ..Default::default() });
@@ -1014,7 +1014,7 @@ fn sibling_exports(uri: &Url, docs: &HashMap<Url, String>) -> Vec<Export> {
                 Decl::Service(d) if d.is_pub => (d.name.clone(), CompletionItemKind::INTERFACE),
                 Decl::Const(d) if d.is_pub => (d.name.clone(), CompletionItemKind::CONSTANT),
                 Decl::TypeAlias(d) if d.is_pub => (d.name.clone(), CompletionItemKind::INTERFACE),
-                Decl::Impl(d) if d.is_pub => (d.name.clone(), CompletionItemKind::MODULE),
+                Decl::Provider(d) if d.is_pub => (d.name.clone(), CompletionItemKind::MODULE),
                 _ => continue,
             };
             out.push(Export { import_name: name.clone(), label: name, kind, module: module.clone() });

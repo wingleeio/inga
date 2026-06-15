@@ -82,18 +82,20 @@ const SIZE_SUFFIXES: [(&str, i64); 3] =
 // ---- program-level state -----------------------------------------------------
 
 struct ServiceMeta {
-    /// Method names in declaration order (the vtable layout).
+    /// Method names in declaration order. An instance holds a *closure* in
+    /// each method slot (slots `0..methods.len()`); a method call loads the
+    /// slot and calls the closure.
     methods: Vec<String>,
-    /// Declared value members, in declaration order. They occupy the slots
-    /// right after the methods — the same position in every impl, so an
-    /// access site needs only the service.
+    /// Value members, in declaration order. They occupy the slots right after
+    /// the methods — the same position in every instance, so an access site
+    /// needs only the service.
     values: Vec<String>,
 }
 
 struct ImplMeta<'a> {
-    decl: &'a ImplDecl,
-    /// Field names in declaration order, stored after the method slots.
-    fields: Vec<String>,
+    decl: &'a ProviderDecl,
+    /// The service this provider satisfies (inferred by the checker).
+    service: String,
 }
 
 #[derive(Clone)]
@@ -260,19 +262,15 @@ impl<'a> Cg<'a> {
                         },
                     );
                 }
-                Decl::Impl(d) => {
-                    self.impls.insert(
-                        d.name.clone(),
-                        ImplMeta {
-                            decl: d,
-                            fields: d
-                                .params
-                                .iter()
-                                .map(|p| p.name.clone())
-                                .chain(d.fields.iter().map(|(n, _, _)| n.clone()))
-                                .collect(),
-                        },
-                    );
+                Decl::Provider(d) => {
+                    let service = self
+                        .info
+                        .facts
+                        .providers
+                        .get(&d.name)
+                        .map(|p| p.service.clone())
+                        .unwrap_or_default();
+                    self.impls.insert(d.name.clone(), ImplMeta { decl: d, service });
                 }
                 Decl::Func(d) => {
                     self.funcs.insert(d.name.clone(), d);
@@ -334,22 +332,9 @@ impl<'a> Cg<'a> {
         self.info.facts.funcs.get(name).cloned().unwrap_or_default()
     }
 
-    fn method_row(&self, service: &str, method: &str) -> RowFact {
-        self.info
-            .facts
-            .methods
-            .get(&(service.to_string(), method.to_string()))
-            .cloned()
-            .unwrap_or_default()
-    }
-
     fn func_fallible(&self, decl: &FuncDecl) -> bool {
         !self.func_row(&decl.name).errors.is_empty()
             || decl.sig.params.iter().any(|p| p.lazy)
-    }
-
-    fn method_fallible(&self, service: &str, method: &str) -> bool {
-        !self.method_row(service, method).errors.is_empty()
     }
 
     fn ctype_of(&self, expr: &Expr) -> CType {
@@ -366,7 +351,7 @@ impl<'a> Cg<'a> {
         for decl in &self.program.decls {
             match decl {
                 Decl::Func(d) => self.gen_func(d),
-                Decl::Impl(d) => self.gen_impl(d),
+                Decl::Provider(d) => self.gen_provider(d),
                 _ => {}
             }
         }
@@ -579,66 +564,39 @@ impl<'a> Cg<'a> {
         self.emit_fn(&format!("@ing.fn.{}", decl.name), &params, f);
     }
 
-    fn gen_impl(&mut self, decl: &'a ImplDecl) {
-        let service = decl.service.clone();
-        let Some(service_meta) = self.services.get(&service) else { return };
-        let n_methods = service_meta.methods.len();
-        let impl_fields = self.impls[&decl.name].fields.clone();
-
-        for method in &decl.methods {
-            let row = self.method_row(&service, &method.name);
-            let fallible = self.method_fallible(&service, &method.name);
-            let mut f = FnCtx::new(fallible);
-            let mut params = vec!["i64 %self".to_string()];
-            for cap in &row.caps {
-                let reg = format!("%ev.{cap}");
-                params.push(format!("i64 {reg}"));
-                f.evidence.insert(cap.clone(), reg);
-            }
-            let mkey = (service.clone(), method.name.clone());
-            let param_ctys =
-                self.info.facts.method_params.get(&mkey).cloned().unwrap_or_default();
-            for (i, param) in method.sig.params.iter().enumerate() {
-                if param.lazy {
-                    self.unsupported(param.span, "`lazy` parameters on service methods");
-                }
-                let reg = format!("%p.{}", param.name);
-                params.push(format!("i64 {reg}"));
-                let slot = f.alloca(self, &param.name);
-                f.line(format!("store i64 {reg}, ptr {slot}"));
-                let cty = param_ctys.get(i).cloned().unwrap_or(CType::Int);
-                f.scopes
-                    .last_mut()
-                    .unwrap()
-                    .insert(param.name.clone(), LocalVar { slot, lazy: false, cty });
-            }
-            let field_ctys =
-                self.info.facts.impl_fields.get(&decl.name).cloned().unwrap_or_default();
-            let cty_by_name: std::collections::HashMap<&String, &CType> =
-                impl_fields.iter().zip(field_ctys.iter()).collect();
-            let canonical = self.canonical_impl_fields(&decl.name);
-            // Impl fields load from the instance (after the method slots),
-            // at their canonical positions.
-            for (i, field) in canonical.iter().enumerate() {
-                let slot = f.alloca(self, field);
-                let p = self.tmp();
-                f.line(format!("{p} = inttoptr i64 %self to ptr"));
-                let gep = self.tmp();
-                f.line(format!("{gep} = getelementptr i64, ptr {p}, i64 {}", n_methods + i));
-                let v = self.tmp();
-                f.line(format!("{v} = load i64, ptr {gep}"));
-                f.line(format!("store i64 {v}, ptr {slot}"));
-                let cty = cty_by_name.get(field).map(|c| (*c).clone()).unwrap_or(CType::Int);
-                f.scopes
-                    .last_mut()
-                    .unwrap()
-                    .insert(field.clone(), LocalVar { slot, lazy: false, cty });
-            }
-            let value = self.gen_block(&mut f, &method.body);
-            let ret_cty = self.info.facts.method_ret.get(&mkey).cloned();
-            f.ret(self, &value, ret_cty.as_ref());
-            self.emit_fn(&format!("@ing.m.{}.{}", decl.name, method.name), &params, f);
+    /// A provider is a constructor function `@ing.provider.Name` that takes
+    /// evidence for its `uses` row, then its parameters, runs its body, and
+    /// returns the freshly built service instance (the body's trailing
+    /// construction).
+    fn gen_provider(&mut self, decl: &'a ProviderDecl) {
+        let fact = self.info.facts.providers.get(&decl.name).cloned().unwrap_or_default();
+        let mut f = FnCtx::new(fact.fallible);
+        let mut params = Vec::new();
+        for cap in &fact.caps {
+            let reg = format!("%ev.{cap}");
+            params.push(format!("i64 {reg}"));
+            f.evidence.insert(cap.clone(), reg);
         }
+        for (i, param) in decl.sig.params.iter().enumerate() {
+            if let Some(caps) = self.info.facts.param_contracts.get(&(decl.name.clone(), i)) {
+                f.param_contracts.insert(param.name.clone(), caps.clone());
+            }
+        }
+        for (i, param) in decl.sig.params.iter().enumerate() {
+            let reg = format!("%p.{}", param.name);
+            params.push(format!("i64 {reg}"));
+            let slot = f.alloca(self, &param.name);
+            f.line(format!("store i64 {reg}, ptr {slot}"));
+            let cty = fact.params.get(i).cloned().unwrap_or(CType::Int);
+            f.scopes
+                .last_mut()
+                .unwrap()
+                .insert(param.name.clone(), LocalVar { slot, lazy: param.lazy, cty });
+        }
+        let value = self.gen_block(&mut f, &decl.body);
+        let ret_cty = CType::Service(fact.service.clone());
+        f.ret(self, &value, Some(&ret_cty));
+        self.emit_fn(&format!("@ing.provider.{}", decl.name), &params, f);
     }
 
     /// Top-level constants: a global slot each, filled by `ing.consts.init`
@@ -784,6 +742,39 @@ impl<'a> Cg<'a> {
                 self.load_slot_from_int(f, &v, *index)
             }
             ExprKind::RecordUpdate { name, base, fields, .. } => {
+                // A service instance: method members hold a closure in slots
+                // `0..n_methods`; value members hold data in the slots after.
+                if let Some(smeta) = self.services.get(name) {
+                    let methods = smeta.methods.clone();
+                    let values = smeta.values.clone();
+                    let n_methods = methods.len();
+                    let ptr = self.gen_alloc(f, (n_methods + values.len()) as i64);
+                    for (fname, _, value) in fields {
+                        if let Some(mi) = methods.iter().position(|x| x == fname) {
+                            // The method is a closure: it captures the
+                            // provider's instances and takes evidence for its
+                            // declared call-time `uses` per call (a contract
+                            // closure). It's stored in the method slot.
+                            let caps = self
+                                .info
+                                .facts
+                                .methods
+                                .get(&(name.clone(), fname.clone()))
+                                .map(|r| r.caps.clone())
+                                .unwrap_or_default();
+                            let clos = self.gen_contract_closure(f, value, &caps, value.span);
+                            self.dup_value(f, &clos, &CType::Func);
+                            self.store_slot(f, &ptr, mi as i64, &clos);
+                        } else if let Some(vi) = values.iter().position(|x| x == fname) {
+                            let v = self.gen_expr(f, value);
+                            let vcty = self.ctype_of(value);
+                            self.dup_value(f, &v, &vcty);
+                            self.store_slot(f, &ptr, (n_methods + vi) as i64, &v);
+                        }
+                    }
+                    let _ = base;
+                    return self.ptr_to_int(f, &ptr);
+                }
                 let decl_fields = self.struct_meta.get(name).cloned().unwrap_or_default();
                 let fctys = self
                     .info
@@ -1435,40 +1426,33 @@ impl<'a> Cg<'a> {
                     self.unsupported(name_span, "this method call");
                     return "0".to_string();
                 };
-                let row = self.method_row(&service, name);
-                let fallible = self.method_fallible(&service, name);
+                // The method is a contract closure in the instance's method
+                // slot: it captured the provider's instances, and takes
+                // evidence for its declared call-time `uses` here, from the
+                // caller's scope.
+                let caps = self
+                    .info
+                    .facts
+                    .methods
+                    .get(&(service.clone(), name.to_string()))
+                    .map(|r| r.caps.clone())
+                    .unwrap_or_default();
                 let inst = self.gen_expr(f, recv);
-                let mut call_args = vec![format!("i64 {inst}")];
-                for cap in &row.caps {
+                let clos = self.load_slot_from_int(f, &inst, idx as i64);
+                let mut evidence = Vec::new();
+                for cap in &caps {
                     match f.evidence.get(cap) {
-                        Some(ev) => call_args.push(format!("i64 {ev}")),
+                        Some(ev) => evidence.push(ev.clone()),
                         None => {
-                            self.unsupported(span, &format!("calling `{name}` without `{cap}` provided"));
-                            call_args.push("i64 0".to_string());
+                            self.unsupported(
+                                span,
+                                &format!("calling `{name}` without `{cap}` provided"),
+                            );
+                            evidence.push("0".to_string());
                         }
                     }
                 }
-                for arg in args {
-                    let v = self.gen_expr(f, arg);
-                    call_args.push(format!("i64 {v}"));
-                }
-                let p = self.tmp();
-                f.line(format!("{p} = inttoptr i64 {inst} to ptr"));
-                let gep = self.tmp();
-                f.line(format!("{gep} = getelementptr i64, ptr {p}, i64 {idx}"));
-                let fp_i = self.tmp();
-                f.line(format!("{fp_i} = load i64, ptr {gep}"));
-                let fp = self.tmp();
-                f.line(format!("{fp} = inttoptr i64 {fp_i} to ptr"));
-                let out = if fallible {
-                    let r = self.tmp();
-                    f.line(format!("{r} = call {{ i64, i64 }} {fp}({})", call_args.join(", ")));
-                    self.check_failure(f, &r)
-                } else {
-                    let r = self.tmp();
-                    f.line(format!("{r} = call i64 {fp}({})", call_args.join(", ")));
-                    r
-                };
+                let arg_vals: Vec<String> = args.iter().map(|a| self.gen_expr(f, a)).collect();
                 let ret_cty = self
                     .info
                     .facts
@@ -1476,8 +1460,7 @@ impl<'a> Cg<'a> {
                     .get(&(service.clone(), name.to_string()))
                     .cloned()
                     .unwrap_or(CType::Int);
-                self.pool_value(f, &out, &ret_cty);
-                out
+                self.gen_contract_call(f, &clos, &evidence, &arg_vals, &ret_cty)
             }
             CType::MutMap(k, vc) => {
                 let m = self.gen_expr(f, recv);
@@ -2367,24 +2350,6 @@ impl<'a> Cg<'a> {
 
     // ---- provide -----------------------------------------------------------------------------
 
-    /// An impl's instance layout after the method slots: the service's
-    /// declared value members first (service order), then private fields.
-    fn canonical_impl_fields(&self, impl_name: &str) -> Vec<String> {
-        let Some(meta) = self.impls.get(impl_name) else { return Vec::new() };
-        let service_values = self
-            .services
-            .get(&meta.decl.service)
-            .map(|s| s.values.clone())
-            .unwrap_or_default();
-        let mut out = service_values.clone();
-        for f in &meta.fields {
-            if !service_values.contains(f) {
-                out.push(f.clone());
-            }
-        }
-        out
-    }
-
     fn gen_provide(
         &mut self,
         f: &mut FnCtx,
@@ -2434,54 +2399,48 @@ impl<'a> Cg<'a> {
             }
             let name = &item.name;
             let Some(meta) = self.impls.get(name.as_str()) else {
-                self.unsupported(item.name_span, "this implementation");
+                self.unsupported(item.name_span, "this provider");
                 continue;
             };
-            let decl = meta.decl;
-            let service = decl.service.clone();
-            let Some(smeta) = self.services.get(&service) else { continue };
-            let methods = smeta.methods.clone();
-            let canonical = self.canonical_impl_fields(name);
-
-            let ptr = self.gen_alloc(f, (methods.len() + canonical.len()) as i64);
-            for (i, m) in methods.iter().enumerate() {
-                let fnref = format!("ptrtoint (ptr @ing.m.{name}.{m} to i64)");
-                self.store_slot(f, &ptr, i as i64, &fnref);
+            let service = meta.service.clone();
+            let fact = self.info.facts.providers.get(name.as_str()).cloned().unwrap_or_default();
+            // Every provider is a constructor function: pass evidence for its
+            // `uses` row and its arguments, then bind the instance it returns.
+            let mut call_args = Vec::new();
+            for cap in &fact.caps {
+                match f.evidence.get(cap) {
+                    Some(ev) => call_args.push(format!("i64 {ev}")),
+                    None => {
+                        self.unsupported(
+                            item.name_span,
+                            &format!("providing `{name}` without `{cap}` provided first"),
+                        );
+                        call_args.push("i64 0".to_string());
+                    }
+                }
             }
-            // Provide arguments fill the parameter fields, in order; field
-            // initializers (and methods) see them like any other field.
-            f.scopes.push(HashMap::new());
             let args = item.args.as_deref().unwrap_or(&[]);
-            for (param, arg) in decl.params.iter().zip(args.iter()) {
-                let i = canonical.iter().position(|x| x == &param.name).unwrap_or(0);
-                let v = self.gen_expr(f, arg);
-                let pcty = self.ctype_of(arg);
-                self.dup_value(f, &v, &pcty);
-                self.store_slot(f, &ptr, (methods.len() + i) as i64, &v);
-                let slot = f.alloca(self, &param.name);
-                f.line(format!("store i64 {v}, ptr {slot}"));
-                f.scopes
-                    .last_mut()
-                    .unwrap()
-                    .insert(param.name.clone(), LocalVar { slot, lazy: false, cty: pcty });
+            for (i, arg) in args.iter().enumerate() {
+                let contract = self.info.facts.param_contracts.get(&(name.clone(), i)).cloned();
+                let v = if let Some(caps) = contract {
+                    self.gen_contract_closure(f, arg, &caps, item.name_span)
+                } else {
+                    self.gen_expr(f, arg)
+                };
+                call_args.push(format!("i64 {v}"));
             }
-            // Field initializers run in declaration order (so later ones see
-            // earlier fields) but store at their canonical slot.
-            for (fname, _, init) in decl.fields.iter() {
-                let i = canonical.iter().position(|x| x == fname).unwrap_or(0);
-                let v = self.gen_expr(f, init);
-                let fcty = self.ctype_of(init);
-                self.dup_value(f, &v, &fcty);
-                self.store_slot(f, &ptr, (methods.len() + i) as i64, &v);
-                let s = f.alloca(self, fname);
-                f.line(format!("store i64 {v}, ptr {s}"));
-                f.scopes
-                    .last_mut()
-                    .unwrap()
-                    .insert(fname.clone(), LocalVar { slot: s, lazy: false, cty: fcty });
-            }
-            f.scopes.pop();
-            let inst = self.ptr_to_int(f, &ptr);
+            let inst = if fact.fallible {
+                let r = self.tmp();
+                f.line(format!(
+                    "{r} = call {{ i64, i64 }} @ing.provider.{name}({})",
+                    call_args.join(", ")
+                ));
+                self.check_failure(f, &r)
+            } else {
+                let r = self.tmp();
+                f.line(format!("{r} = call i64 @ing.provider.{name}({})", call_args.join(", ")));
+                r
+            };
             f.evidence.insert(service, inst);
         }
         if arenas == 0 {

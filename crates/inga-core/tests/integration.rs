@@ -26,7 +26,7 @@ fn check_warnings(src: &str) -> Vec<String> {
 #[test]
 fn uncaught_error_in_main_is_rejected() {
     let errors = check_errors(r#"
-struct Boom = { String why }
+struct Boom { String why }
 
 main :: () {
     fail Boom("x")
@@ -41,8 +41,8 @@ main :: () {
 #[test]
 fn declared_error_row_must_cover_inferred() {
     let errors = check_errors(r#"
-struct A = { Int x }
-struct B = { Int x }
+struct A { Int x }
+struct B { Int x }
 
 f :: (Bool go) -> Int ! A {
     if go {
@@ -64,8 +64,8 @@ main :: () {
 #[test]
 fn unreachable_catch_arm_warns() {
     let warnings = check_warnings(r#"
-struct A = { Int x }
-struct B = { Int x }
+struct A { Int x }
+struct B { Int x }
 
 f :: () {
     fail A(1)
@@ -167,19 +167,19 @@ f :: () -> Int uses A {
     a.go() + b.go()
 }
 
-aImpl :: A {
-    go :: () {
-        1
+provider AImpl :: () {
+    A {
+        go: () -> 1
     }
 }
-bImpl :: B {
-    go :: () {
-        2
+provider BImpl :: () {
+    B {
+        go: () -> 2
     }
 }
 
 main :: () {
-    provide aImpl, bImpl {
+    provide AImpl, BImpl {
         println(f())
     }
 }
@@ -388,7 +388,7 @@ main :: () {
 #[test]
 fn function_type_rows_are_contracts() {
     let errors = check_errors(r#"
-struct Boom = { Int code }
+struct Boom { Int code }
 
 pure :: ((Int) -> Int f, Int x) -> Int {
     f(x)

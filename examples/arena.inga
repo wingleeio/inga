@@ -3,7 +3,7 @@
 // speed for allocation-heavy code, no refcount traffic inside.
 // Run with: inga run examples/arena.inga (or inga build)
 
-struct Particle = { Float x, Float y, Float vx, Float vy }
+struct Particle { Float x, Float y, Float vx, Float vy }
 
 step :: (Particle p) -> Particle {
     Particle(p.x + p.vx, p.y + p.vy, p.vx, p.vy * 0.99)

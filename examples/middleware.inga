@@ -1,7 +1,11 @@
-// Route-level middleware — each route picks its own stack, and the
-// middleware *provides*: `withAuth` authenticates a request and provides
-// a Session that exists only for that call, so handlers just say
-// `uses Session` and main never provides it.
+// Route-level middleware as *providers*. Now that a provider is a function
+// that can fail and depend on other services, the middleware *is* the
+// provider: a route `provide`s the stack it needs and the handler just says
+// what it `uses`. No handler piping, no lambda adapters — the route block
+// already has the request (and any captured route params) in scope.
+//
+// The providers raise typed errors; one edge middleware maps every domain
+// error to a status code, so the router stays pure routing.
 //
 //   inga run examples/middleware.inga
 //   curl localhost:8080/                      -> public, no auth
@@ -18,27 +22,25 @@ port = 8080
 adminId = 1
 
 type Handler = (HttpRequest) -> HttpResponse
-type Authed = (HttpRequest) -> HttpResponse uses Session
+// A handler that may raise the domain errors `withErrors` knows how to map.
+type Route = (HttpRequest) -> HttpResponse ! AuthError, ForbiddenError
 
-struct User      = { Int id, String name }
-struct AuthError = { String why }
+struct User           { Int id, String name }
+struct AuthError      { String why }
+struct ForbiddenError { String why }
 
 service Session {
-    User user
+    User user // who the request is
 }
-
-loggedIn :: Session {
-    User user
+service Admin {
+    User user // proof the request is authorized as admin
 }
-
 service Logger {
     info :: (String m)
 }
 
-consoleLogger :: Logger {
-    info :: (m) {
-        println("[log] ${m}")
-    }
+provider ConsoleLogger :: () {
+    Logger { info: (m) -> println("[log] ${m}") }
 }
 
 authenticate :: (String query) -> User ! AuthError {
@@ -46,6 +48,27 @@ authenticate :: (String query) -> User ! AuthError {
         "token=${Int id}" -> User { id: id, name: "user-${id}" }
         _                 -> fail AuthError("missing or bad token")
     }
+}
+
+// ---- middleware: providers that authenticate and authorize -------------------
+
+// The auth layer: parse the token and build a Session — or fail. A provider
+// is a function, so constructing the Session can run `authenticate`, whose
+// inferred `! AuthError` rides wherever this provider is provided.
+provider WithSession :: (HttpRequest req) {
+    Session { user: authenticate(req.query) }
+}
+
+// The authorization layer stacks on top: it acquires the Session provided
+// just before it (inferring `uses Session`) and fails unless that user is an
+// admin — a provider depending on a provider, which is why provide order
+// matters.
+provider WithAdmin :: () {
+    Session session
+    if session.user.id != adminId {
+        fail ForbiddenError("admins only")
+    }
+    Admin { user: session.user }
 }
 
 // ---- handlers: each declares what it needs ----------------------------------
@@ -59,9 +82,9 @@ profile :: (HttpRequest req) -> HttpResponse uses Session {
     HttpResponse(200, json.encode(session.user))
 }
 
-adminPanel :: (HttpRequest req) -> HttpResponse uses Session {
-    Session session
-    HttpResponse(200, "admin console, hello ${session.user.name}")
+adminPanel :: (HttpRequest req) -> HttpResponse uses Admin {
+    Admin admin
+    HttpResponse(200, "admin console, hello ${admin.user.name}")
 }
 
 userProfile :: (HttpRequest req, Int id) -> HttpResponse uses Session {
@@ -69,32 +92,18 @@ userProfile :: (HttpRequest req, Int id) -> HttpResponse uses Session {
     HttpResponse(200, "user ${id}, viewed by ${session.user.name}")
 }
 
-// ---- middlewares: handler in, handler out ------------------------------------
+// ---- edge middleware: map every domain error to a response, once -------------
 
-withAuth :: (Authed inner) {
-    (req) -> {
-        user = authenticate(req.query) |> catch { AuthError(why) -> User { id: -1, name: why } }
-        if user.id < 0 {
-            HttpResponse(401, user.name)
-        } else {
-            provide loggedIn(user)
-            inner(req)
+withErrors :: (Route inner) {
+    (req) -> inner(req)
+        |> catch {
+            AuthError(why)      -> HttpResponse(401, why)
+            ForbiddenError(why) -> HttpResponse(403, why)
         }
-    }
 }
 
-withAdminAuth :: (Authed inner) {
-    (req) -> {
-        user = authenticate(req.query) |> catch { AuthError -> User { id: -1, name: "" } }
-        if user.id == adminId {
-            provide loggedIn(user)
-            inner(req)
-        } else {
-            HttpResponse(403, "admins only")
-        }
-    }
-}
-
+// Logging isn't a provider — it provides nothing, it *observes* the response
+// — so it stays a plain handler-in, handler-out wrapper.
 withLogging :: (Handler inner) {
     Logger log
     (req) -> {
@@ -104,26 +113,32 @@ withLogging :: (Handler inner) {
     }
 }
 
-// ---- the router: plain data flow ---------------------------------------------
-
 main :: () {
-    provide Http, consoleLogger
+    provide Http, ConsoleLogger
 
-    // Route-level middleware, inline: each arm wraps its handler with
-    // exactly the stack that route needs.
+    // Pure routing: each route provides exactly the middleware stack it needs
+    // and calls its handler. The typed failures flow out to `withErrors`.
     router = (HttpRequest req) -> {
         match req.path {
-            "/"               -> home(req)
-            "/profile"        -> (profile |> withAuth)(req)
-            "/admin"          -> (adminPanel |> withAdminAuth)(req)
-            "/user/${Int id}" -> (((HttpRequest r) -> userProfile(r, id)) |> withAuth)(req)
-            _                 -> HttpResponse(404, "try /, /profile, /admin, /user/7")
+            "/" -> home(req)
+            "/profile" -> {
+                provide WithSession(req)
+                profile(req)
+            }
+            "/admin" -> {
+                provide WithSession(req)
+                provide WithAdmin()
+                adminPanel(req)
+            }
+            "/user/${Int id}" -> {
+                provide WithSession(req)
+                userProfile(req, id)
+            }
+            _ -> HttpResponse(404, "try /, /profile, /admin, /user/7")
         }
-        // Route captures flow into the handler through a lambda — it
-        // closes over `id` and is itself the Authed handler.
     }
 
     println("listening on :${port}")
-    http.serve(port, router |> withLogging)
+    http.serve(port, router |> withErrors |> withLogging)
         |> catch { HttpError(status, m) -> println("server: ${m}") }
 }

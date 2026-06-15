@@ -20,6 +20,7 @@
   "type"
   "enum"
   "service"
+  "provider"
   "shared"
   "match"
   "catch"
@@ -71,8 +72,9 @@
 ; Declarations and calls.
 (function_declaration name: (identifier) @function)
 (method_signature name: (identifier) @function)
-(implementation name: (identifier) @function)
-(impl_field name: (identifier) @property)
+(value_member name: (identifier) @property)
+(provider_declaration name: (identifier) @function)
+(provider_declaration name: (type_identifier) @function)
 (call_expression function: (identifier) @function)
 (call_expression
   function: (field_expression field: (identifier) @function.method))

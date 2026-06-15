@@ -32,7 +32,7 @@
     "declarations": {
       "patterns": [
         {
-          "comment": "struct / enum declarations: `struct User = { Int id }`, `enum Shape = Circle | Dot`",
+          "comment": "struct / enum declarations: `struct User { Int id }`, `enum Shape = Circle | Dot`",
           "match": "\\b(struct|type|enum)\\s+([A-Z][A-Za-z0-9_]*)",
           "captures": {
             "1": { "name": "keyword.declaration.inga" },
@@ -48,12 +48,12 @@
           }
         },
         {
-          "comment": "implementation declarations: `consoleLogger :: Logger {`",
-          "match": "^\\s*([a-z][A-Za-z0-9_]*)\\s*(::)\\s*([A-Z][A-Za-z0-9_]*)",
+          "comment": "provider declarations: `provider MemoryCache :: () { Cache { … } }`",
+          "match": "\\b(provider)\\s+([A-Za-z][A-Za-z0-9_]*)\\s*(::)",
           "captures": {
-            "1": { "name": "entity.name.function.inga" },
-            "2": { "name": "keyword.operator.signature.inga" },
-            "3": { "name": "entity.name.type.interface.inga" }
+            "1": { "name": "keyword.declaration.inga" },
+            "2": { "name": "entity.name.function.inga" },
+            "3": { "name": "keyword.operator.signature.inga" }
           }
         },
         {
@@ -89,7 +89,7 @@
         },
         {
           "name": "keyword.other.inga",
-          "match": "\\b(use|pub|shared|struct|type|enum|service|provide|uses|lazy)\\b"
+          "match": "\\b(use|pub|shared|struct|type|enum|service|provider|provide|uses|lazy)\\b"
         },
         {
           "name": "constant.language.inga",

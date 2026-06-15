@@ -4,11 +4,11 @@
 use std/json
 use std/schedule
 
-struct UserNotFound = { Int id }
-struct DbError      = { String cause }
-struct CacheMiss    = { String key }
+struct UserNotFound { Int id }
+struct DbError      { String cause }
+struct CacheMiss    { String key }
 
-struct User = { Int id, String name, String email }
+struct User { Int id, String name, String email }
 
 service Logger {
     info :: (String msg)
@@ -41,7 +41,7 @@ cached :: (id) {
         |> json.decode(User)
         |> Some
         |> catch {
-            CacheMiss     -> None
+            CacheMiss -> None
             DecodeError e -> {
                 logger.warn("corrupt cache entry for ${id}: ${e.message}")
                 None
@@ -71,33 +71,26 @@ fetchAndCache :: (id) {
 
 // ---- implementations --------------------------------------------------------
 
-consoleLogger :: Logger {
-    info :: (msg) {
-        println("[info] ${msg}")
-    }
-    warn :: (msg) {
-        println("[warn] ${msg}")
+provider ConsoleLogger :: () {
+    Logger {
+        info: (msg) -> println("[info] ${msg}")
+        warn: (msg) -> println("[warn] ${msg}")
     }
 }
 
-memoryCache :: Cache {
+provider MemoryCache :: () {
     store = MutMap()
-
-    get :: (key) {
-        store.get(key) |> orFail(CacheMiss(key))
-    }
-
-    set :: (key, value, ttl) {
-        store.set(key, value)
+    Cache {
+        get: (key) -> store.get(key) |> orFail(CacheMiss(key))
+        set: (key, value, ttl) -> store.set(key, value)
     }
 }
 
 // A flaky in-memory database: refuses the first two connections, so
-// `retry` has something to do.
-fakeDb :: Database {
+// `retry` has something to do. `attempts` is captured by `findUser`.
+provider FakeDb :: () {
     attempts = MutMap()
-
-    findUser :: (id) {
+    Database { findUser: (id) -> {
         n = attempts.get("count") |> getOrElse(0)
         attempts.set("count", n + 1)
         if n < 2 {
@@ -108,11 +101,11 @@ fakeDb :: Database {
         } else {
             None
         }
-    }
+    } }
 }
 
 main :: () {
-    provide consoleLogger, memoryCache, fakeDb {
+    provide ConsoleLogger, MemoryCache, FakeDb {
         // First lookup: cache miss -> flaky db (retried) -> cache refresh.
         user = getUserById(42) |> catch { UserNotFound -> User(0, "anonymous", "n/a") }
         println("fetched: ${user.name} <${user.email}>")

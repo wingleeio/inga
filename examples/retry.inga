@@ -2,20 +2,19 @@
 
 use std/schedule
 
-struct Flaky = { Int attempt }
+struct Flaky { Int attempt }
 
 service Counter {
     next :: () -> Int
 }
 
-memoryCounter :: Counter {
+provider MemoryCounter :: () {
     state = MutMap()
-
-    next :: () {
+    Counter { next: () -> {
         n = state.get("n") |> getOrElse(0)
         state.set("n", n + 1)
         n
-    }
+    } }
 }
 
 // `flaky` fails its first three calls. Its error row (`! Flaky`) and
@@ -32,14 +31,14 @@ flaky :: () {
 }
 
 main :: () {
-    provide memoryCounter {
+    provide MemoryCounter {
         value = flaky()
             |> retry(schedule.fixed(1.millis) |> schedule.upTo(5))
             |> catch { Flaky(attempt) -> -attempt }
         println("settled on ${value} after retries")
 
         // Exhaust the retry budget: 2 retries cannot survive 3 failures.
-        provide memoryCounter {
+        provide MemoryCounter {
             failed = flaky()
                 |> retry(schedule.fixed(1.millis) |> schedule.upTo(2))
                 |> catch { Flaky(attempt) -> -attempt }

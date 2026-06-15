@@ -59,7 +59,7 @@ module.exports = grammar({
         $.enum_declaration,
         $.service_declaration,
         $.function_declaration,
-        $.implementation
+        $.provider_declaration
       ),
 
     // `use std/graphics`, `use cards`, `use cards { rankName, suitCol }`.
@@ -76,7 +76,7 @@ module.exports = grammar({
       prec.right(sepBy1('/', choice($.identifier, $.type_identifier))),
 
     struct_declaration: $ =>
-      seq(optional('pub'), 'struct', field('name', $.type_identifier), '=', $.fields),
+      seq(optional('pub'), 'struct', field('name', $.type_identifier), optional('='), $.fields),
 
     // `type Handler = (HttpRequest) -> HttpResponse uses Session`
     type_alias_declaration: $ =>
@@ -109,27 +109,30 @@ module.exports = grammar({
         'service',
         field('name', $.type_identifier),
         '{',
-        repeat($.method_signature),
+        repeat(choice($.method_signature, $.value_member)),
         '}'
       ),
 
     method_signature: $ => seq(field('name', $.identifier), '::', $.signature),
 
+    // `MutMap<String, Int> ui` — a typed value member, read as `dex.ui`.
+    value_member: $ => seq(field('type', $._type), field('name', $.identifier)),
+
     function_declaration: $ =>
       seq(optional('pub'), field('name', $.identifier), '::', $.signature, field('body', $.block)),
 
-    implementation: $ =>
+    // `provider Name :: (params) { … Service { … } }`. The body is a function
+    // body whose result constructs the service it provides; methods are lambda
+    // fields in that construction.
+    provider_declaration: $ =>
       seq(
         optional('pub'),
-        field('name', $.identifier),
+        'provider',
+        field('name', choice($.identifier, $.type_identifier)),
         '::',
-        field('service', $.type_identifier),
-        '{',
-        repeat(choice($.function_declaration, $.impl_field)),
-        '}'
+        $.signature,
+        field('body', $.block)
       ),
-
-    impl_field: $ => seq(field('name', $.identifier), '=', $._expression),
 
     signature: $ =>
       seq(

@@ -186,7 +186,7 @@ impl Printer {
                 }
                 Decl::Enum(d) => self.print_enum_decl(d),
                 Decl::Service(d) => self.print_service(d),
-                Decl::Impl(d) => self.print_impl(d),
+                Decl::Provider(d) => self.print_provider(d),
                 Decl::Func(d) => self.print_func(d, 0),
                 Decl::TypeAlias(d) => {
                     self.flush_comments_before(d.span.start, 0);
@@ -245,7 +245,7 @@ impl Printer {
         self.blank_line_if_gap(self.lines.line(d.span.start));
         let body = render_field_block(&d.fields);
         let padded = format!("{:<width$}", d.name, width = name_width);
-        self.out.push_str(&format!("{}struct {padded} = {body}", pub_prefix(d.is_pub)));
+        self.out.push_str(&format!("{}struct {padded} {body}", pub_prefix(d.is_pub)));
         self.attach_trailing_comment(d.span.end);
         self.out.push('\n');
         self.prev_end_line = Some(self.lines.line(d.span.end));
@@ -336,39 +336,13 @@ impl Printer {
         self.prev_end_line = Some(self.lines.line(d.span.end));
     }
 
-    fn print_impl(&mut self, d: &ImplDecl) {
+    fn print_provider(&mut self, d: &ProviderDecl) {
         self.flush_comments_before(d.span.start, 0);
         self.blank_line_if_gap(self.lines.line(d.span.start));
-        self.out.push_str(&format!("{}{} :: {} {{\n", pub_prefix(d.is_pub), d.name, d.service));
-        self.prev_end_line = Some(self.lines.line(d.span.start));
-        for p in &d.params {
-            self.flush_comments_before(p.span.start, 1);
-            self.blank_line_if_gap(self.lines.line(p.span.start));
-            self.push_indent(1);
-            if let Some(ty) = &p.ty {
-                self.out.push_str(&format!("{} {}", render_type(ty), p.name));
-            } else {
-                self.out.push_str(&p.name);
-            }
-            self.attach_trailing_comment(p.span.end);
-            self.out.push('\n');
-            self.prev_end_line = Some(self.lines.line(p.span.end));
-        }
-        for (name, span, value) in &d.fields {
-            self.flush_comments_before(span.start, 1);
-            self.blank_line_if_gap(self.lines.line(span.start));
-            self.push_indent(1);
-            let rendered = self.render_expr(value, 1);
-            self.out.push_str(&format!("{name} = {rendered}"));
-            self.attach_trailing_comment(value.span.end);
-            self.out.push('\n');
-            self.prev_end_line = Some(self.lines.line(value.span.end));
-        }
-        for method in &d.methods {
-            self.print_func(method, 1);
-        }
-        self.flush_comments_before(d.span.end, 1);
-        self.out.push_str("}\n");
+        self.out
+            .push_str(&format!("{}provider {} :: {} ", pub_prefix(d.is_pub), d.name, render_sig(&d.sig)));
+        self.print_block(&d.body, 0);
+        self.out.push('\n');
         self.prev_end_line = Some(self.lines.line(d.span.end));
     }
 
@@ -487,7 +461,24 @@ impl Printer {
                 for (fname, _, value) in fields {
                     parts.push(format!("{fname}: {}", self.render_expr(value, indent)));
                 }
-                format!("{name} {{ {} }}", parts.join(", "))
+                let oneline = format!("{name} {{ {} }}", parts.join(", "));
+                // Break a record across lines when it is long or already
+                // multi-line — keeps multi-member service shapes readable.
+                let too_wide = indent * 4 + oneline.len() > 72;
+                if parts.len() > 1 && (too_wide || oneline.contains('\n')) {
+                    let mut inner = Vec::new();
+                    if let Some(base) = base {
+                        inner.push(format!("..{}", self.render_expr(base, indent + 1)));
+                    }
+                    for (fname, _, value) in fields {
+                        inner.push(format!("{fname}: {}", self.render_expr(value, indent + 1)));
+                    }
+                    let pad = indent_str(indent + 1);
+                    let close = indent_str(indent);
+                    format!("{name} {{\n{pad}{}\n{close}}}", inner.join(&format!("\n{pad}")))
+                } else {
+                    oneline
+                }
             }
             ExprKind::List(items) => {
                 let inner: Vec<String> = items.iter().map(|e| self.render_expr(e, indent)).collect();
@@ -787,16 +778,20 @@ impl Printer {
 
     fn render_arms(&mut self, arms: &[Arm], indent: usize, out: &mut String) {
         let patterns: Vec<String> = arms.iter().map(|a| render_pattern(&a.pattern)).collect();
-        let width = patterns.iter().map(|p| p.len()).max().unwrap_or(0);
-        for (arm, pat) in arms.iter().zip(patterns) {
+        let bodies: Vec<String> =
+            arms.iter().map(|a| self.render_expr(&a.body, indent)).collect();
+        // Align the `->` only when every arm is single-line. A multiline
+        // (block) body can't sit on the arrow column, so mixing padded and
+        // tight arrows reads as ragged — when any arm is multiline, every
+        // arrow goes tight.
+        let width = if bodies.iter().any(|b| b.contains('\n')) {
+            0
+        } else {
+            patterns.iter().map(|p| p.len()).max().unwrap_or(0)
+        };
+        for (pat, body) in patterns.into_iter().zip(bodies) {
             out.push_str(&indent_str(indent));
-            let body = self.render_expr(&arm.body, indent);
-            if body.contains('\n') {
-                // Don't pad before a multiline body; keep the arrow tight.
-                out.push_str(&format!("{pat} -> {body}\n"));
-            } else {
-                out.push_str(&format!("{pat:<width$} -> {body}\n"));
-            }
+            out.push_str(&format!("{pat:<width$} -> {body}\n"));
         }
     }
 }
@@ -829,7 +824,7 @@ fn decl_span(decl: &Decl) -> Span {
         Decl::Struct(d) => d.span,
         Decl::Enum(d) => d.span,
         Decl::Service(d) => d.span,
-        Decl::Impl(d) => d.span,
+        Decl::Provider(d) => d.span,
         Decl::Func(d) => d.span,
         Decl::Const(d) => d.span,
         Decl::TypeAlias(d) => d.span,

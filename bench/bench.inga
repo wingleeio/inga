@@ -4,7 +4,7 @@
 // All workloads are fib-shaped tree recursion so call counts are large while
 // recursion depth stays small. Run with: inga run bench/bench.inga
 
-struct Boom = { Int n }
+struct Boom { Int n }
 
 service Adder {
     add :: (Int a, Int b) -> Int
@@ -15,21 +15,15 @@ service Store {
     take :: (Int k) -> Int
 }
 
-plainAdder :: Adder {
-    add :: (a, b) {
-        a + b
-    }
+provider PlainAdder :: () {
+    Adder { add: (a, b) -> a + b }
 }
 
-memStore :: Store {
+provider MemStore :: () {
     m = MutMap()
-
-    put :: (k, v) {
-        m.set(k, v)
-    }
-
-    take :: (k) {
-        m.get(k) |> getOrElse(0)
+    Store {
+        put: (k, v) -> m.set(k, v)
+        take: (k) -> m.get(k) |> getOrElse(0)
     }
 }
 
@@ -103,7 +97,7 @@ round :: (Int i) uses Adder, Store {
 }
 
 main :: () {
-    provide plainAdder, memStore {
+    provide PlainAdder, MemStore {
         round(1)
         round(2)
     }

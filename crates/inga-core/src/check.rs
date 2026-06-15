@@ -124,6 +124,20 @@ pub struct RowFact {
     pub caps: Vec<String>,
 }
 
+/// What the backend needs to emit a provider — a constructor function
+/// `@ing.provider.Name(evidence…, params…)` that returns the service instance.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderFact {
+    /// The service this provider satisfies.
+    pub service: String,
+    /// Sorted capabilities the constructor takes as evidence parameters.
+    pub caps: Vec<String>,
+    /// The constructor can fail.
+    pub fallible: bool,
+    /// Parameter c-types, in order.
+    pub params: Vec<CType>,
+}
+
 #[derive(Debug, Default)]
 pub struct Facts {
     /// Top-level constants, in declaration (= initialization) order.
@@ -144,8 +158,13 @@ pub struct Facts {
     /// Struct field types and enum variant field types, by name.
     pub struct_fields: HashMap<String, Vec<CType>>,
     pub enum_variants: HashMap<String, Vec<(String, Vec<CType>)>>,
-    /// Impl instance field types, by impl name.
+    /// Impl instance field types, by provider name. For a method-service
+    /// provider these are the parameter + state fields, in canonical order.
     pub impl_fields: HashMap<String, Vec<CType>>,
+    /// Provider facts, by provider name — the backend uses these to emit
+    /// either an inline instance (method providers) or a constructor function
+    /// (value providers).
+    pub providers: HashMap<String, ProviderFact>,
     /// Functions with universal type parameters: the backend exempts their
     /// results from reclamation (uniform representation, no per-instance
     /// drop glue — a bounded, documented leak).
@@ -199,6 +218,10 @@ struct MethodInfo {
     params: Vec<Type>,
     ret: Type,
     declared_errors: BTreeSet<String>,
+    /// The method's *call-time* `uses` row, declared on the interface sig
+    /// (`get :: (…) ! E uses Cache`). Calling the method requires these; the
+    /// caller inherits them. Distinct from the provider's construction deps.
+    declared_caps: BTreeSet<String>,
     name_span: Span,
 }
 
@@ -214,11 +237,16 @@ struct ServiceInfo {
     shared: bool,
 }
 
+/// A provider — a function whose result is its `for` service's shape. Its
+/// rows (errors, deps) ride at the provide site.
 struct ImplInfo {
     service: String,
-    /// Parameter fields (supplied by `provide name(args…)`), in order.
+    /// Provider parameters (from the signature), supplied by
+    /// `provide name(args…)`, in order.
     params: Vec<(String, Type)>,
-    fields: Vec<(String, Type)>,
+    /// Declared rows from the signature annotations, if any.
+    declared_errors: Option<BTreeSet<String>>,
+    declared_caps: Option<BTreeSet<String>>,
     name_span: Span,
     module: usize,
     is_pub: bool,
@@ -301,7 +329,6 @@ struct Checker<'a> {
     funcs: HashMap<String, FuncInfo>,
 
     func_rows: HashMap<String, Rows>,
-    method_rows: HashMap<(String, String), Rows>,
     impl_field_rows: HashMap<String, Rows>,
 
     diags: Vec<Diagnostic>,
@@ -341,7 +368,6 @@ impl<'a> Checker<'a> {
             impls: HashMap::new(),
             funcs: HashMap::new(),
             func_rows: HashMap::new(),
-            method_rows: HashMap::new(),
             impl_field_rows: HashMap::new(),
             diags: Vec::new(),
             record_info: false,
@@ -535,7 +561,7 @@ impl<'a> Checker<'a> {
                 Decl::Struct(d) => (&d.name, d.name_span, DefKind::Struct, d.is_pub),
                 Decl::Enum(d) => (&d.name, d.name_span, DefKind::Enum, d.is_pub),
                 Decl::Service(d) => (&d.name, d.name_span, DefKind::Service, d.is_pub),
-                Decl::Impl(d) => (&d.name, d.name_span, DefKind::Impl, d.is_pub),
+                Decl::Provider(d) => (&d.name, d.name_span, DefKind::Impl, d.is_pub),
                 Decl::Func(d) => (&d.name, d.name_span, DefKind::Func, d.is_pub),
                 Decl::Const(d) => (&d.name, d.name_span, DefKind::Const, d.is_pub),
                 Decl::TypeAlias(d) => (&d.name, d.name_span, DefKind::Alias, d.is_pub),
@@ -676,12 +702,23 @@ impl<'a> Checker<'a> {
                             None => self.ctx.fresh(),
                         };
                         let declared_errors = self.resolve_error_list(m.sig.errors.as_deref());
+                        let mut declared_caps = BTreeSet::new();
+                        if let Some(list) = &m.sig.uses {
+                            for (cap, span) in list {
+                                if self.services.contains_key(cap) {
+                                    declared_caps.insert(cap.clone());
+                                } else {
+                                    self.error(*span, format!("unknown service `{cap}` in `uses`"));
+                                }
+                            }
+                        }
                         methods.push((
                             m.name.clone(),
                             MethodInfo {
                                 params,
                                 ret,
                                 declared_errors,
+                                declared_caps,
                                 name_span: m.name_span,
                             },
                         ));
@@ -703,36 +740,55 @@ impl<'a> Checker<'a> {
                         info.shared = d.is_shared;
                     }
                 }
-                Decl::Impl(d) => {
-                    if !self.services.contains_key(&d.service) {
+                Decl::Provider(d) => {
+                    let service = self.resolve_provider_service(d);
+                    if service.is_empty() {
                         self.error(
-                            d.service_span,
-                            format!("unknown service `{}`", d.service),
+                            d.name_span,
+                            format!("cannot tell which service `{}` provides — its body must end by constructing one, like `SomeService {{ … }}`", d.name),
                         );
+                    } else if !self.services.contains_key(&service) {
+                        self.error(d.service_span, format!("unknown service `{service}`"));
                     }
-                    let fields: Vec<(String, Type)> =
-                        d.fields.iter().map(|(name, _, _)| (name.clone(), self.ctx.fresh())).collect();
+                    let mut tyvars = HashMap::new();
+                    for (i, p) in d.sig.params.iter().enumerate() {
+                        if let Some(caps) = p.ty.as_ref().and_then(|t| self.callback_contract(t)) {
+                            self.info.facts.param_contracts.insert((d.name.clone(), i), caps);
+                        }
+                    }
                     let params: Vec<(String, Type)> = d
+                        .sig
                         .params
                         .iter()
                         .map(|p| {
                             let ty = match &p.ty {
-                                Some(t) => {
-                                    let mut tyvars = HashMap::new();
-                                    self.resolve_type_expr(t, &mut tyvars)
-                                }
+                                Some(t) => self.resolve_type_expr(t, &mut tyvars),
                                 None => self.ctx.fresh(),
                             };
                             (p.name.clone(), ty)
                         })
                         .collect();
+                    let declared_errors =
+                        d.sig.errors.as_ref().map(|list| self.resolve_error_list(Some(list)));
+                    let declared_caps = d.sig.uses.as_ref().map(|list| {
+                        let mut set = BTreeSet::new();
+                        for (name, span) in list {
+                            if self.services.contains_key(name) {
+                                set.insert(name.clone());
+                            } else {
+                                self.error(*span, format!("unknown service `{name}` in `uses`"));
+                            }
+                        }
+                        set
+                    });
                     let module = self.module_of(d.name_span);
                     self.impls.insert(
                         d.name.clone(),
                         ImplInfo {
-                            service: d.service.clone(),
+                            service,
                             params,
-                            fields,
+                            declared_errors,
+                            declared_caps,
                             name_span: d.name_span,
                             module,
                             is_pub: d.is_pub,
@@ -1149,7 +1205,7 @@ impl<'a> Checker<'a> {
         for decl in &self.program.decls {
             match decl {
                 Decl::Func(d) => self.check_func(d),
-                Decl::Impl(d) => self.check_impl(d),
+                Decl::Provider(d) => self.check_provider(d),
                 Decl::Const(d) => self.check_const(d),
                 _ => {}
             }
@@ -1224,127 +1280,191 @@ impl<'a> Checker<'a> {
         self.current_rigid.clear();
     }
 
-    fn check_impl(&mut self, d: &ImplDecl) {
+    /// The service a provider satisfies, inferred from the body's trailing
+    /// construction expression (`… Session { … }`).
+    fn resolve_provider_service(&self, d: &ProviderDecl) -> String {
+        if let Some(Stmt::Expr(e)) = d.body.stmts.last() {
+            if let ExprKind::RecordUpdate { name, .. } = &e.kind {
+                if self.services.contains_key(name) {
+                    return name.clone();
+                }
+            }
+        }
+        String::new()
+    }
+
+    fn check_provider(&mut self, d: &ProviderDecl) {
         let Some(info) = self.impls.get(&d.name) else { return };
-        let field_types: Vec<(String, Type)> = info.fields.clone();
         let param_types: Vec<(String, Type)> = info.params.clone();
         let service = info.service.clone();
 
-        // Field initializers (parameter fields are in scope).
-        let mut field_rows = Rows::default();
+        // A provider is a function whose result is the service's shape.
+        // Parameters are in scope; deps acquired in the body and `fail`s
+        // become the provider's rows, which ride at the provide site.
         let mut scope = HashMap::new();
         for (i, (pname, pty)) in param_types.iter().enumerate() {
             scope.insert(pname.clone(), pty.clone());
             if self.record_info {
-                if let Some(p) = d.params.get(i) {
+                if let Some(p) = d.sig.params.get(i) {
                     self.typed_hovers.push((p.span, pname.clone(), pty.clone()));
                 }
             }
         }
-        for ((name, _span, value), (_, ty)) in d.fields.iter().zip(field_types.iter()) {
-            self.scopes = vec![scope.clone()];
-            self.row_stack = vec![Rows::default()];
-            let value_ty = self.check_expr(value);
-            self.unify_at(ty, &value_ty, value.span, "field initializer");
-            field_rows.merge(&self.row_stack.pop().unwrap_or_default());
-            scope.insert(name.clone(), ty.clone());
+        self.scopes = vec![scope];
+        self.row_stack = vec![Rows::default()];
+        let body_ty = self.check_block(&d.body);
+        if !service.is_empty() {
+            self.unify_at(
+                &Type::Service(service.clone()),
+                &body_ty,
+                last_span(&d.body),
+                "provider result",
+            );
         }
-        // Every value member the service declares must be a field here, at
-        // the declared type. Extra fields stay private instance state.
-        let declared_values = self
-            .services
-            .get(&service)
-            .map(|i| i.values.clone())
-            .unwrap_or_default();
-        for (vname, vty) in &declared_values {
-            if let Some((_, pty)) = param_types.iter().find(|(p, _)| p == vname) {
-                let pspan = d
-                    .params
-                    .iter()
-                    .find(|p| &p.name == vname)
-                    .map(|p| p.span)
-                    .unwrap_or(d.name_span);
-                self.unify_at(vty, pty, pspan, "service value member");
-                continue;
-            }
-            match d.fields.iter().position(|(f, _, _)| f == vname) {
-                Some(i) => {
-                    let (_, fty) = &field_types[i];
-                    let fspan = d.fields[i].1;
-                    self.unify_at(vty, fty, fspan, "service value member");
-                }
-                None => {
-                    self.error(
-                        d.name_span,
-                        format!(
-                            "`{}` must define the value member `{vname}` declared by service `{service}`",
-                            d.name
-                        ),
-                    );
-                }
-            }
-        }
-        if self.impl_field_rows.get(&d.name) != Some(&field_rows) {
+        let rows = self.row_stack.pop().unwrap_or_default();
+        if self.impl_field_rows.get(&d.name) != Some(&rows) {
             self.changed = true;
-            self.impl_field_rows.insert(d.name.clone(), field_rows);
+            self.impl_field_rows.insert(d.name.clone(), rows);
         }
+        if self.record_info {
+            self.info.hovers.push((d.name_span, self.provider_signature(&d.name)));
+        }
+    }
 
-        // Methods, unified against the service signature.
-        for method in &d.methods {
-            let sig_info = self.services.get(&service).and_then(|s| {
-                s.methods.iter().find(|(n, _)| n == &method.name).map(|(_, m)| {
-                    (m.params.clone(), m.ret.clone())
-                })
-            });
-            let Some((sig_params, sig_ret)) = sig_info else {
-                if self.services.contains_key(&service) {
-                    self.error(
-                        method.name_span,
-                        format!("service `{service}` has no method `{}`", method.name),
-                    );
-                }
-                continue;
-            };
-            if sig_params.len() != method.sig.params.len() {
-                self.error(
-                    method.name_span,
-                    format!(
-                        "method `{}` has {} parameter(s) but service `{service}` declares {}",
-                        method.name,
-                        method.sig.params.len(),
-                        sig_params.len()
-                    ),
-                );
-                continue;
+    /// Rows a provide site incurs by providing `name`: the provider
+    /// function's declared ∪ inferred rows.
+    fn provider_effective_rows(&self, name: &str) -> Rows {
+        let mut rows = self.impl_field_rows.get(name).cloned().unwrap_or_default();
+        if let Some(info) = self.impls.get(name) {
+            if let Some(declared) = &info.declared_errors {
+                rows.errors.extend(declared.iter().cloned());
             }
-            let mut method_scope = scope.clone();
-            let mut tyvars = HashMap::new();
-            for (param, sig_ty) in method.sig.params.iter().zip(sig_params.iter()) {
-                if let Some(t) = &param.ty {
-                    let annotated = self.resolve_type_expr(t, &mut tyvars);
-                    self.unify_at(sig_ty, &annotated, param.span, "parameter annotation");
-                }
-                method_scope.insert(param.name.clone(), sig_ty.clone());
-            }
-            self.scopes = vec![method_scope];
-            self.row_stack = vec![Rows::default()];
-            let body_ty = self.check_block(&method.body);
-            self.unify_at(&sig_ret, &body_ty, last_span(&method.body), "method body");
-            let rows = self.row_stack.pop().unwrap_or_default();
-
-            let key = (service.clone(), method.name.clone());
-            let entry = self.method_rows.entry(key).or_default();
-            let before = entry.clone();
-            entry.merge(&rows);
-            if *entry != before {
-                self.changed = true;
-            }
-
-            if self.record_info {
-                let detail = format!("{} :: {} method of {service}", method.name, d.name);
-                self.info.hovers.push((method.name_span, detail));
+            if let Some(declared) = &info.declared_caps {
+                rows.caps.extend(declared.iter().cloned());
             }
         }
+        rows
+    }
+
+    /// A provider's signature for hover: `provider name for Service ::
+    /// (params) ! Errs uses Deps`.
+    fn provider_signature(&self, name: &str) -> String {
+        let Some(info) = self.impls.get(name) else { return name.to_string() };
+        let mut names = Vec::new();
+        let params: Vec<String> = info
+            .params
+            .iter()
+            .map(|(n, t)| format!("{} {n}", self.ctx.render(t, &mut names)))
+            .collect();
+        let mut out = format!("provider {name} for {} :: ({})", info.service, params.join(", "));
+        let rows = self.provider_effective_rows(name);
+        if !rows.errors.is_empty() {
+            out.push_str(" ! ");
+            out.push_str(&rows.errors.iter().cloned().collect::<Vec<_>>().join(", "));
+        }
+        if !rows.caps.is_empty() {
+            out.push_str(" uses ");
+            out.push_str(&rows.caps.iter().cloned().collect::<Vec<_>>().join(", "));
+        }
+        out
+    }
+
+    /// `Session { user: user }` — build a value-service instance from its
+    /// declared value members. The result type is the service itself.
+    fn check_service_construction(
+        &mut self,
+        name: &str,
+        name_span: Span,
+        base: Option<&Expr>,
+        fields: &[(String, Span, Expr)],
+    ) -> Type {
+        let info = &self.services[name];
+        let (m, p, def_span) = (info.module, info.is_pub, info.name_span);
+        let values = info.values.clone();
+        // (method name, param types, return type, declared errors, declared caps)
+        let methods: Vec<(String, Vec<Type>, Type, BTreeSet<String>, BTreeSet<String>)> = info
+            .methods
+            .iter()
+            .map(|(mn, mi)| {
+                (
+                    mn.clone(),
+                    mi.params.clone(),
+                    mi.ret.clone(),
+                    mi.declared_errors.clone(),
+                    mi.declared_caps.clone(),
+                )
+            })
+            .collect();
+        self.gate(name, m, p, name_span);
+        if self.record_info {
+            self.info.refs.push((name_span, def_span));
+            self.info
+                .hovers
+                .push((name_span, format!("service {name} — building an instance")));
+        }
+        if let Some(base) = base {
+            self.check_expr(base);
+            self.error(
+                name_span,
+                format!("a service instance is built by giving all of `{name}`'s members, not by record update"),
+            );
+        }
+        let mut seen: Vec<String> = Vec::new();
+        for (fname, fspan, value) in fields {
+            if seen.contains(fname) {
+                self.error(*fspan, format!("member `{fname}` is given twice"));
+            }
+            seen.push(fname.clone());
+            if let Some((_, vty)) = values.iter().find(|(v, _)| v == fname) {
+                // A value member: the field holds data of the declared type.
+                let value_ty = self.check_expr(value);
+                self.unify_at(vty, &value_ty, value.span, "service value member");
+                if self.record_info {
+                    self.typed_hovers.push((*fspan, fname.clone(), vty.clone()));
+                }
+            } else if let Some((_, mparams, mret, merrs, mcaps)) =
+                methods.iter().find(|(mn, _, _, _, _)| mn == fname)
+            {
+                // A method member: the field holds a closure matching the
+                // interface signature, including its declared call-time `uses`
+                // contract. The closure may bind those services in its body
+                // (supplied per call) and capture the provider's instances; it
+                // may not use any *other* service (must be explicit).
+                let expected = Type::Func(Rc::new(FuncType {
+                    params: mparams.clone(),
+                    ret: mret.clone(),
+                    errors: merrs.clone(),
+                    caps: mcaps.clone(),
+                }));
+                let value_ty = self.check_arg_expecting(value, &expected);
+                self.unify_at(&expected, &value_ty, value.span, "service method");
+                self.enforce_func_rows(&expected, &value_ty, value.span);
+                if self.record_info {
+                    self.typed_hovers.push((*fspan, fname.clone(), expected.clone()));
+                }
+            } else {
+                self.error(*fspan, format!("service `{name}` has no member `{fname}`"));
+                self.check_expr(value);
+            }
+        }
+        let missing: Vec<String> = values
+            .iter()
+            .map(|(v, _)| v)
+            .chain(methods.iter().map(|(mn, _, _, _, _)| mn))
+            .filter(|n| !seen.contains(n))
+            .map(|n| format!("`{n}`"))
+            .collect();
+        if !missing.is_empty() {
+            self.error(
+                name_span,
+                format!(
+                    "`{name}` is missing {} {}",
+                    if missing.len() == 1 { "member" } else { "members" },
+                    missing.join(", ")
+                ),
+            );
+        }
+        Type::Service(name.to_string())
     }
 
     // ---- rows helpers ------------------------------------------------------
@@ -1389,15 +1509,16 @@ impl<'a> Checker<'a> {
         rows
     }
 
+    /// Rows a *caller* of `service.method(…)` incurs — declared on the
+    /// interface sig (both the `!` errors and the call-time `uses` caps). The
+    /// caller inherits these; the provider's construction deps do not appear
+    /// here (they were captured when the method closure was built).
     fn method_effective_rows(&self, service: &str, method: &str) -> Rows {
-        let mut rows = self
-            .method_rows
-            .get(&(service.to_string(), method.to_string()))
-            .cloned()
-            .unwrap_or_default();
+        let mut rows = Rows::default();
         if let Some(s) = self.services.get(service) {
             if let Some((_, m)) = s.methods.iter().find(|(n, _)| n == method) {
                 rows.errors.extend(m.declared_errors.iter().cloned());
+                rows.caps.extend(m.declared_caps.iter().cloned());
             }
         }
         rows
@@ -1558,16 +1679,23 @@ impl<'a> Checker<'a> {
                 .collect();
             self.info.facts.enum_variants.insert(name.clone(), variants);
         }
-        for (name, info) in &self.impls {
-            // Parameter fields first, then state fields (matching the
-            // backend's ImplMeta field order).
-            let fields: Vec<CType> = info
-                .params
-                .iter()
-                .chain(info.fields.iter())
-                .map(|(_, t)| self.ctype(t))
-                .collect();
-            self.info.facts.impl_fields.insert(name.clone(), fields);
+        for name in self.impls.keys().cloned().collect::<Vec<_>>() {
+            let info = &self.impls[&name];
+            let params: Vec<CType> = info.params.iter().map(|(_, t)| self.ctype(t)).collect();
+            let service = info.service.clone();
+            let rows = self.provider_effective_rows(&name);
+            // Every provider is a constructor function `@ing.provider.Name`
+            // that returns the service instance; the backend emits and calls
+            // it like any function.
+            let fact = ProviderFact {
+                service: service.clone(),
+                caps: rows.caps.iter().cloned().collect(),
+                fallible: !rows.errors.is_empty(),
+                params: params.clone(),
+            };
+            self.info.facts.providers.insert(name.clone(), fact);
+            self.info.facts.func_params.insert(name.clone(), params);
+            self.info.facts.func_ret.insert(name.clone(), CType::Service(service));
         }
         let pairs: Vec<(String, String)> = self
             .services
@@ -1639,6 +1767,14 @@ impl<'a> Checker<'a> {
                 }
             }
             ExprKind::RecordUpdate { name, name_span, base, fields } => {
+                if self.services.contains_key(name) {
+                    return self.check_service_construction(
+                        name,
+                        *name_span,
+                        base.as_deref(),
+                        fields,
+                    );
+                }
                 let result = if self.structs.contains_key(name) {
                     let info = &self.structs[name];
                     let (m, p, def_span) = (info.module, info.is_pub, info.name_span);
@@ -1920,7 +2056,7 @@ impl<'a> Checker<'a> {
         if self.impls.contains_key(name) {
             self.error(
                 span,
-                format!("`{name}` is an implementation; use it with `provide {name} {{ ... }}`"),
+                format!("`{name}` is a provider; use it with `provide {name}`"),
             );
             return Type::Unknown;
         }
@@ -5029,30 +5165,23 @@ impl<'a> Checker<'a> {
                     }
                     if self.record_info {
                         self.info.refs.push((item.name_span, def_span));
-                        let sig = if params.is_empty() {
-                            format!("{} :: {service}", item.name)
-                        } else {
-                            let mut names = Vec::new();
-                            let rendered: Vec<String> = params
-                                .iter()
-                                .map(|(n, t)| format!("{} {n}", self.ctx.render(t, &mut names)))
-                                .collect();
-                            format!("{} :: ({}) {service}", item.name, rendered.join(", "))
-                        };
-                        self.info.hovers.push((item.name_span, sig));
+                        self.info
+                            .hovers
+                            .push((item.name_span, self.provider_signature(&item.name)));
                     }
-                    // Constructing the impl runs its field initializers; they
-                    // see only the services provided earlier in this list.
-                    let mut field_rows =
-                        self.impl_field_rows.get(&item.name).cloned().unwrap_or_default();
-                    field_rows.caps.retain(|c| !provided.contains(c));
-                    self.merge_rows(&field_rows);
+                    // Providing runs the provider's setup — a value provider's
+                    // constructor function, a method provider's field
+                    // initializers. Its rows (deps, failures) ride here, minus
+                    // the services already provided earlier in this list.
+                    let mut rows = self.provider_effective_rows(&item.name);
+                    rows.caps.retain(|c| !provided.contains(c));
+                    self.merge_rows(&rows);
                     provided.insert(service);
                 }
                 None => {
                     self.error(
                         item.name_span,
-                        format!("unknown implementation `{}` (declare it like `{} :: SomeService {{ ... }}`)", item.name, item.name),
+                        format!("unknown provider `{}` (declare it like `provider {} :: () -> SomeService {{ … }}`)", item.name, item.name),
                     );
                 }
             }
@@ -5079,28 +5208,18 @@ impl<'a> Checker<'a> {
     }
 
     /// `shared service` is the contract that instances may cross fiber
-    /// boundaries; every implementation must then carry only scalar state
+    /// boundaries; such a service may then carry only scalar value members
     /// (no maps, strings, functions, or nested services), so two fibers can
-    /// never race on a refcount or shared mutation. Checked at each impl.
+    /// never race on a refcount or shared mutation.
     fn validate_shared_impls(&mut self) {
-        let impls: Vec<(String, String, Span)> = self
-            .impls
+        let shared: Vec<(String, Vec<(String, Type)>, Span)> = self
+            .services
             .iter()
-            .map(|(n, i)| (n.clone(), i.service.clone(), i.name_span))
+            .filter(|(_, s)| s.shared)
+            .map(|(n, s)| (n.clone(), s.values.clone(), s.name_span))
             .collect();
-        for (impl_name, service, span) in impls {
-            if !self.services.get(&service).map(|s| s.shared).unwrap_or(false) {
-                continue;
-            }
-            let fields = match self.impls.get(&impl_name) {
-                Some(i) => {
-                    let mut all = i.params.clone();
-                    all.extend(i.fields.clone());
-                    all
-                }
-                None => continue,
-            };
-            for (fname, ty) in &fields {
+        for (service, values, span) in shared {
+            for (vname, ty) in &values {
                 let ok = matches!(
                     self.ctx.resolve(ty),
                     Type::Int | Type::Float | Type::Bool | Type::Duration | Type::Unit
@@ -5110,7 +5229,7 @@ impl<'a> Checker<'a> {
                     self.error(
                         span,
                         format!(
-                            "`{impl_name}` implements the shared service `{service}`, but field `{fname}` is {rendered} — shared services may carry only scalar state (Int/Float/Bool/Duration)"
+                            "the shared service `{service}` has the value member `{vname}` of type {rendered} — a shared service may carry only scalar value members (Int/Float/Bool/Duration) so fibers can't race"
                         ),
                     );
                 }
@@ -5247,6 +5366,33 @@ impl<'a> Checker<'a> {
             }
         }
 
+        // Provider signatures are contracts too: a declared `!`/`uses` row
+        // must cover what the body actually does.
+        let provider_names: Vec<String> = self.impls.keys().cloned().collect();
+        for name in provider_names {
+            let info = &self.impls[&name];
+            let name_span = info.name_span;
+            let declared_errors = info.declared_errors.clone();
+            let declared_caps = info.declared_caps.clone();
+            let inferred = self.impl_field_rows.get(&name).cloned().unwrap_or_default();
+            if let Some(declared) = declared_errors {
+                for err in inferred.errors.difference(&declared) {
+                    self.diags.push(Diagnostic::error(
+                        name_span,
+                        format!("provider `{name}` can fail with `{err}` but its signature does not declare it (add `! {err}` or handle it with `catch`)"),
+                    ));
+                }
+            }
+            if let Some(declared) = declared_caps {
+                for cap in inferred.caps.difference(&declared) {
+                    self.diags.push(Diagnostic::error(
+                        name_span,
+                        format!("provider `{name}` uses `{cap}` but its signature does not declare it (add `uses {cap}`)"),
+                    ));
+                }
+            }
+        }
+
         // `main` must be self-contained: every error handled, every service provided.
         if let Some(info) = self.funcs.get("main") {
             let name_span = info.name_span;
@@ -5306,11 +5452,11 @@ impl<'a> Checker<'a> {
                     kind: DefKind::Service,
                     detail: format!("service {}", d.name),
                 },
-                Decl::Impl(d) => DefInfo {
+                Decl::Provider(d) => DefInfo {
                     name: d.name.clone(),
                     span: d.name_span,
                     kind: DefKind::Impl,
-                    detail: format!("{} :: {}", d.name, d.service),
+                    detail: self.provider_signature(&d.name),
                 },
                 Decl::TypeAlias(d) => {
                     let mut tyvars = HashMap::new();
@@ -5532,7 +5678,7 @@ impl<'a> Checker<'a> {
             .iter()
             .map(|(f, t)| format!("{} {f}", self.ctx.render(t, &mut names)))
             .collect();
-        format!("struct {name} = {{ {} }}", fields.join(", "))
+        format!("struct {name} {{ {} }}", fields.join(", "))
     }
 
     fn render_func_signature(&self, name: &str) -> String {

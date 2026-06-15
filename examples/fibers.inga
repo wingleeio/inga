@@ -12,17 +12,15 @@
 
 use std/fiber
 
-struct Report = { String label, Int total }
-struct TooBig = { String label }
+struct Report { String label, Int total }
+struct TooBig { String label }
 
 shared service Adder {
     add :: (Int a, Int b) -> Int
 }
 
-plainAdder :: Adder {
-    add :: (a, b) {
-        a + b
-    }
+provider PlainAdder :: () {
+    Adder { add: (a, b) -> a + b }
 }
 
 sumTo :: (Int n, Int acc) -> Int uses Adder {
@@ -42,7 +40,7 @@ crunch :: (String label, Int n) -> Report ! TooBig uses Adder {
 }
 
 main :: () {
-    provide Runtime(4), plainAdder
+    provide Runtime(4), PlainAdder
 
     // Fork first, join after — all three run at once.
     a = crunch("small", 1000) |> fiber.fork

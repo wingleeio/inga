@@ -4,7 +4,7 @@
 
 use std/fs
 
-struct Note = { Int id, String text }
+struct Note { Int id, String text }
 
 notesDir :: () -> String {
     "/tmp/inga-notes"

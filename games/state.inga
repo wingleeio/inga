@@ -33,13 +33,13 @@ pub blindName :: (Int blind) -> String {
 
 pub selCount :: () -> Int uses Game {
     Game game
-    sel = game.sel()
+    sel = game.sel
     fold(range(8), 0, (acc, i) -> acc + gn(sel, i))
 }
 
 pub shuffle :: () uses Game {
     Game game
-    deck = game.deck()
+    deck = game.deck
     map(range(52), (i) -> {
         deck.set(i, i)
         0
@@ -57,9 +57,9 @@ pub shuffle :: () uses Game {
 // Animation slots in `av`: 0..7 card lift (x1000), 10..17 deal slide.
 pub deal :: () uses Game {
     Game game
-    deck = game.deck()
-    hand = game.hand()
-    av = game.av()
+    deck = game.deck
+    hand = game.hand
+    av = game.av
     map(range(8), (i) -> {
         pos = gv("deckPos")
         if gn(hand, i) < 0 && pos < 52 {
@@ -74,8 +74,8 @@ pub deal :: () uses Game {
 
 pub removeSelected :: () uses Game {
     Game game
-    hand = game.hand()
-    sel = game.sel()
+    hand = game.hand
+    sel = game.sel
     map(range(8), (i) -> {
         if gn(sel, i) == 1 {
             hand.set(i, -1)
@@ -98,8 +98,8 @@ pub setupBlind :: () uses Game {
     sv("lastType", -1)
     sv("introT", 110) // blind intro banner frames
     shuffle()
-    hand = game.hand()
-    sel = game.sel()
+    hand = game.hand
+    sel = game.sel
     map(range(8), (i) -> {
         hand.set(i, -1)
         sel.set(i, 0)
@@ -163,8 +163,8 @@ pub nextBlind :: () uses Game {
 // `finishPlay` applies the result once the animation lands.
 pub playHand :: () uses Game {
     Game game
-    out = game.out()
-    av = game.av()
+    out = game.out
+    av = game.av
     nSteps = buildSteps()
     if nSteps > 0 && gv("hands") > 0 {
         sv("anim", 1)
@@ -217,7 +217,7 @@ pub discardSelected :: () uses Game {
 // Sell the joker in `slot` for half price; the rest shift down.
 pub sellJoker :: (Int slot) uses Game {
     Game game
-    jok = game.jok()
+    jok = game.jok
     n = gv("jokers")
     if slot >= 0 && slot < n {
         sv("money", gv("money") + sellPrice(gn(jok, slot)))
@@ -243,9 +243,9 @@ pub sortKey :: (Int card, Bool bySuit) -> Int {
 
 pub sortHand :: (Bool bySuit) uses Game {
     Game game
-    hand = game.hand()
-    sel = game.sel()
-    av = game.av()
+    hand = game.hand
+    sel = game.sel
+    av = game.av
     map(range(8), (i) -> {
         best = fold(range(8), i, (acc, j) -> {
             if j > i && sortKey(gn(hand, j), bySuit) > sortKey(gn(hand, acc), bySuit) {

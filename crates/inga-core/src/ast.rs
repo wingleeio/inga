@@ -20,8 +20,10 @@ pub enum Decl {
     Enum(EnumDecl),
     /// `service Logger { info :: (String msg) ... }`
     Service(ServiceDecl),
-    /// `consoleLogger :: Logger { ... }`
-    Impl(ImplDecl),
+    /// `provider consoleLogger :: () -> Logger { ... }` — a provider yields a
+    /// service instance; it is a function with inferred rows, so its setup may
+    /// fail and depend on other services.
+    Provider(ProviderDecl),
     /// `getUserById :: (id) { ... }`
     Func(FuncDecl),
     /// `maxRetries = 3` — a top-level constant, evaluated once at startup
@@ -120,20 +122,27 @@ pub struct MethodSig {
     pub span: Span,
 }
 
+/// `provider WithSession :: (HttpRequest req) { Session { user: … } }`
+///
+/// A provider is a function whose result *constructs* the service it provides
+/// — `Session { user: u }`, `Logger { info: (m) -> … }`. The service, the
+/// `uses`/`!` rows, and the (always-the-service) return type are all inferred.
+/// The body may acquire other services and `fail` during construction (those
+/// rows ride at the provide site); the method closures themselves are pure
+/// (they may not acquire services — the provider captures what they need).
 #[derive(Debug)]
-pub struct ImplDecl {
+pub struct ProviderDecl {
     pub is_pub: bool,
     pub name: String,
     pub name_span: Span,
+    /// The service this provider satisfies — inferred by the checker from the
+    /// body's trailing construction (empty until then).
     pub service: String,
     pub service_span: Span,
-    /// `User u` — parameter fields, supplied positionally by
-    /// `provide name(args…)`. A parameter may satisfy a service value
-    /// member of the same name.
-    pub params: Vec<Field>,
-    /// `store = MutMap()` — instance state, evaluated when the impl is provided.
-    pub fields: Vec<(String, Span, Expr)>,
-    pub methods: Vec<FuncDecl>,
+    /// `(params) [! Errs] [uses Deps]` — no `-> ret`; rows optional/inferred.
+    pub sig: Sig,
+    /// The function body; its result constructs the service instance.
+    pub body: Block,
     pub span: Span,
 }
 

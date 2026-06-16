@@ -113,30 +113,26 @@ withLogging :: (Handler inner) {
     }
 }
 
+// Pure routing: each route provides exactly the middleware stack it needs
+// and calls its handler. The typed failures flow out to `withErrors`.
+router :: (HttpRequest req) {
+    match req.path {
+        "/" -> home(req)
+        "/profile" -> provide WithSession(req) {
+            profile(req)
+        }
+        "/admin" -> provide WithSession(req), WithAdmin() {
+            adminPanel(req)
+        }
+        "/user/${Int id}" -> provide WithSession(req) {
+            userProfile(req, id)
+        }
+        _ -> HttpResponse(404, "try /, /profile, /admin, /user/7")
+    }
+}
+
 main :: () {
     provide Http, ConsoleLogger
-
-    // Pure routing: each route provides exactly the middleware stack it needs
-    // and calls its handler. The typed failures flow out to `withErrors`.
-    router = (HttpRequest req) -> {
-        match req.path {
-            "/" -> home(req)
-            "/profile" -> {
-                provide WithSession(req)
-                profile(req)
-            }
-            "/admin" -> {
-                provide WithSession(req)
-                provide WithAdmin()
-                adminPanel(req)
-            }
-            "/user/${Int id}" -> {
-                provide WithSession(req)
-                userProfile(req, id)
-            }
-            _ -> HttpResponse(404, "try /, /profile, /admin, /user/7")
-        }
-    }
 
     println("listening on :${port}")
     http.serve(port, router |> withErrors |> withLogging)
